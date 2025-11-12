@@ -1,75 +1,173 @@
-from ._backend import Backend
+"""Locations where we look for configs, install stuff, etc"""
 
-from numpy.distutils.core import setup, Extension
-from numpy.distutils.system_info import get_info
-from numpy.distutils.misc_util import dict_append
-from numpy.exceptions import VisibleDeprecationWarning
+# The following comment should be removed at some point in the future.
+# mypy: strict-optional=False
+
+# If pip's going to use distutils, it should not be using the copy that setuptools
+# might have injected into the environment. This is done by removing the injected
+# shim, if it's injected.
+#
+# See https://github.com/pypa/pip/issues/8761 for the original discussion and
+# rationale for why this is done within pip.
+from __future__ import annotations
+
+try:
+    __import__("_distutils_hack").remove_shim()
+except (ImportError, AttributeError):
+    pass
+
+import logging
 import os
 import sys
-import shutil
-import warnings
+from distutils.cmd import Command as DistutilsCommand
+from distutils.command.install import SCHEME_KEYS
+from distutils.command.install import install as distutils_install_command
+from distutils.sysconfig import get_python_lib
+
+from pip._internal.models.scheme import Scheme
+from pip._internal.utils.compat import WINDOWS
+from pip._internal.utils.virtualenv import running_under_virtualenv
+
+from .base import get_major_minor_version
+
+logger = logging.getLogger(__name__)
 
 
-class DistutilsBackend(Backend):
-    def __init__(sef, *args, **kwargs):
-        warnings.warn(
-            "\ndistutils has been deprecated since NumPy 1.26.x\n"
-            "Use the Meson backend instead, or generate wrappers"
-            " without -c and use a custom build script",
-            VisibleDeprecationWarning,
-            stacklevel=2,
+def distutils_scheme(
+    dist_name: str,
+    user: bool = False,
+    home: str | None = None,
+    root: str | None = None,
+    isolated: bool = False,
+    prefix: str | None = None,
+    *,
+    ignore_config_files: bool = False,
+) -> dict[str, str]:
+    """
+    Return a distutils install scheme
+    """
+    from distutils.dist import Distribution
+
+    dist_args: dict[str, str | list[str]] = {"name": dist_name}
+    if isolated:
+        dist_args["script_args"] = ["--no-user-cfg"]
+
+    d = Distribution(dist_args)
+    if not ignore_config_files:
+        try:
+            d.parse_config_files()
+        except UnicodeDecodeError:
+            paths = d.find_config_files()
+            logger.warning(
+                "Ignore distutils configs in %s due to encoding errors.",
+                ", ".join(os.path.basename(p) for p in paths),
+            )
+    obj: DistutilsCommand | None = None
+    obj = d.get_command_obj("install", create=True)
+    assert obj is not None
+    i: distutils_install_command = obj
+    # NOTE: setting user or home has the side-effect of creating the home dir
+    # or user base for installations during finalize_options()
+    # ideally, we'd prefer a scheme class that has no side-effects.
+    assert not (user and prefix), f"user={user} prefix={prefix}"
+    assert not (home and prefix), f"home={home} prefix={prefix}"
+    i.user = user or i.user
+    if user or home:
+        i.prefix = ""
+    i.prefix = prefix or i.prefix
+    i.home = home or i.home
+    i.root = root or i.root
+    i.finalize_options()
+
+    scheme: dict[str, str] = {}
+    for key in SCHEME_KEYS:
+        scheme[key] = getattr(i, "install_" + key)
+
+    # install_lib specified in setup.cfg should install *everything*
+    # into there (i.e. it takes precedence over both purelib and
+    # platlib).  Note, i.install_lib is *always* set after
+    # finalize_options(); we only want to override here if the user
+    # has explicitly requested it hence going back to the config
+    if "install_lib" in d.get_option_dict("install"):
+        scheme.update({"purelib": i.install_lib, "platlib": i.install_lib})
+
+    if running_under_virtualenv():
+        if home:
+            prefix = home
+        elif user:
+            prefix = i.install_userbase
+        else:
+            prefix = i.prefix
+        scheme["headers"] = os.path.join(
+            prefix,
+            "include",
+            "site",
+            f"python{get_major_minor_version()}",
+            dist_name,
         )
-        super().__init__(*args, **kwargs)
 
-    def compile(self):
-        num_info = {}
-        if num_info:
-            self.include_dirs.extend(num_info.get("include_dirs", []))
-        ext_args = {
-            "name": self.modulename,
-            "sources": self.sources,
-            "include_dirs": self.include_dirs,
-            "library_dirs": self.library_dirs,
-            "libraries": self.libraries,
-            "define_macros": self.define_macros,
-            "undef_macros": self.undef_macros,
-            "extra_objects": self.extra_objects,
-            "f2py_options": self.f2py_flags,
-        }
+        if root is not None:
+            path_no_drive = os.path.splitdrive(os.path.abspath(scheme["headers"]))[1]
+            scheme["headers"] = os.path.join(root, path_no_drive[1:])
 
-        if self.sysinfo_flags:
-            for n in self.sysinfo_flags:
-                i = get_info(n)
-                if not i:
-                    print(
-                        f"No {repr(n)} resources found"
-                        "in system (try `f2py --help-link`)"
-                    )
-                dict_append(ext_args, **i)
+    return scheme
 
-        ext = Extension(**ext_args)
 
-        sys.argv = [sys.argv[0]] + self.setup_flags
-        sys.argv.extend(
-            [
-                "build",
-                "--build-temp",
-                self.build_dir,
-                "--build-base",
-                self.build_dir,
-                "--build-platlib",
-                ".",
-                "--disable-optimization",
-            ]
-        )
+def get_scheme(
+    dist_name: str,
+    user: bool = False,
+    home: str | None = None,
+    root: str | None = None,
+    isolated: bool = False,
+    prefix: str | None = None,
+) -> Scheme:
+    """
+    Get the "scheme" corresponding to the input parameters. The distutils
+    documentation provides the context for the available schemes:
+    https://docs.python.org/3/install/index.html#alternate-installation
 
-        if self.fc_flags:
-            sys.argv.extend(["config_fc"] + self.fc_flags)
-        if self.flib_flags:
-            sys.argv.extend(["build_ext"] + self.flib_flags)
+    :param dist_name: the name of the package to retrieve the scheme for, used
+        in the headers scheme path
+    :param user: indicates to use the "user" scheme
+    :param home: indicates to use the "home" scheme and provides the base
+        directory for the same
+    :param root: root under which other directories are re-based
+    :param isolated: equivalent to --no-user-cfg, i.e. do not consider
+        ~/.pydistutils.cfg (posix) or ~/pydistutils.cfg (non-posix) for
+        scheme paths
+    :param prefix: indicates to use the "prefix" scheme and provides the
+        base directory for the same
+    """
+    scheme = distutils_scheme(dist_name, user, home, root, isolated, prefix)
+    return Scheme(
+        platlib=scheme["platlib"],
+        purelib=scheme["purelib"],
+        headers=scheme["headers"],
+        scripts=scheme["scripts"],
+        data=scheme["data"],
+    )
 
-        setup(ext_modules=[ext])
 
-        if self.remove_build_dir and os.path.exists(self.build_dir):
-            print(f"Removing build directory {self.build_dir}")
-            shutil.rmtree(self.build_dir)
+def get_bin_prefix() -> str:
+    # XXX: In old virtualenv versions, sys.prefix can contain '..' components,
+    # so we need to call normpath to eliminate them.
+    prefix = os.path.normpath(sys.prefix)
+    if WINDOWS:
+        bin_py = os.path.join(prefix, "Scripts")
+        # buildout uses 'bin' on Windows too?
+        if not os.path.exists(bin_py):
+            bin_py = os.path.join(prefix, "bin")
+        return bin_py
+    # Forcing to use /usr/local/bin for standard macOS framework installs
+    # Also log to ~/Library/Logs/ for use with the Console.app log viewer
+    if sys.platform[:6] == "darwin" and prefix[:16] == "/System/Library/":
+        return "/usr/local/bin"
+    return os.path.join(prefix, "bin")
+
+
+def get_purelib() -> str:
+    return get_python_lib(plat_specific=False)
+
+
+def get_platlib() -> str:
+    return get_python_lib(plat_specific=True)
