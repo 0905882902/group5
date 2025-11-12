@@ -1,289 +1,572 @@
+"""
+Operator classes for eval.
+"""
+
 from __future__ import annotations
 
-from typing import final
+from datetime import datetime
+from functools import partial
+import operator
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    Literal,
+)
 
 import numpy as np
-import pytest
 
-from pandas.core.dtypes.common import is_string_dtype
+from pandas._libs.tslibs import Timestamp
 
-import pandas as pd
-import pandas._testing as tm
-from pandas.core import ops
+from pandas.core.dtypes.common import (
+    is_list_like,
+    is_scalar,
+)
 
+import pandas.core.common as com
+from pandas.core.computation.common import (
+    ensure_decoded,
+    result_type_many,
+)
+from pandas.core.computation.scope import DEFAULT_GLOBALS
 
-class BaseOpsUtil:
-    series_scalar_exc: type[Exception] | None = TypeError
-    frame_scalar_exc: type[Exception] | None = TypeError
-    series_array_exc: type[Exception] | None = TypeError
-    divmod_exc: type[Exception] | None = TypeError
+from pandas.io.formats.printing import (
+    pprint_thing,
+    pprint_thing_encoded,
+)
 
-    def _get_expected_exception(
-        self, op_name: str, obj, other
-    ) -> type[Exception] | tuple[type[Exception], ...] | None:
-        # Find the Exception, if any we expect to raise calling
-        #  obj.__op_name__(other)
-
-        # The self.obj_bar_exc pattern isn't great in part because it can depend
-        #  on op_name or dtypes, but we use it here for backward-compatibility.
-        if op_name in ["__divmod__", "__rdivmod__"]:
-            result = self.divmod_exc
-        elif isinstance(obj, pd.Series) and isinstance(other, pd.Series):
-            result = self.series_array_exc
-        elif isinstance(obj, pd.Series):
-            result = self.series_scalar_exc
-        else:
-            result = self.frame_scalar_exc
-
-        return result
-
-    def _cast_pointwise_result(self, op_name: str, obj, other, pointwise_result):
-        # In _check_op we check that the result of a pointwise operation
-        #  (found via _combine) matches the result of the vectorized
-        #  operation obj.__op_name__(other).
-        #  In some cases pandas dtype inference on the scalar result may not
-        #  give a matching dtype even if both operations are behaving "correctly".
-        #  In these cases, do extra required casting here.
-        return pointwise_result
-
-    def get_op_from_name(self, op_name: str):
-        return tm.get_op_from_name(op_name)
-
-    # Subclasses are not expected to need to override check_opname, _check_op,
-    #  _check_divmod_op, or _combine.
-    #  Ideally any relevant overriding can be done in _cast_pointwise_result,
-    #  get_op_from_name, and the specification of `exc`. If you find a use
-    #  case that still requires overriding _check_op or _combine, please let
-    #  us know at github.com/pandas-dev/pandas/issues
-    @final
-    def check_opname(self, ser: pd.Series, op_name: str, other):
-        exc = self._get_expected_exception(op_name, ser, other)
-        op = self.get_op_from_name(op_name)
-
-        self._check_op(ser, op, other, op_name, exc)
-
-    # see comment on check_opname
-    @final
-    def _combine(self, obj, other, op):
-        if isinstance(obj, pd.DataFrame):
-            if len(obj.columns) != 1:
-                raise NotImplementedError
-            expected = obj.iloc[:, 0].combine(other, op).to_frame()
-        else:
-            expected = obj.combine(other, op)
-        return expected
-
-    # see comment on check_opname
-    @final
-    def _check_op(
-        self, ser: pd.Series, op, other, op_name: str, exc=NotImplementedError
-    ):
-        # Check that the Series/DataFrame arithmetic/comparison method matches
-        #  the pointwise result from _combine.
-
-        if exc is None:
-            result = op(ser, other)
-            expected = self._combine(ser, other, op)
-            expected = self._cast_pointwise_result(op_name, ser, other, expected)
-            assert isinstance(result, type(ser))
-            tm.assert_equal(result, expected)
-        else:
-            with pytest.raises(exc):
-                op(ser, other)
-
-    # see comment on check_opname
-    @final
-    def _check_divmod_op(self, ser: pd.Series, op, other):
-        # check that divmod behavior matches behavior of floordiv+mod
-        if op is divmod:
-            exc = self._get_expected_exception("__divmod__", ser, other)
-        else:
-            exc = self._get_expected_exception("__rdivmod__", ser, other)
-        if exc is None:
-            result_div, result_mod = op(ser, other)
-            if op is divmod:
-                expected_div, expected_mod = ser // other, ser % other
-            else:
-                expected_div, expected_mod = other // ser, other % ser
-            tm.assert_series_equal(result_div, expected_div)
-            tm.assert_series_equal(result_mod, expected_mod)
-        else:
-            with pytest.raises(exc):
-                divmod(ser, other)
-
-
-class BaseArithmeticOpsTests(BaseOpsUtil):
-    """
-    Various Series and DataFrame arithmetic ops methods.
-
-    Subclasses supporting various ops should set the class variables
-    to indicate that they support ops of that kind
-
-    * series_scalar_exc = TypeError
-    * frame_scalar_exc = TypeError
-    * series_array_exc = TypeError
-    * divmod_exc = TypeError
-    """
-
-    series_scalar_exc: type[Exception] | None = TypeError
-    frame_scalar_exc: type[Exception] | None = TypeError
-    series_array_exc: type[Exception] | None = TypeError
-    divmod_exc: type[Exception] | None = TypeError
-
-    def test_arith_series_with_scalar(self, data, all_arithmetic_operators):
-        # series & scalar
-        if all_arithmetic_operators == "__rmod__" and is_string_dtype(data.dtype):
-            pytest.skip("Skip testing Python string formatting")
-
-        op_name = all_arithmetic_operators
-        ser = pd.Series(data)
-        self.check_opname(ser, op_name, ser.iloc[0])
-
-    def test_arith_frame_with_scalar(self, data, all_arithmetic_operators):
-        # frame & scalar
-        if all_arithmetic_operators == "__rmod__" and is_string_dtype(data.dtype):
-            pytest.skip("Skip testing Python string formatting")
-
-        op_name = all_arithmetic_operators
-        df = pd.DataFrame({"A": data})
-        self.check_opname(df, op_name, data[0])
-
-    def test_arith_series_with_array(self, data, all_arithmetic_operators):
-        # ndarray & other series
-        op_name = all_arithmetic_operators
-        ser = pd.Series(data)
-        self.check_opname(ser, op_name, pd.Series([ser.iloc[0]] * len(ser)))
-
-    def test_divmod(self, data):
-        ser = pd.Series(data)
-        self._check_divmod_op(ser, divmod, 1)
-        self._check_divmod_op(1, ops.rdivmod, ser)
-
-    def test_divmod_series_array(self, data, data_for_twos):
-        ser = pd.Series(data)
-        self._check_divmod_op(ser, divmod, data)
-
-        other = data_for_twos
-        self._check_divmod_op(other, ops.rdivmod, ser)
-
-        other = pd.Series(other)
-        self._check_divmod_op(other, ops.rdivmod, ser)
-
-    def test_add_series_with_extension_array(self, data):
-        # Check adding an ExtensionArray to a Series of the same dtype matches
-        # the behavior of adding the arrays directly and then wrapping in a
-        # Series.
-
-        ser = pd.Series(data)
-
-        exc = self._get_expected_exception("__add__", ser, data)
-        if exc is not None:
-            with pytest.raises(exc):
-                ser + data
-            return
-
-        result = ser + data
-        expected = pd.Series(data + data)
-        tm.assert_series_equal(result, expected)
-
-    @pytest.mark.parametrize("box", [pd.Series, pd.DataFrame, pd.Index])
-    @pytest.mark.parametrize(
-        "op_name",
-        [
-            x
-            for x in tm.arithmetic_dunder_methods + tm.comparison_dunder_methods
-            if not x.startswith("__r")
-        ],
+if TYPE_CHECKING:
+    from collections.abc import (
+        Iterable,
+        Iterator,
     )
-    def test_direct_arith_with_ndframe_returns_not_implemented(
-        self, data, box, op_name
-    ):
-        # EAs should return NotImplemented for ops with Series/DataFrame/Index
-        # Pandas takes care of unboxing the series and calling the EA's op.
-        other = box(data)
 
-        if hasattr(data, op_name):
-            result = getattr(data, op_name)(other)
-            assert result is NotImplemented
+REDUCTIONS = ("sum", "prod", "min", "max")
+
+_unary_math_ops = (
+    "sin",
+    "cos",
+    "exp",
+    "log",
+    "expm1",
+    "log1p",
+    "sqrt",
+    "sinh",
+    "cosh",
+    "tanh",
+    "arcsin",
+    "arccos",
+    "arctan",
+    "arccosh",
+    "arcsinh",
+    "arctanh",
+    "abs",
+    "log10",
+    "floor",
+    "ceil",
+)
+_binary_math_ops = ("arctan2",)
+
+MATHOPS = _unary_math_ops + _binary_math_ops
 
 
-class BaseComparisonOpsTests(BaseOpsUtil):
-    """Various Series and DataFrame comparison ops methods."""
+LOCAL_TAG = "__pd_eval_local_"
 
-    def _compare_other(self, ser: pd.Series, data, op, other):
-        if op.__name__ in ["eq", "ne"]:
-            # comparison should match point-wise comparisons
-            result = op(ser, other)
-            expected = ser.combine(other, op)
-            expected = self._cast_pointwise_result(op.__name__, ser, other, expected)
-            tm.assert_series_equal(result, expected)
 
-        else:
-            exc = None
+class Term:
+    def __new__(cls, name, env, side=None, encoding=None):
+        klass = Constant if not isinstance(name, str) else cls
+        # error: Argument 2 for "super" not an instance of argument 1
+        supr_new = super(Term, klass).__new__  # type: ignore[misc]
+        return supr_new(klass)
+
+    is_local: bool
+
+    def __init__(self, name, env, side=None, encoding=None) -> None:
+        # name is a str for Term, but may be something else for subclasses
+        self._name = name
+        self.env = env
+        self.side = side
+        tname = str(name)
+        self.is_local = tname.startswith(LOCAL_TAG) or tname in DEFAULT_GLOBALS
+        self._value = self._resolve_name()
+        self.encoding = encoding
+
+    @property
+    def local_name(self) -> str:
+        return self.name.replace(LOCAL_TAG, "")
+
+    def __repr__(self) -> str:
+        return pprint_thing(self.name)
+
+    def __call__(self, *args, **kwargs):
+        return self.value
+
+    def evaluate(self, *args, **kwargs) -> Term:
+        return self
+
+    def _resolve_name(self):
+        local_name = str(self.local_name)
+        is_local = self.is_local
+        if local_name in self.env.scope and isinstance(
+            self.env.scope[local_name], type
+        ):
+            is_local = False
+
+        res = self.env.resolve(local_name, is_local=is_local)
+        self.update(res)
+
+        if hasattr(res, "ndim") and res.ndim > 2:
+            raise NotImplementedError(
+                "N-dimensional objects, where N > 2, are not supported with eval"
+            )
+        return res
+
+    def update(self, value) -> None:
+        """
+        search order for local (i.e., @variable) variables:
+
+        scope, key_variable
+        [('locals', 'local_name'),
+         ('globals', 'local_name'),
+         ('locals', 'key'),
+         ('globals', 'key')]
+        """
+        key = self.name
+
+        # if it's a variable name (otherwise a constant)
+        if isinstance(key, str):
+            self.env.swapkey(self.local_name, key, new_value=value)
+
+        self.value = value
+
+    @property
+    def is_scalar(self) -> bool:
+        return is_scalar(self._value)
+
+    @property
+    def type(self):
+        try:
+            # potentially very slow for large, mixed dtype frames
+            return self._value.values.dtype
+        except AttributeError:
             try:
-                result = op(ser, other)
-            except Exception as err:
-                exc = err
+                # ndarray
+                return self._value.dtype
+            except AttributeError:
+                # scalar
+                return type(self._value)
 
-            if exc is None:
-                # Didn't error, then should match pointwise behavior
-                expected = ser.combine(other, op)
-                expected = self._cast_pointwise_result(
-                    op.__name__, ser, other, expected
-                )
-                tm.assert_series_equal(result, expected)
+    return_type = type
+
+    @property
+    def raw(self) -> str:
+        return f"{type(self).__name__}(name={repr(self.name)}, type={self.type})"
+
+    @property
+    def is_datetime(self) -> bool:
+        try:
+            t = self.type.type
+        except AttributeError:
+            t = self.type
+
+        return issubclass(t, (datetime, np.datetime64))
+
+    @property
+    def value(self):
+        return self._value
+
+    @value.setter
+    def value(self, new_value) -> None:
+        self._value = new_value
+
+    @property
+    def name(self):
+        return self._name
+
+    @property
+    def ndim(self) -> int:
+        return self._value.ndim
+
+
+class Constant(Term):
+    def _resolve_name(self):
+        return self._name
+
+    @property
+    def name(self):
+        return self.value
+
+    def __repr__(self) -> str:
+        # in python 2 str() of float
+        # can truncate shorter than repr()
+        return repr(self.name)
+
+
+_bool_op_map = {"not": "~", "and": "&", "or": "|"}
+
+
+class Op:
+    """
+    Hold an operator of arbitrary arity.
+    """
+
+    op: str
+
+    def __init__(self, op: str, operands: Iterable[Term | Op], encoding=None) -> None:
+        self.op = _bool_op_map.get(op, op)
+        self.operands = operands
+        self.encoding = encoding
+
+    def __iter__(self) -> Iterator:
+        return iter(self.operands)
+
+    def __repr__(self) -> str:
+        """
+        Print a generic n-ary operator and its operands using infix notation.
+        """
+        # recurse over the operands
+        parened = (f"({pprint_thing(opr)})" for opr in self.operands)
+        return pprint_thing(f" {self.op} ".join(parened))
+
+    @property
+    def return_type(self):
+        # clobber types to bool if the op is a boolean operator
+        if self.op in (CMP_OPS_SYMS + BOOL_OPS_SYMS):
+            return np.bool_
+        return result_type_many(*(term.type for term in com.flatten(self)))
+
+    @property
+    def has_invalid_return_type(self) -> bool:
+        types = self.operand_types
+        obj_dtype_set = frozenset([np.dtype("object")])
+        return self.return_type == object and types - obj_dtype_set
+
+    @property
+    def operand_types(self):
+        return frozenset(term.type for term in com.flatten(self))
+
+    @property
+    def is_scalar(self) -> bool:
+        return all(operand.is_scalar for operand in self.operands)
+
+    @property
+    def is_datetime(self) -> bool:
+        try:
+            t = self.return_type.type
+        except AttributeError:
+            t = self.return_type
+
+        return issubclass(t, (datetime, np.datetime64))
+
+
+def _in(x, y):
+    """
+    Compute the vectorized membership of ``x in y`` if possible, otherwise
+    use Python.
+    """
+    try:
+        return x.isin(y)
+    except AttributeError:
+        if is_list_like(x):
+            try:
+                return y.isin(x)
+            except AttributeError:
+                pass
+        return x in y
+
+
+def _not_in(x, y):
+    """
+    Compute the vectorized membership of ``x not in y`` if possible,
+    otherwise use Python.
+    """
+    try:
+        return ~x.isin(y)
+    except AttributeError:
+        if is_list_like(x):
+            try:
+                return ~y.isin(x)
+            except AttributeError:
+                pass
+        return x not in y
+
+
+CMP_OPS_SYMS = (">", "<", ">=", "<=", "==", "!=", "in", "not in")
+_cmp_ops_funcs = (
+    operator.gt,
+    operator.lt,
+    operator.ge,
+    operator.le,
+    operator.eq,
+    operator.ne,
+    _in,
+    _not_in,
+)
+_cmp_ops_dict = dict(zip(CMP_OPS_SYMS, _cmp_ops_funcs))
+
+BOOL_OPS_SYMS = ("&", "|", "and", "or")
+_bool_ops_funcs = (operator.and_, operator.or_, operator.and_, operator.or_)
+_bool_ops_dict = dict(zip(BOOL_OPS_SYMS, _bool_ops_funcs))
+
+ARITH_OPS_SYMS = ("+", "-", "*", "/", "**", "//", "%")
+_arith_ops_funcs = (
+    operator.add,
+    operator.sub,
+    operator.mul,
+    operator.truediv,
+    operator.pow,
+    operator.floordiv,
+    operator.mod,
+)
+_arith_ops_dict = dict(zip(ARITH_OPS_SYMS, _arith_ops_funcs))
+
+SPECIAL_CASE_ARITH_OPS_SYMS = ("**", "//", "%")
+_special_case_arith_ops_funcs = (operator.pow, operator.floordiv, operator.mod)
+_special_case_arith_ops_dict = dict(
+    zip(SPECIAL_CASE_ARITH_OPS_SYMS, _special_case_arith_ops_funcs)
+)
+
+_binary_ops_dict = {}
+
+for d in (_cmp_ops_dict, _bool_ops_dict, _arith_ops_dict):
+    _binary_ops_dict.update(d)
+
+
+def is_term(obj) -> bool:
+    return isinstance(obj, Term)
+
+
+class BinOp(Op):
+    """
+    Hold a binary operator and its operands.
+
+    Parameters
+    ----------
+    op : str
+    lhs : Term or Op
+    rhs : Term or Op
+    """
+
+    def __init__(self, op: str, lhs, rhs) -> None:
+        super().__init__(op, (lhs, rhs))
+        self.lhs = lhs
+        self.rhs = rhs
+
+        self._disallow_scalar_only_bool_ops()
+
+        self.convert_values()
+
+        try:
+            self.func = _binary_ops_dict[op]
+        except KeyError as err:
+            # has to be made a list for python3
+            keys = list(_binary_ops_dict.keys())
+            raise ValueError(
+                f"Invalid binary operator {repr(op)}, valid operators are {keys}"
+            ) from err
+
+    def __call__(self, env):
+        """
+        Recursively evaluate an expression in Python space.
+
+        Parameters
+        ----------
+        env : Scope
+
+        Returns
+        -------
+        object
+            The result of an evaluated expression.
+        """
+        # recurse over the left/right nodes
+        left = self.lhs(env)
+        right = self.rhs(env)
+
+        return self.func(left, right)
+
+    def evaluate(self, env, engine: str, parser, term_type, eval_in_python):
+        """
+        Evaluate a binary operation *before* being passed to the engine.
+
+        Parameters
+        ----------
+        env : Scope
+        engine : str
+        parser : str
+        term_type : type
+        eval_in_python : list
+
+        Returns
+        -------
+        term_type
+            The "pre-evaluated" expression as an instance of ``term_type``
+        """
+        if engine == "python":
+            res = self(env)
+        else:
+            # recurse over the left/right nodes
+
+            left = self.lhs.evaluate(
+                env,
+                engine=engine,
+                parser=parser,
+                term_type=term_type,
+                eval_in_python=eval_in_python,
+            )
+
+            right = self.rhs.evaluate(
+                env,
+                engine=engine,
+                parser=parser,
+                term_type=term_type,
+                eval_in_python=eval_in_python,
+            )
+
+            # base cases
+            if self.op in eval_in_python:
+                res = self.func(left.value, right.value)
             else:
-                with pytest.raises(type(exc)):
-                    ser.combine(other, op)
+                from pandas.core.computation.eval import eval
 
-    def test_compare_scalar(self, data, comparison_op):
-        ser = pd.Series(data)
-        self._compare_other(ser, data, comparison_op, 0)
+                res = eval(self, local_dict=env, engine=engine, parser=parser)
 
-    def test_compare_array(self, data, comparison_op):
-        ser = pd.Series(data)
-        other = pd.Series([data[0]] * len(data), dtype=data.dtype)
-        self._compare_other(ser, data, comparison_op, other)
+        name = env.add_tmp(res)
+        return term_type(name, env=env)
+
+    def convert_values(self) -> None:
+        """
+        Convert datetimes to a comparable value in an expression.
+        """
+
+        def stringify(value):
+            encoder: Callable
+            if self.encoding is not None:
+                encoder = partial(pprint_thing_encoded, encoding=self.encoding)
+            else:
+                encoder = pprint_thing
+            return encoder(value)
+
+        lhs, rhs = self.lhs, self.rhs
+
+        if is_term(lhs) and lhs.is_datetime and is_term(rhs) and rhs.is_scalar:
+            v = rhs.value
+            if isinstance(v, (int, float)):
+                v = stringify(v)
+            v = Timestamp(ensure_decoded(v))
+            if v.tz is not None:
+                v = v.tz_convert("UTC")
+            self.rhs.update(v)
+
+        if is_term(rhs) and rhs.is_datetime and is_term(lhs) and lhs.is_scalar:
+            v = lhs.value
+            if isinstance(v, (int, float)):
+                v = stringify(v)
+            v = Timestamp(ensure_decoded(v))
+            if v.tz is not None:
+                v = v.tz_convert("UTC")
+            self.lhs.update(v)
+
+    def _disallow_scalar_only_bool_ops(self):
+        rhs = self.rhs
+        lhs = self.lhs
+
+        # GH#24883 unwrap dtype if necessary to ensure we have a type object
+        rhs_rt = rhs.return_type
+        rhs_rt = getattr(rhs_rt, "type", rhs_rt)
+        lhs_rt = lhs.return_type
+        lhs_rt = getattr(lhs_rt, "type", lhs_rt)
+        if (
+            (lhs.is_scalar or rhs.is_scalar)
+            and self.op in _bool_ops_dict
+            and (
+                not (
+                    issubclass(rhs_rt, (bool, np.bool_))
+                    and issubclass(lhs_rt, (bool, np.bool_))
+                )
+            )
+        ):
+            raise NotImplementedError("cannot evaluate scalar only bool ops")
 
 
-class BaseUnaryOpsTests(BaseOpsUtil):
-    def test_invert(self, data):
-        ser = pd.Series(data, name="name")
+def isnumeric(dtype) -> bool:
+    return issubclass(np.dtype(dtype).type, np.number)
+
+
+UNARY_OPS_SYMS = ("+", "-", "~", "not")
+_unary_ops_funcs = (operator.pos, operator.neg, operator.invert, operator.invert)
+_unary_ops_dict = dict(zip(UNARY_OPS_SYMS, _unary_ops_funcs))
+
+
+class UnaryOp(Op):
+    """
+    Hold a unary operator and its operands.
+
+    Parameters
+    ----------
+    op : str
+        The token used to represent the operator.
+    operand : Term or Op
+        The Term or Op operand to the operator.
+
+    Raises
+    ------
+    ValueError
+        * If no function associated with the passed operator token is found.
+    """
+
+    def __init__(self, op: Literal["+", "-", "~", "not"], operand) -> None:
+        super().__init__(op, (operand,))
+        self.operand = operand
+
         try:
-            # 10 is an arbitrary choice here, just avoid iterating over
-            #  the whole array to trim test runtime
-            [~x for x in data[:10]]
-        except TypeError:
-            # scalars don't support invert -> we don't expect the vectorized
-            #  operation to succeed
-            with pytest.raises(TypeError):
-                ~ser
-            with pytest.raises(TypeError):
-                ~data
-        else:
-            # Note we do not reuse the pointwise result to construct expected
-            #  because python semantics for negating bools are weird see GH#54569
-            result = ~ser
-            expected = pd.Series(~data, name="name")
-            tm.assert_series_equal(result, expected)
+            self.func = _unary_ops_dict[op]
+        except KeyError as err:
+            raise ValueError(
+                f"Invalid unary operator {repr(op)}, "
+                f"valid operators are {UNARY_OPS_SYMS}"
+            ) from err
 
-    @pytest.mark.parametrize("ufunc", [np.positive, np.negative, np.abs])
-    def test_unary_ufunc_dunder_equivalence(self, data, ufunc):
-        # the dunder __pos__ works if and only if np.positive works,
-        #  same for __neg__/np.negative and __abs__/np.abs
-        attr = {np.positive: "__pos__", np.negative: "__neg__", np.abs: "__abs__"}[
-            ufunc
-        ]
+    def __call__(self, env) -> MathCall:
+        operand = self.operand(env)
+        # error: Cannot call function of unknown type
+        return self.func(operand)  # type: ignore[operator]
 
-        exc = None
-        try:
-            result = getattr(data, attr)()
-        except Exception as err:
-            exc = err
+    def __repr__(self) -> str:
+        return pprint_thing(f"{self.op}({self.operand})")
 
-            # if __pos__ raised, then so should the ufunc
-            with pytest.raises((type(exc), TypeError)):
-                ufunc(data)
-        else:
-            alt = ufunc(data)
-            tm.assert_extension_array_equal(result, alt)
+    @property
+    def return_type(self) -> np.dtype:
+        operand = self.operand
+        if operand.return_type == np.dtype("bool"):
+            return np.dtype("bool")
+        if isinstance(operand, Op) and (
+            operand.op in _cmp_ops_dict or operand.op in _bool_ops_dict
+        ):
+            return np.dtype("bool")
+        return np.dtype("int")
+
+
+class MathCall(Op):
+    def __init__(self, func, args) -> None:
+        super().__init__(func.name, args)
+        self.func = func
+
+    def __call__(self, env):
+        # error: "Op" not callable
+        operands = [op(env) for op in self.operands]  # type: ignore[operator]
+        return self.func.func(*operands)
+
+    def __repr__(self) -> str:
+        operands = map(str, self.operands)
+        return pprint_thing(f"{self.op}({','.join(operands)})")
+
+
+class FuncNode:
+    def __init__(self, name: str) -> None:
+        if name not in MATHOPS:
+            raise ValueError(f'"{name}" is not a supported function')
+        self.name = name
+        self.func = getattr(np, name)
+
+    def __call__(self, *args) -> MathCall:
+        return MathCall(self, args)
