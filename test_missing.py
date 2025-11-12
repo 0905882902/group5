@@ -1,216 +1,163 @@
-import collections
-
 import numpy as np
 import pytest
 
-from pandas.core.dtypes.dtypes import CategoricalDtype
-
 import pandas as pd
 from pandas import (
-    Categorical,
     DataFrame,
     Index,
-    Series,
-    isna,
+    date_range,
 )
 import pandas._testing as tm
 
 
-class TestCategoricalMissing:
-    def test_isna(self):
-        exp = np.array([False, False, True])
-        cat = Categorical(["a", "b", np.nan])
-        res = cat.isna()
-
-        tm.assert_numpy_array_equal(res, exp)
-
-    def test_na_flags_int_categories(self):
-        # #1457
-
-        categories = list(range(10))
-        labels = np.random.default_rng(2).integers(0, 10, 20)
-        labels[::5] = -1
-
-        cat = Categorical(labels, categories)
-        repr(cat)
-
-        tm.assert_numpy_array_equal(isna(cat), labels == -1)
-
-    def test_nan_handling(self):
-        # Nans are represented as -1 in codes
-        c = Categorical(["a", "b", np.nan, "a"])
-        tm.assert_index_equal(c.categories, Index(["a", "b"]))
-        tm.assert_numpy_array_equal(c._codes, np.array([0, 1, -1, 0], dtype=np.int8))
-        c[1] = np.nan
-        tm.assert_index_equal(c.categories, Index(["a", "b"]))
-        tm.assert_numpy_array_equal(c._codes, np.array([0, -1, -1, 0], dtype=np.int8))
-
-        # Adding nan to categories should make assigned nan point to the
-        # category!
-        c = Categorical(["a", "b", np.nan, "a"])
-        tm.assert_index_equal(c.categories, Index(["a", "b"]))
-        tm.assert_numpy_array_equal(c._codes, np.array([0, 1, -1, 0], dtype=np.int8))
-
-    def test_set_dtype_nans(self):
-        c = Categorical(["a", "b", np.nan])
-        result = c._set_dtype(CategoricalDtype(["a", "c"]))
-        tm.assert_numpy_array_equal(result.codes, np.array([0, -1, -1], dtype="int8"))
-
-    def test_set_item_nan(self):
-        cat = Categorical([1, 2, 3])
-        cat[1] = np.nan
-
-        exp = Categorical([1, np.nan, 3], categories=[1, 2, 3])
-        tm.assert_categorical_equal(cat, exp)
-
-    @pytest.mark.parametrize(
-        "fillna_kwargs, msg",
-        [
-            (
-                {"value": 1, "method": "ffill"},
-                "Cannot specify both 'value' and 'method'.",
-            ),
-            ({}, "Must specify a fill 'value' or 'method'."),
-            ({"method": "bad"}, "Invalid fill method. Expecting .* bad"),
-            (
-                {"value": Series([1, 2, 3, 4, "a"])},
-                "Cannot setitem on a Categorical with a new category",
-            ),
-        ],
+@pytest.mark.parametrize("func", ["ffill", "bfill"])
+def test_groupby_column_index_name_lost_fill_funcs(func):
+    # GH: 29764 groupby loses index sometimes
+    df = DataFrame(
+        [[1, 1.0, -1.0], [1, np.nan, np.nan], [1, 2.0, -2.0]],
+        columns=Index(["type", "a", "b"], name="idx"),
     )
-    def test_fillna_raises(self, fillna_kwargs, msg):
-        # https://github.com/pandas-dev/pandas/issues/19682
-        # https://github.com/pandas-dev/pandas/issues/13628
-        cat = Categorical([1, 2, 3, None, None])
+    df_grouped = df.groupby(["type"])[["a", "b"]]
+    result = getattr(df_grouped, func)().columns
+    expected = Index(["a", "b"], name="idx")
+    tm.assert_index_equal(result, expected)
 
-        if len(fillna_kwargs) == 1 and "value" in fillna_kwargs:
-            err = TypeError
-        else:
-            err = ValueError
 
-        with pytest.raises(err, match=msg):
-            cat.fillna(**fillna_kwargs)
-
-    @pytest.mark.parametrize("named", [True, False])
-    def test_fillna_iterable_category(self, named):
-        # https://github.com/pandas-dev/pandas/issues/21097
-        if named:
-            Point = collections.namedtuple("Point", "x y")
-        else:
-            Point = lambda *args: args  # tuple
-        cat = Categorical(np.array([Point(0, 0), Point(0, 1), None], dtype=object))
-        result = cat.fillna(Point(0, 0))
-        expected = Categorical([Point(0, 0), Point(0, 1), Point(0, 0)])
-
-        tm.assert_categorical_equal(result, expected)
-
-        # Case where the Point is not among our categories; we want ValueError,
-        #  not NotImplementedError GH#41914
-        cat = Categorical(np.array([Point(1, 0), Point(0, 1), None], dtype=object))
-        msg = "Cannot setitem on a Categorical with a new category"
-        with pytest.raises(TypeError, match=msg):
-            cat.fillna(Point(0, 0))
-
-    def test_fillna_array(self):
-        # accept Categorical or ndarray value if it holds appropriate values
-        cat = Categorical(["A", "B", "C", None, None])
-
-        other = cat.fillna("C")
-        result = cat.fillna(other)
-        tm.assert_categorical_equal(result, other)
-        assert isna(cat[-1])  # didn't modify original inplace
-
-        other = np.array(["A", "B", "C", "B", "A"])
-        result = cat.fillna(other)
-        expected = Categorical(["A", "B", "C", "B", "A"], dtype=cat.dtype)
-        tm.assert_categorical_equal(result, expected)
-        assert isna(cat[-1])  # didn't modify original inplace
-
-    @pytest.mark.parametrize(
-        "values, expected",
-        [
-            ([1, 2, 3], np.array([False, False, False])),
-            ([1, 2, np.nan], np.array([False, False, True])),
-            ([1, 2, np.inf], np.array([False, False, True])),
-            ([1, 2, pd.NA], np.array([False, False, True])),
-        ],
+@pytest.mark.parametrize("func", ["ffill", "bfill"])
+def test_groupby_fill_duplicate_column_names(func):
+    # GH: 25610 ValueError with duplicate column names
+    df1 = DataFrame({"field1": [1, 3, 4], "field2": [1, 3, 4]})
+    df2 = DataFrame({"field1": [1, np.nan, 4]})
+    df_grouped = pd.concat([df1, df2], axis=1).groupby(by=["field2"])
+    expected = DataFrame(
+        [[1, 1.0], [3, np.nan], [4, 4.0]], columns=["field1", "field1"]
     )
-    def test_use_inf_as_na(self, values, expected):
-        # https://github.com/pandas-dev/pandas/issues/33594
-        msg = "use_inf_as_na option is deprecated"
-        with tm.assert_produces_warning(FutureWarning, match=msg):
-            with pd.option_context("mode.use_inf_as_na", True):
-                cat = Categorical(values)
-                result = cat.isna()
-                tm.assert_numpy_array_equal(result, expected)
+    result = getattr(df_grouped, func)()
+    tm.assert_frame_equal(result, expected)
 
-                result = Series(cat).isna()
-                expected = Series(expected)
-                tm.assert_series_equal(result, expected)
 
-                result = DataFrame(cat).isna()
-                expected = DataFrame(expected)
-                tm.assert_frame_equal(result, expected)
+def test_ffill_missing_arguments():
+    # GH 14955
+    df = DataFrame({"a": [1, 2], "b": [1, 1]})
+    msg = "DataFrameGroupBy.fillna is deprecated"
+    with tm.assert_produces_warning(FutureWarning, match=msg):
+        with pytest.raises(ValueError, match="Must specify a fill"):
+            df.groupby("b").fillna()
 
-    @pytest.mark.parametrize(
-        "values, expected",
-        [
-            ([1, 2, 3], np.array([False, False, False])),
-            ([1, 2, np.nan], np.array([False, False, True])),
-            ([1, 2, np.inf], np.array([False, False, True])),
-            ([1, 2, pd.NA], np.array([False, False, True])),
-        ],
+
+@pytest.mark.parametrize(
+    "method, expected", [("ffill", [None, "a", "a"]), ("bfill", ["a", "a", None])]
+)
+def test_fillna_with_string_dtype(method, expected):
+    # GH 40250
+    df = DataFrame({"a": pd.array([None, "a", None], dtype="string"), "b": [0, 0, 0]})
+    grp = df.groupby("b")
+    msg = "DataFrameGroupBy.fillna is deprecated"
+    with tm.assert_produces_warning(FutureWarning, match=msg):
+        result = grp.fillna(method=method)
+    expected = DataFrame({"a": pd.array(expected, dtype="string")})
+    tm.assert_frame_equal(result, expected)
+
+
+def test_fill_consistency():
+    # GH9221
+    # pass thru keyword arguments to the generated wrapper
+    # are set if the passed kw is None (only)
+    df = DataFrame(
+        index=pd.MultiIndex.from_product(
+            [["value1", "value2"], date_range("2014-01-01", "2014-01-06")]
+        ),
+        columns=Index(["1", "2"], name="id"),
     )
-    def test_use_inf_as_na_outside_context(self, values, expected):
-        # https://github.com/pandas-dev/pandas/issues/33594
-        # Using isna directly for Categorical will fail in general here
-        cat = Categorical(values)
+    df["1"] = [
+        np.nan,
+        1,
+        np.nan,
+        np.nan,
+        11,
+        np.nan,
+        np.nan,
+        2,
+        np.nan,
+        np.nan,
+        22,
+        np.nan,
+    ]
+    df["2"] = [
+        np.nan,
+        3,
+        np.nan,
+        np.nan,
+        33,
+        np.nan,
+        np.nan,
+        4,
+        np.nan,
+        np.nan,
+        44,
+        np.nan,
+    ]
 
-        msg = "use_inf_as_na option is deprecated"
-        with tm.assert_produces_warning(FutureWarning, match=msg):
-            with pd.option_context("mode.use_inf_as_na", True):
-                result = isna(cat)
-                tm.assert_numpy_array_equal(result, expected)
+    msg = "The 'axis' keyword in DataFrame.groupby is deprecated"
+    with tm.assert_produces_warning(FutureWarning, match=msg):
+        expected = df.groupby(level=0, axis=0).fillna(method="ffill")
 
-                result = isna(Series(cat))
-                expected = Series(expected)
-                tm.assert_series_equal(result, expected)
+    msg = "DataFrame.groupby with axis=1 is deprecated"
+    with tm.assert_produces_warning(FutureWarning, match=msg):
+        result = df.T.groupby(level=0, axis=1).fillna(method="ffill").T
+    tm.assert_frame_equal(result, expected)
 
-                result = isna(DataFrame(cat))
-                expected = DataFrame(expected)
-                tm.assert_frame_equal(result, expected)
 
-    @pytest.mark.parametrize(
-        "a1, a2, categories",
-        [
-            (["a", "b", "c"], [np.nan, "a", "b"], ["a", "b", "c"]),
-            ([1, 2, 3], [np.nan, 1, 2], [1, 2, 3]),
-        ],
-    )
-    def test_compare_categorical_with_missing(self, a1, a2, categories):
-        # GH 28384
-        cat_type = CategoricalDtype(categories)
+@pytest.mark.parametrize("method", ["ffill", "bfill"])
+@pytest.mark.parametrize("dropna", [True, False])
+@pytest.mark.parametrize("has_nan_group", [True, False])
+def test_ffill_handles_nan_groups(dropna, method, has_nan_group):
+    # GH 34725
 
-        # !=
-        result = Series(a1, dtype=cat_type) != Series(a2, dtype=cat_type)
-        expected = Series(a1) != Series(a2)
-        tm.assert_series_equal(result, expected)
+    df_without_nan_rows = DataFrame([(1, 0.1), (2, 0.2)])
 
-        # ==
-        result = Series(a1, dtype=cat_type) == Series(a2, dtype=cat_type)
-        expected = Series(a1) == Series(a2)
-        tm.assert_series_equal(result, expected)
+    ridx = [-1, 0, -1, -1, 1, -1]
+    df = df_without_nan_rows.reindex(ridx).reset_index(drop=True)
 
-    @pytest.mark.parametrize(
-        "na_value, dtype",
-        [
-            (pd.NaT, "datetime64[ns]"),
-            (None, "float64"),
-            (np.nan, "float64"),
-            (pd.NA, "float64"),
-        ],
-    )
-    def test_categorical_only_missing_values_no_cast(self, na_value, dtype):
-        # GH#44900
-        result = Categorical([na_value, na_value])
-        tm.assert_index_equal(result.categories, Index([], dtype=dtype))
+    group_b = np.nan if has_nan_group else "b"
+    df["group_col"] = pd.Series(["a"] * 3 + [group_b] * 3)
+
+    grouped = df.groupby(by="group_col", dropna=dropna)
+    result = getattr(grouped, method)(limit=None)
+
+    expected_rows = {
+        ("ffill", True, True): [-1, 0, 0, -1, -1, -1],
+        ("ffill", True, False): [-1, 0, 0, -1, 1, 1],
+        ("ffill", False, True): [-1, 0, 0, -1, 1, 1],
+        ("ffill", False, False): [-1, 0, 0, -1, 1, 1],
+        ("bfill", True, True): [0, 0, -1, -1, -1, -1],
+        ("bfill", True, False): [0, 0, -1, 1, 1, -1],
+        ("bfill", False, True): [0, 0, -1, 1, 1, -1],
+        ("bfill", False, False): [0, 0, -1, 1, 1, -1],
+    }
+
+    ridx = expected_rows.get((method, dropna, has_nan_group))
+    expected = df_without_nan_rows.reindex(ridx).reset_index(drop=True)
+    # columns are a 'take' on df.columns, which are object dtype
+    expected.columns = expected.columns.astype(object)
+
+    tm.assert_frame_equal(result, expected)
+
+
+@pytest.mark.parametrize("min_count, value", [(2, np.nan), (-1, 1.0)])
+@pytest.mark.parametrize("func", ["first", "last", "max", "min"])
+def test_min_count(func, min_count, value):
+    # GH#37821
+    df = DataFrame({"a": [1] * 3, "b": [1, np.nan, np.nan], "c": [np.nan] * 3})
+    result = getattr(df.groupby("a"), func)(min_count=min_count)
+    expected = DataFrame({"b": [value], "c": [np.nan]}, index=Index([1], name="a"))
+    tm.assert_frame_equal(result, expected)
+
+
+def test_indices_with_missing():
+    # GH 9304
+    df = DataFrame({"a": [1, 1, np.nan], "b": [2, 3, 4], "c": [5, 6, 7]})
+    g = df.groupby(["a", "b"])
+    result = g.indices
+    expected = {(1.0, 2): np.array([0]), (1.0, 3): np.array([1])}
+    assert result == expected

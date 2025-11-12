@@ -1,977 +1,496 @@
 import numpy as np
 import pytest
 
-from pandas._config import using_string_dtype
-
 import pandas as pd
 from pandas import (
     DataFrame,
     Index,
-    Series,
-    Timestamp,
 )
 import pandas._testing as tm
 
 
-@pytest.fixture(
-    params=[["linear", "single"], ["nearest", "table"]], ids=lambda x: "-".join(x)
+@pytest.mark.parametrize(
+    "interpolation", ["linear", "lower", "higher", "nearest", "midpoint"]
 )
-def interp_method(request):
-    """(interpolation, method) arguments for quantile"""
-    return request.param
-
-
-class TestDataFrameQuantile:
-    @pytest.mark.parametrize(
-        "df,expected",
-        [
-            [
-                DataFrame(
-                    {
-                        0: Series(pd.arrays.SparseArray([1, 2])),
-                        1: Series(pd.arrays.SparseArray([3, 4])),
-                    }
-                ),
-                Series([1.5, 3.5], name=0.5),
-            ],
-            [
-                DataFrame(Series([0.0, None, 1.0, 2.0], dtype="Sparse[float]")),
-                Series([1.0], name=0.5),
-            ],
-        ],
-    )
-    def test_quantile_sparse(self, df, expected):
-        # GH#17198
-        # GH#24600
-        result = df.quantile()
-        expected = expected.astype("Sparse[float]")
-        tm.assert_series_equal(result, expected)
-
-    def test_quantile(
-        self, datetime_frame, interp_method, using_array_manager, request
+@pytest.mark.parametrize(
+    "a_vals,b_vals",
+    [
+        # Ints
+        ([1, 2, 3, 4, 5], [5, 4, 3, 2, 1]),
+        ([1, 2, 3, 4], [4, 3, 2, 1]),
+        ([1, 2, 3, 4, 5], [4, 3, 2, 1]),
+        # Floats
+        ([1.0, 2.0, 3.0, 4.0, 5.0], [5.0, 4.0, 3.0, 2.0, 1.0]),
+        # Missing data
+        ([1.0, np.nan, 3.0, np.nan, 5.0], [5.0, np.nan, 3.0, np.nan, 1.0]),
+        ([np.nan, 4.0, np.nan, 2.0, np.nan], [np.nan, 4.0, np.nan, 2.0, np.nan]),
+        # Timestamps
+        (
+            pd.date_range("1/1/18", freq="D", periods=5),
+            pd.date_range("1/1/18", freq="D", periods=5)[::-1],
+        ),
+        (
+            pd.date_range("1/1/18", freq="D", periods=5).as_unit("s"),
+            pd.date_range("1/1/18", freq="D", periods=5)[::-1].as_unit("s"),
+        ),
+        # All NA
+        ([np.nan] * 5, [np.nan] * 5),
+    ],
+)
+@pytest.mark.parametrize("q", [0, 0.25, 0.5, 0.75, 1])
+def test_quantile(interpolation, a_vals, b_vals, q, request):
+    if (
+        interpolation == "nearest"
+        and q == 0.5
+        and isinstance(b_vals, list)
+        and b_vals == [4, 3, 2, 1]
     ):
-        interpolation, method = interp_method
-        df = datetime_frame
-        result = df.quantile(
-            0.1, axis=0, numeric_only=True, interpolation=interpolation, method=method
-        )
-        expected = Series(
-            [np.percentile(df[col], 10) for col in df.columns],
-            index=df.columns,
-            name=0.1,
-        )
-        if interpolation == "linear":
-            # np.percentile values only comparable to linear interpolation
-            tm.assert_series_equal(result, expected)
-        else:
-            tm.assert_index_equal(result.index, expected.index)
-            request.applymarker(
-                pytest.mark.xfail(
-                    using_array_manager, reason="Name set incorrectly for arraymanager"
-                )
+        request.applymarker(
+            pytest.mark.xfail(
+                reason="Unclear numpy expectation for nearest "
+                "result with equidistant data"
             )
-            assert result.name == expected.name
-
-        result = df.quantile(
-            0.9, axis=1, numeric_only=True, interpolation=interpolation, method=method
         )
-        expected = Series(
-            [np.percentile(df.loc[date], 90) for date in df.index],
-            index=df.index,
-            name=0.9,
-        )
-        if interpolation == "linear":
-            # np.percentile values only comparable to linear interpolation
-            tm.assert_series_equal(result, expected)
-        else:
-            tm.assert_index_equal(result.index, expected.index)
-            request.applymarker(
-                pytest.mark.xfail(
-                    using_array_manager, reason="Name set incorrectly for arraymanager"
-                )
-            )
-            assert result.name == expected.name
+    all_vals = pd.concat([pd.Series(a_vals), pd.Series(b_vals)])
 
-    def test_empty(self, interp_method):
-        interpolation, method = interp_method
-        q = DataFrame({"x": [], "y": []}).quantile(
-            0.1, axis=0, numeric_only=True, interpolation=interpolation, method=method
-        )
-        assert np.isnan(q["x"]) and np.isnan(q["y"])
+    a_expected = pd.Series(a_vals).quantile(q, interpolation=interpolation)
+    b_expected = pd.Series(b_vals).quantile(q, interpolation=interpolation)
 
-    def test_non_numeric_exclusion(self, interp_method, request, using_array_manager):
-        interpolation, method = interp_method
-        df = DataFrame({"col1": ["A", "A", "B", "B"], "col2": [1, 2, 3, 4]})
-        rs = df.quantile(
-            0.5, numeric_only=True, interpolation=interpolation, method=method
-        )
-        xp = df.median(numeric_only=True).rename(0.5)
-        if interpolation == "nearest":
-            xp = (xp + 0.5).astype(np.int64)
-        if method == "table" and using_array_manager:
-            request.applymarker(pytest.mark.xfail(reason="Axis name incorrectly set."))
-        tm.assert_series_equal(rs, xp)
+    df = DataFrame({"key": ["a"] * len(a_vals) + ["b"] * len(b_vals), "val": all_vals})
 
-    def test_axis(self, interp_method, request, using_array_manager):
-        # axis
-        interpolation, method = interp_method
-        df = DataFrame({"A": [1, 2, 3], "B": [2, 3, 4]}, index=[1, 2, 3])
-        result = df.quantile(0.5, axis=1, interpolation=interpolation, method=method)
-        expected = Series([1.5, 2.5, 3.5], index=[1, 2, 3], name=0.5)
-        if interpolation == "nearest":
-            expected = expected.astype(np.int64)
-        if method == "table" and using_array_manager:
-            request.applymarker(pytest.mark.xfail(reason="Axis name incorrectly set."))
-        tm.assert_series_equal(result, expected)
+    expected = DataFrame(
+        [a_expected, b_expected], columns=["val"], index=Index(["a", "b"], name="key")
+    )
+    if all_vals.dtype.kind == "M" and expected.dtypes.values[0].kind == "M":
+        # TODO(non-nano): this should be unnecessary once array_to_datetime
+        #  correctly infers non-nano from Timestamp.unit
+        expected = expected.astype(all_vals.dtype)
+    result = df.groupby("key").quantile(q, interpolation=interpolation)
 
-        result = df.quantile(
-            [0.5, 0.75], axis=1, interpolation=interpolation, method=method
-        )
-        expected = DataFrame(
-            {1: [1.5, 1.75], 2: [2.5, 2.75], 3: [3.5, 3.75]}, index=[0.5, 0.75]
-        )
-        if interpolation == "nearest":
-            expected.iloc[0, :] -= 0.5
-            expected.iloc[1, :] += 0.25
-            expected = expected.astype(np.int64)
-        tm.assert_frame_equal(result, expected, check_index_type=True)
+    tm.assert_frame_equal(result, expected)
 
-    def test_axis_numeric_only_true(self, interp_method, request, using_array_manager):
-        # We may want to break API in the future to change this
-        # so that we exclude non-numeric along the same axis
-        # See GH #7312
-        interpolation, method = interp_method
-        df = DataFrame([[1, 2, 3], ["a", "b", 4]])
-        result = df.quantile(
-            0.5, axis=1, numeric_only=True, interpolation=interpolation, method=method
-        )
-        expected = Series([3.0, 4.0], index=[0, 1], name=0.5)
-        if interpolation == "nearest":
-            expected = expected.astype(np.int64)
-        if method == "table" and using_array_manager:
-            request.applymarker(pytest.mark.xfail(reason="Axis name incorrectly set."))
-        tm.assert_series_equal(result, expected)
 
-    def test_quantile_date_range(self, interp_method, request, using_array_manager):
-        # GH 2460
-        interpolation, method = interp_method
-        dti = pd.date_range("2016-01-01", periods=3, tz="US/Pacific")
-        ser = Series(dti)
-        df = DataFrame(ser)
+def test_quantile_array():
+    # https://github.com/pandas-dev/pandas/issues/27526
+    df = DataFrame({"A": [0, 1, 2, 3, 4]})
+    key = np.array([0, 0, 1, 1, 1], dtype=np.int64)
+    result = df.groupby(key).quantile([0.25])
 
-        result = df.quantile(
-            numeric_only=False, interpolation=interpolation, method=method
-        )
-        expected = Series(
-            ["2016-01-02 00:00:00"], name=0.5, dtype="datetime64[ns, US/Pacific]"
-        )
-        if method == "table" and using_array_manager:
-            request.applymarker(pytest.mark.xfail(reason="Axis name incorrectly set."))
+    index = pd.MultiIndex.from_product([[0, 1], [0.25]])
+    expected = DataFrame({"A": [0.25, 2.50]}, index=index)
+    tm.assert_frame_equal(result, expected)
 
-        tm.assert_series_equal(result, expected)
+    df = DataFrame({"A": [0, 1, 2, 3], "B": [4, 5, 6, 7]})
+    index = pd.MultiIndex.from_product([[0, 1], [0.25, 0.75]])
 
-    def test_quantile_axis_mixed(self, interp_method, request, using_array_manager):
-        # mixed on axis=1
-        interpolation, method = interp_method
-        df = DataFrame(
-            {
-                "A": [1, 2, 3],
-                "B": [2.0, 3.0, 4.0],
-                "C": pd.date_range("20130101", periods=3),
-                "D": ["foo", "bar", "baz"],
-            }
-        )
-        result = df.quantile(
-            0.5, axis=1, numeric_only=True, interpolation=interpolation, method=method
-        )
-        expected = Series([1.5, 2.5, 3.5], name=0.5)
-        if interpolation == "nearest":
-            expected -= 0.5
-        if method == "table" and using_array_manager:
-            request.applymarker(pytest.mark.xfail(reason="Axis name incorrectly set."))
-        tm.assert_series_equal(result, expected)
+    key = np.array([0, 0, 1, 1], dtype=np.int64)
+    result = df.groupby(key).quantile([0.25, 0.75])
+    expected = DataFrame(
+        {"A": [0.25, 0.75, 2.25, 2.75], "B": [4.25, 4.75, 6.25, 6.75]}, index=index
+    )
+    tm.assert_frame_equal(result, expected)
 
-        # must raise
-        msg = "'<' not supported between instances of 'Timestamp' and 'float'"
+
+def test_quantile_array2():
+    # https://github.com/pandas-dev/pandas/pull/28085#issuecomment-524066959
+    arr = np.random.default_rng(2).integers(0, 5, size=(10, 3), dtype=np.int64)
+    df = DataFrame(arr, columns=list("ABC"))
+    result = df.groupby("A").quantile([0.3, 0.7])
+    expected = DataFrame(
+        {
+            "B": [2.0, 2.0, 2.3, 2.7, 0.3, 0.7, 3.2, 4.0, 0.3, 0.7],
+            "C": [1.0, 1.0, 1.9, 3.0999999999999996, 0.3, 0.7, 2.6, 3.0, 1.2, 2.8],
+        },
+        index=pd.MultiIndex.from_product(
+            [[0, 1, 2, 3, 4], [0.3, 0.7]], names=["A", None]
+        ),
+    )
+    tm.assert_frame_equal(result, expected)
+
+
+def test_quantile_array_no_sort():
+    df = DataFrame({"A": [0, 1, 2], "B": [3, 4, 5]})
+    key = np.array([1, 0, 1], dtype=np.int64)
+    result = df.groupby(key, sort=False).quantile([0.25, 0.5, 0.75])
+    expected = DataFrame(
+        {"A": [0.5, 1.0, 1.5, 1.0, 1.0, 1.0], "B": [3.5, 4.0, 4.5, 4.0, 4.0, 4.0]},
+        index=pd.MultiIndex.from_product([[1, 0], [0.25, 0.5, 0.75]]),
+    )
+    tm.assert_frame_equal(result, expected)
+
+    result = df.groupby(key, sort=False).quantile([0.75, 0.25])
+    expected = DataFrame(
+        {"A": [1.5, 0.5, 1.0, 1.0], "B": [4.5, 3.5, 4.0, 4.0]},
+        index=pd.MultiIndex.from_product([[1, 0], [0.75, 0.25]]),
+    )
+    tm.assert_frame_equal(result, expected)
+
+
+def test_quantile_array_multiple_levels():
+    df = DataFrame(
+        {"A": [0, 1, 2], "B": [3, 4, 5], "c": ["a", "a", "a"], "d": ["a", "a", "b"]}
+    )
+    result = df.groupby(["c", "d"]).quantile([0.25, 0.75])
+    index = pd.MultiIndex.from_tuples(
+        [("a", "a", 0.25), ("a", "a", 0.75), ("a", "b", 0.25), ("a", "b", 0.75)],
+        names=["c", "d", None],
+    )
+    expected = DataFrame(
+        {"A": [0.25, 0.75, 2.0, 2.0], "B": [3.25, 3.75, 5.0, 5.0]}, index=index
+    )
+    tm.assert_frame_equal(result, expected)
+
+
+@pytest.mark.parametrize("frame_size", [(2, 3), (100, 10)])
+@pytest.mark.parametrize("groupby", [[0], [0, 1]])
+@pytest.mark.parametrize("q", [[0.5, 0.6]])
+def test_groupby_quantile_with_arraylike_q_and_int_columns(frame_size, groupby, q):
+    # GH30289
+    nrow, ncol = frame_size
+    df = DataFrame(np.array([ncol * [_ % 4] for _ in range(nrow)]), columns=range(ncol))
+
+    idx_levels = [np.arange(min(nrow, 4))] * len(groupby) + [q]
+    idx_codes = [[x for x in range(min(nrow, 4)) for _ in q]] * len(groupby) + [
+        list(range(len(q))) * min(nrow, 4)
+    ]
+    expected_index = pd.MultiIndex(
+        levels=idx_levels, codes=idx_codes, names=groupby + [None]
+    )
+    expected_values = [
+        [float(x)] * (ncol - len(groupby)) for x in range(min(nrow, 4)) for _ in q
+    ]
+    expected_columns = [x for x in range(ncol) if x not in groupby]
+    expected = DataFrame(
+        expected_values, index=expected_index, columns=expected_columns
+    )
+    result = df.groupby(groupby).quantile(q)
+
+    tm.assert_frame_equal(result, expected)
+
+
+def test_quantile_raises():
+    df = DataFrame([["foo", "a"], ["foo", "b"], ["foo", "c"]], columns=["key", "val"])
+
+    msg = "dtype '(object|str)' does not support operation 'quantile'"
+    with pytest.raises(TypeError, match=msg):
+        df.groupby("key").quantile()
+
+
+def test_quantile_out_of_bounds_q_raises():
+    # https://github.com/pandas-dev/pandas/issues/27470
+    df = DataFrame({"a": [0, 0, 0, 1, 1, 1], "b": range(6)})
+    g = df.groupby([0, 0, 0, 1, 1, 1])
+    with pytest.raises(ValueError, match="Got '50.0' instead"):
+        g.quantile(50)
+
+    with pytest.raises(ValueError, match="Got '-1.0' instead"):
+        g.quantile(-1)
+
+
+def test_quantile_missing_group_values_no_segfaults():
+    # GH 28662
+    data = np.array([1.0, np.nan, 1.0])
+    df = DataFrame({"key": data, "val": range(3)})
+
+    # Random segfaults; would have been guaranteed in loop
+    grp = df.groupby("key")
+    for _ in range(100):
+        grp.quantile()
+
+
+@pytest.mark.parametrize(
+    "key, val, expected_key, expected_val",
+    [
+        ([1.0, np.nan, 3.0, np.nan], range(4), [1.0, 3.0], [0.0, 2.0]),
+        ([1.0, np.nan, 2.0, 2.0], range(4), [1.0, 2.0], [0.0, 2.5]),
+        (["a", "b", "b", np.nan], range(4), ["a", "b"], [0, 1.5]),
+        ([0], [42], [0], [42.0]),
+        ([], [], np.array([], dtype="float64"), np.array([], dtype="float64")),
+    ],
+)
+def test_quantile_missing_group_values_correct_results(
+    key, val, expected_key, expected_val
+):
+    # GH 28662, GH 33200, GH 33569
+    df = DataFrame({"key": key, "val": val})
+
+    expected = DataFrame(
+        expected_val, index=Index(expected_key, name="key"), columns=["val"]
+    )
+
+    grp = df.groupby("key")
+
+    result = grp.quantile(0.5)
+    tm.assert_frame_equal(result, expected)
+
+    result = grp.quantile()
+    tm.assert_frame_equal(result, expected)
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        pd.array([1, 0, None] * 2, dtype="Int64"),
+        pd.array([True, False, None] * 2, dtype="boolean"),
+    ],
+)
+@pytest.mark.parametrize("q", [0.5, [0.0, 0.5, 1.0]])
+def test_groupby_quantile_nullable_array(values, q):
+    # https://github.com/pandas-dev/pandas/issues/33136
+    df = DataFrame({"a": ["x"] * 3 + ["y"] * 3, "b": values})
+    result = df.groupby("a")["b"].quantile(q)
+
+    if isinstance(q, list):
+        idx = pd.MultiIndex.from_product((["x", "y"], q), names=["a", None])
+        true_quantiles = [0.0, 0.5, 1.0]
+    else:
+        idx = Index(["x", "y"], name="a")
+        true_quantiles = [0.5]
+
+    expected = pd.Series(true_quantiles * 2, index=idx, name="b", dtype="Float64")
+    tm.assert_series_equal(result, expected)
+
+
+@pytest.mark.parametrize("q", [0.5, [0.0, 0.5, 1.0]])
+@pytest.mark.parametrize("numeric_only", [True, False])
+def test_groupby_quantile_raises_on_invalid_dtype(q, numeric_only):
+    df = DataFrame({"a": [1], "b": [2.0], "c": ["x"]})
+    if numeric_only:
+        result = df.groupby("a").quantile(q, numeric_only=numeric_only)
+        expected = df.groupby("a")[["b"]].quantile(q)
+        tm.assert_frame_equal(result, expected)
+    else:
+        msg = "dtype '.*' does not support operation 'quantile'"
         with pytest.raises(TypeError, match=msg):
-            df.quantile(0.5, axis=1, numeric_only=False)
+            df.groupby("a").quantile(q, numeric_only=numeric_only)
 
-    def test_quantile_axis_parameter(self, interp_method, request, using_array_manager):
-        # GH 9543/9544
-        interpolation, method = interp_method
-        if method == "table" and using_array_manager:
-            request.applymarker(pytest.mark.xfail(reason="Axis name incorrectly set."))
-        df = DataFrame({"A": [1, 2, 3], "B": [2, 3, 4]}, index=[1, 2, 3])
 
-        result = df.quantile(0.5, axis=0, interpolation=interpolation, method=method)
+def test_groupby_quantile_NA_float(any_float_dtype):
+    # GH#42849
+    df = DataFrame({"x": [1, 1], "y": [0.2, np.nan]}, dtype=any_float_dtype)
+    result = df.groupby("x")["y"].quantile(0.5)
+    exp_index = Index([1.0], dtype=any_float_dtype, name="x")
 
-        expected = Series([2.0, 3.0], index=["A", "B"], name=0.5)
-        if interpolation == "nearest":
-            expected = expected.astype(np.int64)
-        tm.assert_series_equal(result, expected)
+    if any_float_dtype in ["Float32", "Float64"]:
+        expected_dtype = any_float_dtype
+    else:
+        expected_dtype = None
 
-        expected = df.quantile(
-            0.5, axis="index", interpolation=interpolation, method=method
-        )
-        if interpolation == "nearest":
-            expected = expected.astype(np.int64)
-        tm.assert_series_equal(result, expected)
+    expected = pd.Series([0.2], dtype=expected_dtype, index=exp_index, name="y")
+    tm.assert_series_equal(result, expected)
 
-        result = df.quantile(0.5, axis=1, interpolation=interpolation, method=method)
-
-        expected = Series([1.5, 2.5, 3.5], index=[1, 2, 3], name=0.5)
-        if interpolation == "nearest":
-            expected = expected.astype(np.int64)
-        tm.assert_series_equal(result, expected)
-
-        result = df.quantile(
-            0.5, axis="columns", interpolation=interpolation, method=method
-        )
-        tm.assert_series_equal(result, expected)
-
-        msg = "No axis named -1 for object type DataFrame"
-        with pytest.raises(ValueError, match=msg):
-            df.quantile(0.1, axis=-1, interpolation=interpolation, method=method)
-        msg = "No axis named column for object type DataFrame"
-        with pytest.raises(ValueError, match=msg):
-            df.quantile(0.1, axis="column")
-
-    def test_quantile_interpolation(self):
-        # see gh-10174
-
-        # interpolation method other than default linear
-        df = DataFrame({"A": [1, 2, 3], "B": [2, 3, 4]}, index=[1, 2, 3])
-        result = df.quantile(0.5, axis=1, interpolation="nearest")
-        expected = Series([1, 2, 3], index=[1, 2, 3], name=0.5)
-        tm.assert_series_equal(result, expected)
-
-        # cross-check interpolation=nearest results in original dtype
-        exp = np.percentile(
-            np.array([[1, 2, 3], [2, 3, 4]]),
-            0.5,
-            axis=0,
-            method="nearest",
-        )
-        expected = Series(exp, index=[1, 2, 3], name=0.5, dtype="int64")
-        tm.assert_series_equal(result, expected)
-
-        # float
-        df = DataFrame({"A": [1.0, 2.0, 3.0], "B": [2.0, 3.0, 4.0]}, index=[1, 2, 3])
-        result = df.quantile(0.5, axis=1, interpolation="nearest")
-        expected = Series([1.0, 2.0, 3.0], index=[1, 2, 3], name=0.5)
-        tm.assert_series_equal(result, expected)
-        exp = np.percentile(
-            np.array([[1.0, 2.0, 3.0], [2.0, 3.0, 4.0]]),
-            0.5,
-            axis=0,
-            method="nearest",
-        )
-        expected = Series(exp, index=[1, 2, 3], name=0.5, dtype="float64")
-        tm.assert_series_equal(result, expected)
-
-        # axis
-        result = df.quantile([0.5, 0.75], axis=1, interpolation="lower")
-        expected = DataFrame(
-            {1: [1.0, 1.0], 2: [2.0, 2.0], 3: [3.0, 3.0]}, index=[0.5, 0.75]
-        )
-        tm.assert_frame_equal(result, expected)
-
-        # test degenerate case
-        df = DataFrame({"x": [], "y": []})
-        q = df.quantile(0.1, axis=0, interpolation="higher")
-        assert np.isnan(q["x"]) and np.isnan(q["y"])
-
-        # multi
-        df = DataFrame([[1, 1, 1], [2, 2, 2], [3, 3, 3]], columns=["a", "b", "c"])
-        result = df.quantile([0.25, 0.5], interpolation="midpoint")
-
-        # https://github.com/numpy/numpy/issues/7163
-        expected = DataFrame(
-            [[1.5, 1.5, 1.5], [2.0, 2.0, 2.0]],
-            index=[0.25, 0.5],
-            columns=["a", "b", "c"],
-        )
-        tm.assert_frame_equal(result, expected)
-
-    def test_quantile_interpolation_datetime(self, datetime_frame):
-        # see gh-10174
-
-        # interpolation = linear (default case)
-        df = datetime_frame
-        q = df.quantile(0.1, axis=0, numeric_only=True, interpolation="linear")
-        assert q["A"] == np.percentile(df["A"], 10)
-
-    def test_quantile_interpolation_int(self, int_frame):
-        # see gh-10174
-
-        df = int_frame
-        # interpolation = linear (default case)
-        q = df.quantile(0.1)
-        assert q["A"] == np.percentile(df["A"], 10)
-
-        # test with and without interpolation keyword
-        q1 = df.quantile(0.1, axis=0, interpolation="linear")
-        assert q1["A"] == np.percentile(df["A"], 10)
-        tm.assert_series_equal(q, q1)
-
-    def test_quantile_multi(self, interp_method, request, using_array_manager):
-        interpolation, method = interp_method
-        df = DataFrame([[1, 1, 1], [2, 2, 2], [3, 3, 3]], columns=["a", "b", "c"])
-        result = df.quantile([0.25, 0.5], interpolation=interpolation, method=method)
-        expected = DataFrame(
-            [[1.5, 1.5, 1.5], [2.0, 2.0, 2.0]],
-            index=[0.25, 0.5],
-            columns=["a", "b", "c"],
-        )
-        if interpolation == "nearest":
-            expected = expected.astype(np.int64)
-        if method == "table" and using_array_manager:
-            request.applymarker(pytest.mark.xfail(reason="Axis name incorrectly set."))
-        tm.assert_frame_equal(result, expected)
-
-    def test_quantile_multi_axis_1(self, interp_method, request, using_array_manager):
-        interpolation, method = interp_method
-        df = DataFrame([[1, 1, 1], [2, 2, 2], [3, 3, 3]], columns=["a", "b", "c"])
-        result = df.quantile(
-            [0.25, 0.5], axis=1, interpolation=interpolation, method=method
-        )
-        expected = DataFrame(
-            [[1.0, 2.0, 3.0]] * 2, index=[0.25, 0.5], columns=[0, 1, 2]
-        )
-        if interpolation == "nearest":
-            expected = expected.astype(np.int64)
-        if method == "table" and using_array_manager:
-            request.applymarker(pytest.mark.xfail(reason="Axis name incorrectly set."))
-        tm.assert_frame_equal(result, expected)
-
-    def test_quantile_multi_empty(self, interp_method):
-        interpolation, method = interp_method
-        result = DataFrame({"x": [], "y": []}).quantile(
-            [0.1, 0.9], axis=0, interpolation=interpolation, method=method
-        )
-        expected = DataFrame(
-            {"x": [np.nan, np.nan], "y": [np.nan, np.nan]}, index=[0.1, 0.9]
-        )
-        tm.assert_frame_equal(result, expected)
-
-    def test_quantile_datetime(self, unit):
-        dti = pd.to_datetime(["2010", "2011"]).as_unit(unit)
-        df = DataFrame({"a": dti, "b": [0, 5]})
-
-        # exclude datetime
-        result = df.quantile(0.5, numeric_only=True)
-        expected = Series([2.5], index=["b"], name=0.5)
-        tm.assert_series_equal(result, expected)
-
-        # datetime
-        result = df.quantile(0.5, numeric_only=False)
-        expected = Series(
-            [Timestamp("2010-07-02 12:00:00"), 2.5], index=["a", "b"], name=0.5
-        )
-        tm.assert_series_equal(result, expected)
-
-        # datetime w/ multi
-        result = df.quantile([0.5], numeric_only=False)
-        expected = DataFrame(
-            {"a": Timestamp("2010-07-02 12:00:00").as_unit(unit), "b": 2.5},
-            index=[0.5],
-        )
-        tm.assert_frame_equal(result, expected)
-
-        # axis = 1
-        df["c"] = pd.to_datetime(["2011", "2012"]).as_unit(unit)
-        result = df[["a", "c"]].quantile(0.5, axis=1, numeric_only=False)
-        expected = Series(
-            [Timestamp("2010-07-02 12:00:00"), Timestamp("2011-07-02 12:00:00")],
-            index=[0, 1],
-            name=0.5,
-            dtype=f"M8[{unit}]",
-        )
-        tm.assert_series_equal(result, expected)
-
-        result = df[["a", "c"]].quantile([0.5], axis=1, numeric_only=False)
-        expected = DataFrame(
-            [[Timestamp("2010-07-02 12:00:00"), Timestamp("2011-07-02 12:00:00")]],
-            index=[0.5],
-            columns=[0, 1],
-            dtype=f"M8[{unit}]",
-        )
-        tm.assert_frame_equal(result, expected)
-
-        # empty when numeric_only=True
-        result = df[["a", "c"]].quantile(0.5, numeric_only=True)
-        expected = Series([], index=[], dtype=np.float64, name=0.5)
-        tm.assert_series_equal(result, expected)
-
-        result = df[["a", "c"]].quantile([0.5], numeric_only=True)
-        expected = DataFrame(index=[0.5], columns=[])
-        tm.assert_frame_equal(result, expected)
-
-    @pytest.mark.parametrize(
-        "dtype",
-        [
-            "datetime64[ns]",
-            "datetime64[ns, US/Pacific]",
-            "timedelta64[ns]",
-            "Period[D]",
-        ],
+    result = df.groupby("x")["y"].quantile([0.5, 0.75])
+    expected = pd.Series(
+        [0.2] * 2,
+        index=pd.MultiIndex.from_product((exp_index, [0.5, 0.75]), names=["x", None]),
+        name="y",
+        dtype=expected_dtype,
     )
-    def test_quantile_dt64_empty(self, dtype, interp_method):
-        # GH#41544
-        interpolation, method = interp_method
-        df = DataFrame(columns=["a", "b"], dtype=dtype)
+    tm.assert_series_equal(result, expected)
 
-        res = df.quantile(
-            0.5, axis=1, numeric_only=False, interpolation=interpolation, method=method
-        )
-        expected = Series([], index=[], name=0.5, dtype=dtype)
-        tm.assert_series_equal(res, expected)
 
-        # no columns in result, so no dtype preservation
-        res = df.quantile(
-            [0.5],
-            axis=1,
-            numeric_only=False,
-            interpolation=interpolation,
-            method=method,
-        )
-        expected = DataFrame(index=[0.5], columns=[])
-        tm.assert_frame_equal(res, expected)
+def test_groupby_quantile_NA_int(any_int_ea_dtype):
+    # GH#42849
+    df = DataFrame({"x": [1, 1], "y": [2, 5]}, dtype=any_int_ea_dtype)
+    result = df.groupby("x")["y"].quantile(0.5)
+    expected = pd.Series(
+        [3.5],
+        dtype="Float64",
+        index=Index([1], name="x", dtype=any_int_ea_dtype),
+        name="y",
+    )
+    tm.assert_series_equal(expected, result)
 
-    @pytest.mark.parametrize("invalid", [-1, 2, [0.5, -1], [0.5, 2]])
-    def test_quantile_invalid(self, invalid, datetime_frame, interp_method):
-        msg = "percentiles should all be in the interval \\[0, 1\\]"
-        interpolation, method = interp_method
-        with pytest.raises(ValueError, match=msg):
-            datetime_frame.quantile(invalid, interpolation=interpolation, method=method)
+    result = df.groupby("x").quantile(0.5)
+    expected = DataFrame(
+        {"y": 3.5}, dtype="Float64", index=Index([1], name="x", dtype=any_int_ea_dtype)
+    )
+    tm.assert_frame_equal(result, expected)
 
-    def test_quantile_box(self, interp_method, request, using_array_manager):
-        interpolation, method = interp_method
-        if method == "table" and using_array_manager:
-            request.applymarker(pytest.mark.xfail(reason="Axis name incorrectly set."))
-        df = DataFrame(
-            {
-                "A": [
-                    Timestamp("2011-01-01"),
-                    Timestamp("2011-01-02"),
-                    Timestamp("2011-01-03"),
-                ],
-                "B": [
-                    Timestamp("2011-01-01", tz="US/Eastern"),
-                    Timestamp("2011-01-02", tz="US/Eastern"),
-                    Timestamp("2011-01-03", tz="US/Eastern"),
-                ],
-                "C": [
-                    pd.Timedelta("1 days"),
-                    pd.Timedelta("2 days"),
-                    pd.Timedelta("3 days"),
-                ],
-            }
-        )
 
-        res = df.quantile(
-            0.5, numeric_only=False, interpolation=interpolation, method=method
-        )
+@pytest.mark.parametrize(
+    "interpolation, val1, val2", [("lower", 2, 2), ("higher", 2, 3), ("nearest", 2, 2)]
+)
+def test_groupby_quantile_all_na_group_masked(
+    interpolation, val1, val2, any_numeric_ea_dtype
+):
+    # GH#37493
+    df = DataFrame(
+        {"a": [1, 1, 1, 2], "b": [1, 2, 3, pd.NA]}, dtype=any_numeric_ea_dtype
+    )
+    result = df.groupby("a").quantile(q=[0.5, 0.7], interpolation=interpolation)
+    expected = DataFrame(
+        {"b": [val1, val2, pd.NA, pd.NA]},
+        dtype=any_numeric_ea_dtype,
+        index=pd.MultiIndex.from_arrays(
+            [pd.Series([1, 1, 2, 2], dtype=any_numeric_ea_dtype), [0.5, 0.7, 0.5, 0.7]],
+            names=["a", None],
+        ),
+    )
+    tm.assert_frame_equal(result, expected)
 
-        exp = Series(
+
+@pytest.mark.parametrize("interpolation", ["midpoint", "linear"])
+def test_groupby_quantile_all_na_group_masked_interp(
+    interpolation, any_numeric_ea_dtype
+):
+    # GH#37493
+    df = DataFrame(
+        {"a": [1, 1, 1, 2], "b": [1, 2, 3, pd.NA]}, dtype=any_numeric_ea_dtype
+    )
+    result = df.groupby("a").quantile(q=[0.5, 0.75], interpolation=interpolation)
+
+    if any_numeric_ea_dtype == "Float32":
+        expected_dtype = any_numeric_ea_dtype
+    else:
+        expected_dtype = "Float64"
+
+    expected = DataFrame(
+        {"b": [2.0, 2.5, pd.NA, pd.NA]},
+        dtype=expected_dtype,
+        index=pd.MultiIndex.from_arrays(
             [
-                Timestamp("2011-01-02"),
-                Timestamp("2011-01-02", tz="US/Eastern"),
-                pd.Timedelta("2 days"),
+                pd.Series([1, 1, 2, 2], dtype=any_numeric_ea_dtype),
+                [0.5, 0.75, 0.5, 0.75],
             ],
-            name=0.5,
-            index=["A", "B", "C"],
-        )
-        tm.assert_series_equal(res, exp)
-
-        res = df.quantile(
-            [0.5], numeric_only=False, interpolation=interpolation, method=method
-        )
-        exp = DataFrame(
-            [
-                [
-                    Timestamp("2011-01-02"),
-                    Timestamp("2011-01-02", tz="US/Eastern"),
-                    pd.Timedelta("2 days"),
-                ]
-            ],
-            index=[0.5],
-            columns=["A", "B", "C"],
-        )
-        tm.assert_frame_equal(res, exp)
-
-    def test_quantile_box_nat(self):
-        # DatetimeLikeBlock may be consolidated and contain NaT in different loc
-        df = DataFrame(
-            {
-                "A": [
-                    Timestamp("2011-01-01"),
-                    pd.NaT,
-                    Timestamp("2011-01-02"),
-                    Timestamp("2011-01-03"),
-                ],
-                "a": [
-                    Timestamp("2011-01-01"),
-                    Timestamp("2011-01-02"),
-                    pd.NaT,
-                    Timestamp("2011-01-03"),
-                ],
-                "B": [
-                    Timestamp("2011-01-01", tz="US/Eastern"),
-                    pd.NaT,
-                    Timestamp("2011-01-02", tz="US/Eastern"),
-                    Timestamp("2011-01-03", tz="US/Eastern"),
-                ],
-                "b": [
-                    Timestamp("2011-01-01", tz="US/Eastern"),
-                    Timestamp("2011-01-02", tz="US/Eastern"),
-                    pd.NaT,
-                    Timestamp("2011-01-03", tz="US/Eastern"),
-                ],
-                "C": [
-                    pd.Timedelta("1 days"),
-                    pd.Timedelta("2 days"),
-                    pd.Timedelta("3 days"),
-                    pd.NaT,
-                ],
-                "c": [
-                    pd.NaT,
-                    pd.Timedelta("1 days"),
-                    pd.Timedelta("2 days"),
-                    pd.Timedelta("3 days"),
-                ],
-            },
-            columns=list("AaBbCc"),
-        )
-
-        res = df.quantile(0.5, numeric_only=False)
-        exp = Series(
-            [
-                Timestamp("2011-01-02"),
-                Timestamp("2011-01-02"),
-                Timestamp("2011-01-02", tz="US/Eastern"),
-                Timestamp("2011-01-02", tz="US/Eastern"),
-                pd.Timedelta("2 days"),
-                pd.Timedelta("2 days"),
-            ],
-            name=0.5,
-            index=list("AaBbCc"),
-        )
-        tm.assert_series_equal(res, exp)
-
-        res = df.quantile([0.5], numeric_only=False)
-        exp = DataFrame(
-            [
-                [
-                    Timestamp("2011-01-02"),
-                    Timestamp("2011-01-02"),
-                    Timestamp("2011-01-02", tz="US/Eastern"),
-                    Timestamp("2011-01-02", tz="US/Eastern"),
-                    pd.Timedelta("2 days"),
-                    pd.Timedelta("2 days"),
-                ]
-            ],
-            index=[0.5],
-            columns=list("AaBbCc"),
-        )
-        tm.assert_frame_equal(res, exp)
-
-    def test_quantile_nan(self, interp_method, request, using_array_manager):
-        interpolation, method = interp_method
-        if method == "table" and using_array_manager:
-            request.applymarker(pytest.mark.xfail(reason="Axis name incorrectly set."))
-        # GH 14357 - float block where some cols have missing values
-        df = DataFrame({"a": np.arange(1, 6.0), "b": np.arange(1, 6.0)})
-        df.iloc[-1, 1] = np.nan
-
-        res = df.quantile(0.5, interpolation=interpolation, method=method)
-        exp = Series(
-            [3.0, 2.5 if interpolation == "linear" else 3.0], index=["a", "b"], name=0.5
-        )
-        tm.assert_series_equal(res, exp)
-
-        res = df.quantile([0.5, 0.75], interpolation=interpolation, method=method)
-        exp = DataFrame(
-            {
-                "a": [3.0, 4.0],
-                "b": [2.5, 3.25] if interpolation == "linear" else [3.0, 4.0],
-            },
-            index=[0.5, 0.75],
-        )
-        tm.assert_frame_equal(res, exp)
-
-        res = df.quantile(0.5, axis=1, interpolation=interpolation, method=method)
-        exp = Series(np.arange(1.0, 6.0), name=0.5)
-        tm.assert_series_equal(res, exp)
-
-        res = df.quantile(
-            [0.5, 0.75], axis=1, interpolation=interpolation, method=method
-        )
-        exp = DataFrame([np.arange(1.0, 6.0)] * 2, index=[0.5, 0.75])
-        if interpolation == "nearest":
-            exp.iloc[1, -1] = np.nan
-        tm.assert_frame_equal(res, exp)
-
-        # full-nan column
-        df["b"] = np.nan
-
-        res = df.quantile(0.5, interpolation=interpolation, method=method)
-        exp = Series([3.0, np.nan], index=["a", "b"], name=0.5)
-        tm.assert_series_equal(res, exp)
-
-        res = df.quantile([0.5, 0.75], interpolation=interpolation, method=method)
-        exp = DataFrame({"a": [3.0, 4.0], "b": [np.nan, np.nan]}, index=[0.5, 0.75])
-        tm.assert_frame_equal(res, exp)
-
-    def test_quantile_nat(self, interp_method, request, using_array_manager, unit):
-        interpolation, method = interp_method
-        if method == "table" and using_array_manager:
-            request.applymarker(pytest.mark.xfail(reason="Axis name incorrectly set."))
-        # full NaT column
-        df = DataFrame({"a": [pd.NaT, pd.NaT, pd.NaT]}, dtype=f"M8[{unit}]")
-
-        res = df.quantile(
-            0.5, numeric_only=False, interpolation=interpolation, method=method
-        )
-        exp = Series([pd.NaT], index=["a"], name=0.5, dtype=f"M8[{unit}]")
-        tm.assert_series_equal(res, exp)
-
-        res = df.quantile(
-            [0.5], numeric_only=False, interpolation=interpolation, method=method
-        )
-        exp = DataFrame({"a": [pd.NaT]}, index=[0.5], dtype=f"M8[{unit}]")
-        tm.assert_frame_equal(res, exp)
-
-        # mixed non-null / full null column
-        df = DataFrame(
-            {
-                "a": [
-                    Timestamp("2012-01-01"),
-                    Timestamp("2012-01-02"),
-                    Timestamp("2012-01-03"),
-                ],
-                "b": [pd.NaT, pd.NaT, pd.NaT],
-            },
-            dtype=f"M8[{unit}]",
-        )
-
-        res = df.quantile(
-            0.5, numeric_only=False, interpolation=interpolation, method=method
-        )
-        exp = Series(
-            [Timestamp("2012-01-02"), pd.NaT],
-            index=["a", "b"],
-            name=0.5,
-            dtype=f"M8[{unit}]",
-        )
-        tm.assert_series_equal(res, exp)
-
-        res = df.quantile(
-            [0.5], numeric_only=False, interpolation=interpolation, method=method
-        )
-        exp = DataFrame(
-            [[Timestamp("2012-01-02"), pd.NaT]],
-            index=[0.5],
-            columns=["a", "b"],
-            dtype=f"M8[{unit}]",
-        )
-        tm.assert_frame_equal(res, exp)
-
-    def test_quantile_empty_no_rows_floats(self, interp_method):
-        interpolation, method = interp_method
-
-        df = DataFrame(columns=["a", "b"], dtype="float64")
-
-        res = df.quantile(0.5, interpolation=interpolation, method=method)
-        exp = Series([np.nan, np.nan], index=["a", "b"], name=0.5)
-        tm.assert_series_equal(res, exp)
-
-        res = df.quantile([0.5], interpolation=interpolation, method=method)
-        exp = DataFrame([[np.nan, np.nan]], columns=["a", "b"], index=[0.5])
-        tm.assert_frame_equal(res, exp)
-
-        res = df.quantile(0.5, axis=1, interpolation=interpolation, method=method)
-        exp = Series([], index=[], dtype="float64", name=0.5)
-        tm.assert_series_equal(res, exp)
-
-        res = df.quantile([0.5], axis=1, interpolation=interpolation, method=method)
-        exp = DataFrame(columns=[], index=[0.5])
-        tm.assert_frame_equal(res, exp)
-
-    def test_quantile_empty_no_rows_ints(self, interp_method):
-        interpolation, method = interp_method
-        df = DataFrame(columns=["a", "b"], dtype="int64")
-
-        res = df.quantile(0.5, interpolation=interpolation, method=method)
-        exp = Series([np.nan, np.nan], index=["a", "b"], name=0.5)
-        tm.assert_series_equal(res, exp)
-
-    def test_quantile_empty_no_rows_dt64(self, interp_method):
-        interpolation, method = interp_method
-        # datetimes
-        df = DataFrame(columns=["a", "b"], dtype="datetime64[ns]")
-
-        res = df.quantile(
-            0.5, numeric_only=False, interpolation=interpolation, method=method
-        )
-        exp = Series(
-            [pd.NaT, pd.NaT], index=["a", "b"], dtype="datetime64[ns]", name=0.5
-        )
-        tm.assert_series_equal(res, exp)
-
-        # Mixed dt64/dt64tz
-        df["a"] = df["a"].dt.tz_localize("US/Central")
-        res = df.quantile(
-            0.5, numeric_only=False, interpolation=interpolation, method=method
-        )
-        exp = exp.astype(object)
-        if interpolation == "nearest":
-            # GH#18463 TODO: would we prefer NaTs here?
-            msg = "The 'downcast' keyword in fillna is deprecated"
-            with tm.assert_produces_warning(FutureWarning, match=msg):
-                exp = exp.fillna(np.nan, downcast=False)
-        tm.assert_series_equal(res, exp)
-
-        # both dt64tz
-        df["b"] = df["b"].dt.tz_localize("US/Central")
-        res = df.quantile(
-            0.5, numeric_only=False, interpolation=interpolation, method=method
-        )
-        exp = exp.astype(df["b"].dtype)
-        tm.assert_series_equal(res, exp)
-
-    def test_quantile_empty_no_columns(self, interp_method):
-        # GH#23925 _get_numeric_data may drop all columns
-        interpolation, method = interp_method
-        df = DataFrame(pd.date_range("1/1/18", periods=5))
-        df.columns.name = "captain tightpants"
-        result = df.quantile(
-            0.5, numeric_only=True, interpolation=interpolation, method=method
-        )
-        expected = Series([], index=[], name=0.5, dtype=np.float64)
-        expected.index.name = "captain tightpants"
-        tm.assert_series_equal(result, expected)
-
-        result = df.quantile(
-            [0.5], numeric_only=True, interpolation=interpolation, method=method
-        )
-        expected = DataFrame([], index=[0.5], columns=[])
-        expected.columns.name = "captain tightpants"
-        tm.assert_frame_equal(result, expected)
-
-    def test_quantile_item_cache(
-        self, using_array_manager, interp_method, using_copy_on_write
-    ):
-        # previous behavior incorrect retained an invalid _item_cache entry
-        interpolation, method = interp_method
-        df = DataFrame(
-            np.random.default_rng(2).standard_normal((4, 3)), columns=["A", "B", "C"]
-        )
-        df["D"] = df["A"] * 2
-        ser = df["A"]
-        if not using_array_manager:
-            assert len(df._mgr.blocks) == 2
-
-        df.quantile(numeric_only=False, interpolation=interpolation, method=method)
-
-        if using_copy_on_write:
-            ser.iloc[0] = 99
-            assert df.iloc[0, 0] == df["A"][0]
-            assert df.iloc[0, 0] != 99
-        else:
-            ser.values[0] = 99
-            assert df.iloc[0, 0] == df["A"][0]
-            assert df.iloc[0, 0] == 99
-
-    def test_invalid_method(self):
-        with pytest.raises(ValueError, match="Invalid method: foo"):
-            DataFrame(range(1)).quantile(0.5, method="foo")
-
-    def test_table_invalid_interpolation(self):
-        with pytest.raises(ValueError, match="Invalid interpolation: foo"):
-            DataFrame(range(1)).quantile(0.5, method="table", interpolation="foo")
-
-
-class TestQuantileExtensionDtype:
-    # TODO: tests for axis=1?
-    # TODO: empty case?
-
-    @pytest.fixture(
-        params=[
-            pytest.param(
-                pd.IntervalIndex.from_breaks(range(10)),
-                marks=pytest.mark.xfail(reason="raises when trying to add Intervals"),
-            ),
-            pd.period_range("2016-01-01", periods=9, freq="D"),
-            pd.date_range("2016-01-01", periods=9, tz="US/Pacific"),
-            pd.timedelta_range("1 Day", periods=9),
-            pd.array(np.arange(9), dtype="Int64"),
-            pd.array(np.arange(9), dtype="Float64"),
-        ],
-        ids=lambda x: str(x.dtype),
+            names=["a", None],
+        ),
     )
-    def index(self, request):
-        # NB: not actually an Index object
-        idx = request.param
-        idx.name = "A"
-        return idx
+    tm.assert_frame_equal(result, expected)
 
-    @pytest.fixture
-    def obj(self, index, frame_or_series):
-        # bc index is not always an Index (yet), we need to re-patch .name
-        obj = frame_or_series(index).copy()
 
-        if frame_or_series is Series:
-            obj.name = "A"
-        else:
-            obj.columns = ["A"]
-        return obj
+@pytest.mark.parametrize("dtype", ["Float64", "Float32"])
+def test_groupby_quantile_allNA_column(dtype):
+    # GH#42849
+    df = DataFrame({"x": [1, 1], "y": [pd.NA] * 2}, dtype=dtype)
+    result = df.groupby("x")["y"].quantile(0.5)
+    expected = pd.Series(
+        [np.nan], dtype=dtype, index=Index([1.0], dtype=dtype), name="y"
+    )
+    expected.index.name = "x"
+    tm.assert_series_equal(expected, result)
 
-    def compute_quantile(self, obj, qs):
-        if isinstance(obj, Series):
-            result = obj.quantile(qs)
-        else:
-            result = obj.quantile(qs, numeric_only=False)
-        return result
 
-    def test_quantile_ea(self, request, obj, index):
-        # result should be invariant to shuffling
-        indexer = np.arange(len(index), dtype=np.intp)
-        np.random.default_rng(2).shuffle(indexer)
-        obj = obj.iloc[indexer]
+def test_groupby_timedelta_quantile():
+    # GH: 29485
+    df = DataFrame(
+        {"value": pd.to_timedelta(np.arange(4), unit="s"), "group": [1, 1, 2, 2]}
+    )
+    result = df.groupby("group").quantile(0.99)
+    expected = DataFrame(
+        {
+            "value": [
+                pd.Timedelta("0 days 00:00:00.990000"),
+                pd.Timedelta("0 days 00:00:02.990000"),
+            ]
+        },
+        index=Index([1, 2], name="group"),
+    )
+    tm.assert_frame_equal(result, expected)
 
-        qs = [0.5, 0, 1]
-        result = self.compute_quantile(obj, qs)
 
-        exp_dtype = index.dtype
-        if index.dtype == "Int64":
-            # match non-nullable casting behavior
-            exp_dtype = "Float64"
-
-        # expected here assumes len(index) == 9
-        expected = Series(
-            [index[4], index[0], index[-1]], dtype=exp_dtype, index=qs, name="A"
-        )
-        expected = type(obj)(expected)
-
-        tm.assert_equal(result, expected)
-
-    def test_quantile_ea_with_na(self, obj, index):
-        obj.iloc[0] = index._na_value
-        obj.iloc[-1] = index._na_value
-
-        # result should be invariant to shuffling
-        indexer = np.arange(len(index), dtype=np.intp)
-        np.random.default_rng(2).shuffle(indexer)
-        obj = obj.iloc[indexer]
-
-        qs = [0.5, 0, 1]
-        result = self.compute_quantile(obj, qs)
-
-        # expected here assumes len(index) == 9
-        expected = Series(
-            [index[4], index[1], index[-2]], dtype=index.dtype, index=qs, name="A"
-        )
-        expected = type(obj)(expected)
-        tm.assert_equal(result, expected)
-
-    def test_quantile_ea_all_na(self, request, obj, index):
-        obj.iloc[:] = index._na_value
-        # Check dtypes were preserved; this was once a problem see GH#39763
-        assert np.all(obj.dtypes == index.dtype)
-
-        # result should be invariant to shuffling
-        indexer = np.arange(len(index), dtype=np.intp)
-        np.random.default_rng(2).shuffle(indexer)
-        obj = obj.iloc[indexer]
-
-        qs = [0.5, 0, 1]
-        result = self.compute_quantile(obj, qs)
-
-        expected = index.take([-1, -1, -1], allow_fill=True, fill_value=index._na_value)
-        expected = Series(expected, index=qs, name="A")
-        expected = type(obj)(expected)
-        tm.assert_equal(result, expected)
-
-    def test_quantile_ea_scalar(self, request, obj, index):
-        # scalar qs
-
-        # result should be invariant to shuffling
-        indexer = np.arange(len(index), dtype=np.intp)
-        np.random.default_rng(2).shuffle(indexer)
-        obj = obj.iloc[indexer]
-
-        qs = 0.5
-        result = self.compute_quantile(obj, qs)
-
-        exp_dtype = index.dtype
-        if index.dtype == "Int64":
-            exp_dtype = "Float64"
-
-        expected = Series({"A": index[4]}, dtype=exp_dtype, name=0.5)
-        if isinstance(obj, Series):
-            expected = expected["A"]
-            assert result == expected
-        else:
-            tm.assert_series_equal(result, expected)
-
-    @pytest.mark.xfail(using_string_dtype(), reason="TODO(infer_string)", strict=False)
-    @pytest.mark.parametrize(
-        "dtype, expected_data, expected_index, axis",
+def test_columns_groupby_quantile():
+    # GH 33795
+    df = DataFrame(
+        np.arange(12).reshape(3, -1),
+        index=list("XYZ"),
+        columns=pd.Series(list("ABAB"), name="col"),
+    )
+    msg = "DataFrame.groupby with axis=1 is deprecated"
+    with tm.assert_produces_warning(FutureWarning, match=msg):
+        gb = df.groupby("col", axis=1)
+    result = gb.quantile(q=[0.8, 0.2])
+    expected = DataFrame(
         [
-            ["float64", [], [], 1],
-            ["int64", [], [], 1],
-            ["float64", [np.nan, np.nan], ["a", "b"], 0],
-            ["int64", [np.nan, np.nan], ["a", "b"], 0],
+            [1.6, 0.4, 2.6, 1.4],
+            [5.6, 4.4, 6.6, 5.4],
+            [9.6, 8.4, 10.6, 9.4],
         ],
+        index=list("XYZ"),
+        columns=pd.MultiIndex.from_tuples(
+            [("A", 0.8), ("A", 0.2), ("B", 0.8), ("B", 0.2)], names=["col", None]
+        ),
     )
-    def test_empty_numeric(self, dtype, expected_data, expected_index, axis):
-        # GH 14564
-        df = DataFrame(columns=["a", "b"], dtype=dtype)
-        result = df.quantile(0.5, axis=axis)
-        expected = Series(
-            expected_data, name=0.5, index=Index(expected_index), dtype="float64"
-        )
-        tm.assert_series_equal(result, expected)
 
-    @pytest.mark.xfail(using_string_dtype(), reason="TODO(infer_string)", strict=False)
-    @pytest.mark.parametrize(
-        "dtype, expected_data, expected_index, axis, expected_dtype",
-        [
-            ["datetime64[ns]", [], [], 1, "datetime64[ns]"],
-            ["datetime64[ns]", [pd.NaT, pd.NaT], ["a", "b"], 0, "datetime64[ns]"],
-        ],
-    )
-    def test_empty_datelike(
-        self, dtype, expected_data, expected_index, axis, expected_dtype
-    ):
-        # GH 14564
-        df = DataFrame(columns=["a", "b"], dtype=dtype)
-        result = df.quantile(0.5, axis=axis, numeric_only=False)
-        expected = Series(
-            expected_data, name=0.5, index=Index(expected_index), dtype=expected_dtype
-        )
-        tm.assert_series_equal(result, expected)
+    tm.assert_frame_equal(result, expected)
 
-    @pytest.mark.xfail(using_string_dtype(), reason="TODO(infer_string)", strict=False)
-    @pytest.mark.parametrize(
-        "expected_data, expected_index, axis",
-        [
-            [[np.nan, np.nan], range(2), 1],
-            [[], [], 0],
-        ],
+
+def test_timestamp_groupby_quantile(unit):
+    # GH 33168
+    dti = pd.date_range(
+        start="2020-04-19 00:00:00", freq="1min", periods=100, tz="UTC", unit=unit
+    ).floor("1h")
+    df = DataFrame(
+        {
+            "timestamp": dti,
+            "category": list(range(1, 101)),
+            "value": list(range(101, 201)),
+        }
     )
-    def test_datelike_numeric_only(self, expected_data, expected_index, axis):
-        # GH 14564
-        df = DataFrame(
-            {
-                "a": pd.to_datetime(["2010", "2011"]),
-                "b": [0, 5],
-                "c": pd.to_datetime(["2011", "2012"]),
-            }
-        )
-        result = df[["a", "c"]].quantile(0.5, axis=axis, numeric_only=True)
-        expected = Series(
-            expected_data, name=0.5, index=Index(expected_index), dtype=np.float64
-        )
-        tm.assert_series_equal(result, expected)
+
+    result = df.groupby("timestamp").quantile([0.2, 0.8])
+
+    mi = pd.MultiIndex.from_product([dti[::99], [0.2, 0.8]], names=("timestamp", None))
+    expected = DataFrame(
+        [
+            {"category": 12.8, "value": 112.8},
+            {"category": 48.2, "value": 148.2},
+            {"category": 68.8, "value": 168.8},
+            {"category": 92.2, "value": 192.2},
+        ],
+        index=mi,
+    )
+
+    tm.assert_frame_equal(result, expected)
+
+
+def test_groupby_quantile_dt64tz_period():
+    # GH#51373
+    dti = pd.date_range("2016-01-01", periods=1000)
+    df = pd.Series(dti).to_frame().copy()
+    df[1] = dti.tz_localize("US/Pacific")
+    df[2] = dti.to_period("D")
+    df[3] = dti - dti[0]
+    df.iloc[-1] = pd.NaT
+
+    by = np.tile(np.arange(5), 200)
+    gb = df.groupby(by)
+
+    result = gb.quantile(0.5)
+
+    # Check that we match the group-by-group result
+    exp = {i: df.iloc[i::5].quantile(0.5) for i in range(5)}
+    expected = DataFrame(exp).T.infer_objects()
+    expected.index = expected.index.astype(int)
+
+    tm.assert_frame_equal(result, expected)
+
+
+def test_groupby_quantile_nonmulti_levels_order():
+    # Non-regression test for GH #53009
+    ind = pd.MultiIndex.from_tuples(
+        [
+            (0, "a", "B"),
+            (0, "a", "A"),
+            (0, "b", "B"),
+            (0, "b", "A"),
+            (1, "a", "B"),
+            (1, "a", "A"),
+            (1, "b", "B"),
+            (1, "b", "A"),
+        ],
+        names=["sample", "cat0", "cat1"],
+    )
+    ser = pd.Series(range(8), index=ind)
+    result = ser.groupby(level="cat1", sort=False).quantile([0.2, 0.8])
+
+    qind = pd.MultiIndex.from_tuples(
+        [("B", 0.2), ("B", 0.8), ("A", 0.2), ("A", 0.8)], names=["cat1", None]
+    )
+    expected = pd.Series([1.2, 4.8, 2.2, 5.8], index=qind)
+
+    tm.assert_series_equal(result, expected)
+
+    # We need to check that index levels are not sorted
+    expected_levels = pd.core.indexes.frozen.FrozenList([["B", "A"], [0.2, 0.8]])
+    tm.assert_equal(result.index.levels, expected_levels)
