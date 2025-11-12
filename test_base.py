@@ -1,352 +1,414 @@
-import os
-import shutil
-import tempfile
-import warnings
-from pickle import loads
-from pickle import dumps
-from functools import partial
-from importlib import resources
-
-import pytest
+from datetime import datetime
 
 import numpy as np
-from sklearn.datasets import get_data_home
-from sklearn.datasets import clear_data_home
-from sklearn.datasets import load_files
-from sklearn.datasets import load_sample_images
-from sklearn.datasets import load_sample_image
-from sklearn.datasets import load_digits
-from sklearn.datasets import load_diabetes
-from sklearn.datasets import load_linnerud
-from sklearn.datasets import load_iris
-from sklearn.datasets import load_breast_cancer
-from sklearn.datasets import load_boston
-from sklearn.datasets import load_wine
-from sklearn.datasets._base import (
-    load_csv_data,
-    load_gzip_compressed_csv_data,
+import pytest
+
+from pandas.core.dtypes.common import is_extension_array_dtype
+
+import pandas as pd
+from pandas import (
+    DataFrame,
+    DatetimeIndex,
+    MultiIndex,
+    NaT,
+    PeriodIndex,
+    Series,
+    TimedeltaIndex,
 )
-from sklearn.utils import Bunch
-from sklearn.utils._testing import SkipTest
-from sklearn.datasets.tests.test_common import check_as_frame
+import pandas._testing as tm
+from pandas.core.groupby.groupby import DataError
+from pandas.core.groupby.grouper import Grouper
+from pandas.core.indexes.datetimes import date_range
+from pandas.core.indexes.period import period_range
+from pandas.core.indexes.timedeltas import timedelta_range
+from pandas.core.resample import _asfreq_compat
 
-from sklearn.externals._pilutil import pillow_installed
+# a fixture value can be overridden by the test parameter value. Note that the
+# value of the fixture can be overridden this way even if the test doesn't use
+# it directly (doesn't mention it in the function prototype).
+# see https://docs.pytest.org/en/latest/fixture.html#override-a-fixture-with-direct-test-parametrization  # noqa: E501
+# in this module we override the fixture values defined in conftest.py
+# tuples of '_index_factory,_series_name,_index_start,_index_end'
+DATE_RANGE = (date_range, "dti", datetime(2005, 1, 1), datetime(2005, 1, 10))
+PERIOD_RANGE = (period_range, "pi", datetime(2005, 1, 1), datetime(2005, 1, 10))
+TIMEDELTA_RANGE = (timedelta_range, "tdi", "1 day", "10 day")
 
-from sklearn.utils import IS_PYPY
-
-
-def _remove_dir(path):
-    if os.path.isdir(path):
-        shutil.rmtree(path)
-
-
-@pytest.fixture(scope="module")
-def data_home(tmpdir_factory):
-    tmp_file = str(tmpdir_factory.mktemp("scikit_learn_data_home_test"))
-    yield tmp_file
-    _remove_dir(tmp_file)
-
-
-@pytest.fixture(scope="module")
-def load_files_root(tmpdir_factory):
-    tmp_file = str(tmpdir_factory.mktemp("scikit_learn_load_files_test"))
-    yield tmp_file
-    _remove_dir(tmp_file)
+all_ts = pytest.mark.parametrize(
+    "_index_factory,_series_name,_index_start,_index_end",
+    [DATE_RANGE, PERIOD_RANGE, TIMEDELTA_RANGE],
+)
 
 
 @pytest.fixture
-def test_category_dir_1(load_files_root):
-    test_category_dir1 = tempfile.mkdtemp(dir=load_files_root)
-    sample_file = tempfile.NamedTemporaryFile(dir=test_category_dir1, delete=False)
-    sample_file.write(b"Hello World!\n")
-    sample_file.close()
-    yield str(test_category_dir1)
-    _remove_dir(test_category_dir1)
+def create_index(_index_factory):
+    def _create_index(*args, **kwargs):
+        """return the _index_factory created using the args, kwargs"""
+        return _index_factory(*args, **kwargs)
+
+    return _create_index
 
 
-@pytest.fixture
-def test_category_dir_2(load_files_root):
-    test_category_dir2 = tempfile.mkdtemp(dir=load_files_root)
-    yield str(test_category_dir2)
-    _remove_dir(test_category_dir2)
+@pytest.mark.parametrize("freq", ["2D", "1h"])
+@pytest.mark.parametrize(
+    "_index_factory,_series_name,_index_start,_index_end", [DATE_RANGE, TIMEDELTA_RANGE]
+)
+def test_asfreq(series_and_frame, freq, create_index):
+    obj = series_and_frame
 
-
-def test_data_home(data_home):
-    # get_data_home will point to a pre-existing folder
-    data_home = get_data_home(data_home=data_home)
-    assert data_home == data_home
-    assert os.path.exists(data_home)
-
-    # clear_data_home will delete both the content and the folder it-self
-    clear_data_home(data_home=data_home)
-    assert not os.path.exists(data_home)
-
-    # if the folder is missing it will be created again
-    data_home = get_data_home(data_home=data_home)
-    assert os.path.exists(data_home)
-
-
-def test_default_empty_load_files(load_files_root):
-    res = load_files(load_files_root)
-    assert len(res.filenames) == 0
-    assert len(res.target_names) == 0
-    assert res.DESCR is None
-
-
-def test_default_load_files(test_category_dir_1, test_category_dir_2, load_files_root):
-    if IS_PYPY:
-        pytest.xfail("[PyPy] fails due to string containing NUL characters")
-    res = load_files(load_files_root)
-    assert len(res.filenames) == 1
-    assert len(res.target_names) == 2
-    assert res.DESCR is None
-    assert res.data == [b"Hello World!\n"]
-
-
-def test_load_files_w_categories_desc_and_encoding(
-    test_category_dir_1, test_category_dir_2, load_files_root
-):
-    if IS_PYPY:
-        pytest.xfail("[PyPy] fails due to string containing NUL characters")
-    category = os.path.abspath(test_category_dir_1).split("/").pop()
-    res = load_files(
-        load_files_root, description="test", categories=category, encoding="utf-8"
-    )
-    assert len(res.filenames) == 1
-    assert len(res.target_names) == 1
-    assert res.DESCR == "test"
-    assert res.data == ["Hello World!\n"]
-
-
-def test_load_files_wo_load_content(
-    test_category_dir_1, test_category_dir_2, load_files_root
-):
-    res = load_files(load_files_root, load_content=False)
-    assert len(res.filenames) == 1
-    assert len(res.target_names) == 2
-    assert res.DESCR is None
-    assert res.get("data") is None
+    result = obj.resample(freq).asfreq()
+    new_index = create_index(obj.index[0], obj.index[-1], freq=freq)
+    expected = obj.reindex(new_index)
+    tm.assert_almost_equal(result, expected)
 
 
 @pytest.mark.parametrize(
-    "filename, expected_n_samples, expected_n_features, expected_target_names",
-    [
-        ("wine_data.csv", 178, 13, ["class_0", "class_1", "class_2"]),
-        ("iris.csv", 150, 4, ["setosa", "versicolor", "virginica"]),
-        ("breast_cancer.csv", 569, 30, ["malignant", "benign"]),
-    ],
+    "_index_factory,_series_name,_index_start,_index_end", [DATE_RANGE, TIMEDELTA_RANGE]
 )
-def test_load_csv_data(
-    filename, expected_n_samples, expected_n_features, expected_target_names
-):
-    actual_data, actual_target, actual_target_names = load_csv_data(filename)
-    assert actual_data.shape[0] == expected_n_samples
-    assert actual_data.shape[1] == expected_n_features
-    assert actual_target.shape[0] == expected_n_samples
-    np.testing.assert_array_equal(actual_target_names, expected_target_names)
+def test_asfreq_fill_value(series, create_index):
+    # test for fill value during resampling, issue 3715
+
+    ser = series
+
+    result = ser.resample("1h").asfreq()
+    new_index = create_index(ser.index[0], ser.index[-1], freq="1h")
+    expected = ser.reindex(new_index)
+    tm.assert_series_equal(result, expected)
+
+    # Explicit cast to float to avoid implicit cast when setting None
+    frame = ser.astype("float").to_frame("value")
+    frame.iloc[1] = None
+    result = frame.resample("1h").asfreq(fill_value=4.0)
+    new_index = create_index(frame.index[0], frame.index[-1], freq="1h")
+    expected = frame.reindex(new_index, fill_value=4.0)
+    tm.assert_frame_equal(result, expected)
 
 
-def test_load_csv_data_with_descr():
-    data_file_name = "iris.csv"
-    descr_file_name = "iris.rst"
+@all_ts
+def test_resample_interpolate(frame):
+    # GH#12925
+    df = frame
+    result = df.resample("1min").asfreq().interpolate()
+    expected = df.resample("1min").interpolate()
+    tm.assert_frame_equal(result, expected)
 
-    res_without_descr = load_csv_data(data_file_name=data_file_name)
-    res_with_descr = load_csv_data(
-        data_file_name=data_file_name, descr_file_name=descr_file_name
+
+def test_raises_on_non_datetimelike_index():
+    # this is a non datetimelike index
+    xp = DataFrame()
+    msg = (
+        "Only valid with DatetimeIndex, TimedeltaIndex or PeriodIndex, "
+        "but got an instance of 'RangeIndex'"
     )
-    assert len(res_with_descr) == 4
-    assert len(res_without_descr) == 3
-
-    np.testing.assert_array_equal(res_with_descr[0], res_without_descr[0])
-    np.testing.assert_array_equal(res_with_descr[1], res_without_descr[1])
-    np.testing.assert_array_equal(res_with_descr[2], res_without_descr[2])
-
-    assert res_with_descr[-1].startswith(".. _iris_dataset:")
+    with pytest.raises(TypeError, match=msg):
+        xp.resample("YE")
 
 
-@pytest.mark.parametrize(
-    "filename, kwargs, expected_shape",
-    [
-        ("diabetes_data.csv.gz", {}, [442, 10]),
-        ("diabetes_target.csv.gz", {}, [442]),
-        ("digits.csv.gz", {"delimiter": ","}, [1797, 65]),
-    ],
-)
-def test_load_gzip_compressed_csv_data(filename, kwargs, expected_shape):
-    actual_data = load_gzip_compressed_csv_data(filename, **kwargs)
-    assert actual_data.shape == tuple(expected_shape)
+@all_ts
+@pytest.mark.parametrize("freq", ["ME", "D", "h"])
+def test_resample_empty_series(freq, empty_series_dti, resample_method):
+    # GH12771 & GH12868
 
+    ser = empty_series_dti
+    if freq == "ME" and isinstance(ser.index, TimedeltaIndex):
+        msg = (
+            "Resampling on a TimedeltaIndex requires fixed-duration `freq`, "
+            "e.g. '24h' or '3D', not <MonthEnd>"
+        )
+        with pytest.raises(ValueError, match=msg):
+            ser.resample(freq)
+        return
+    elif freq == "ME" and isinstance(ser.index, PeriodIndex):
+        # index is PeriodIndex, so convert to corresponding Period freq
+        freq = "M"
+    rs = ser.resample(freq)
+    result = getattr(rs, resample_method)()
 
-def test_load_gzip_compressed_csv_data_with_descr():
-    data_file_name = "diabetes_target.csv.gz"
-    descr_file_name = "diabetes.rst"
-
-    expected_data = load_gzip_compressed_csv_data(data_file_name=data_file_name)
-    actual_data, descr = load_gzip_compressed_csv_data(
-        data_file_name=data_file_name,
-        descr_file_name=descr_file_name,
-    )
-
-    np.testing.assert_array_equal(actual_data, expected_data)
-    assert descr.startswith(".. _diabetes_dataset:")
-
-
-def test_load_sample_images():
-    try:
-        res = load_sample_images()
-        assert len(res.images) == 2
-        assert len(res.filenames) == 2
-        images = res.images
-
-        # assert is china image
-        assert np.all(images[0][0, 0, :] == np.array([174, 201, 231], dtype=np.uint8))
-        # assert is flower image
-        assert np.all(images[1][0, 0, :] == np.array([2, 19, 13], dtype=np.uint8))
-        assert res.DESCR
-    except ImportError:
-        warnings.warn("Could not load sample images, PIL is not available.")
-
-
-def test_load_sample_image():
-    try:
-        china = load_sample_image("china.jpg")
-        assert china.dtype == "uint8"
-        assert china.shape == (427, 640, 3)
-    except ImportError:
-        warnings.warn("Could not load sample images, PIL is not available.")
-
-
-def test_load_missing_sample_image_error():
-    if pillow_installed:
-        with pytest.raises(AttributeError):
-            load_sample_image("blop.jpg")
+    if resample_method == "ohlc":
+        expected = DataFrame(
+            [], index=ser.index[:0].copy(), columns=["open", "high", "low", "close"]
+        )
+        expected.index = _asfreq_compat(ser.index, freq)
+        tm.assert_frame_equal(result, expected, check_dtype=False)
     else:
-        warnings.warn("Could not load sample images, PIL is not available.")
+        expected = ser.copy()
+        expected.index = _asfreq_compat(ser.index, freq)
+        tm.assert_series_equal(result, expected, check_dtype=False)
+
+    tm.assert_index_equal(result.index, expected.index)
+    assert result.index.freq == expected.index.freq
 
 
-@pytest.mark.filterwarnings("ignore:Function load_boston is deprecated")
-@pytest.mark.parametrize(
-    "loader_func, data_shape, target_shape, n_target, has_descr, filenames",
-    [
-        (load_breast_cancer, (569, 30), (569,), 2, True, ["filename"]),
-        (load_wine, (178, 13), (178,), 3, True, []),
-        (load_iris, (150, 4), (150,), 3, True, ["filename"]),
-        (
-            load_linnerud,
-            (20, 3),
-            (20, 3),
-            3,
-            True,
-            ["data_filename", "target_filename"],
-        ),
-        (load_diabetes, (442, 10), (442,), None, True, []),
-        (load_digits, (1797, 64), (1797,), 10, True, []),
-        (partial(load_digits, n_class=9), (1617, 64), (1617,), 10, True, []),
-        (load_boston, (506, 13), (506,), None, True, ["filename"]),
-    ],
-)
-def test_loader(loader_func, data_shape, target_shape, n_target, has_descr, filenames):
-    bunch = loader_func()
-
-    assert isinstance(bunch, Bunch)
-    assert bunch.data.shape == data_shape
-    assert bunch.target.shape == target_shape
-    if hasattr(bunch, "feature_names"):
-        assert len(bunch.feature_names) == data_shape[1]
-    if n_target is not None:
-        assert len(bunch.target_names) == n_target
-    if has_descr:
-        assert bunch.DESCR
-    if filenames:
-        assert "data_module" in bunch
-        assert all(
+@pytest.mark.parametrize("min_count", [0, 1])
+def test_resample_empty_sum_string(string_dtype_no_object, min_count):
+    # https://github.com/pandas-dev/pandas/issues/60229
+    dtype = string_dtype_no_object
+    ser = Series(
+        pd.NA,
+        index=DatetimeIndex(
             [
-                f in bunch and resources.is_resource(bunch["data_module"], bunch[f])
-                for f in filenames
+                "2000-01-01 00:00:00",
+                "2000-01-01 00:00:10",
+                "2000-01-01 00:00:20",
+                "2000-01-01 00:00:30",
             ]
+        ),
+        dtype=dtype,
+    )
+    rs = ser.resample("20s")
+    result = rs.sum(min_count=min_count)
+
+    value = "" if min_count == 0 else pd.NA
+    index = date_range(start="2000-01-01", freq="20s", periods=2)
+    expected = Series(value, index=index, dtype=dtype)
+    tm.assert_series_equal(result, expected)
+
+
+@all_ts
+@pytest.mark.parametrize(
+    "freq",
+    [
+        pytest.param("ME", marks=pytest.mark.xfail(reason="Don't know why this fails")),
+        "D",
+        "h",
+    ],
+)
+def test_resample_nat_index_series(freq, series, resample_method):
+    # GH39227
+
+    ser = series.copy()
+    ser.index = PeriodIndex([NaT] * len(ser), freq=freq)
+
+    rs = ser.resample(freq)
+    result = getattr(rs, resample_method)()
+
+    if resample_method == "ohlc":
+        expected = DataFrame(
+            [], index=ser.index[:0].copy(), columns=["open", "high", "low", "close"]
         )
+        tm.assert_frame_equal(result, expected, check_dtype=False)
+    else:
+        expected = ser[:0].copy()
+        tm.assert_series_equal(result, expected, check_dtype=False)
+    tm.assert_index_equal(result.index, expected.index)
+    assert result.index.freq == expected.index.freq
+
+
+@all_ts
+@pytest.mark.parametrize("freq", ["ME", "D", "h"])
+@pytest.mark.parametrize("resample_method", ["count", "size"])
+def test_resample_count_empty_series(freq, empty_series_dti, resample_method):
+    # GH28427
+    ser = empty_series_dti
+    if freq == "ME" and isinstance(ser.index, TimedeltaIndex):
+        msg = (
+            "Resampling on a TimedeltaIndex requires fixed-duration `freq`, "
+            "e.g. '24h' or '3D', not <MonthEnd>"
+        )
+        with pytest.raises(ValueError, match=msg):
+            ser.resample(freq)
+        return
+    elif freq == "ME" and isinstance(ser.index, PeriodIndex):
+        # index is PeriodIndex, so convert to corresponding Period freq
+        freq = "M"
+    rs = ser.resample(freq)
+
+    result = getattr(rs, resample_method)()
+
+    index = _asfreq_compat(ser.index, freq)
+
+    expected = Series([], dtype="int64", index=index, name=ser.name)
+
+    tm.assert_series_equal(result, expected)
+
+
+@all_ts
+@pytest.mark.parametrize("freq", ["ME", "D", "h"])
+def test_resample_empty_dataframe(empty_frame_dti, freq, resample_method):
+    # GH13212
+    df = empty_frame_dti
+    # count retains dimensions too
+    if freq == "ME" and isinstance(df.index, TimedeltaIndex):
+        msg = (
+            "Resampling on a TimedeltaIndex requires fixed-duration `freq`, "
+            "e.g. '24h' or '3D', not <MonthEnd>"
+        )
+        with pytest.raises(ValueError, match=msg):
+            df.resample(freq, group_keys=False)
+        return
+    elif freq == "ME" and isinstance(df.index, PeriodIndex):
+        # index is PeriodIndex, so convert to corresponding Period freq
+        freq = "M"
+    rs = df.resample(freq, group_keys=False)
+    result = getattr(rs, resample_method)()
+    if resample_method == "ohlc":
+        # TODO: no tests with len(df.columns) > 0
+        mi = MultiIndex.from_product([df.columns, ["open", "high", "low", "close"]])
+        expected = DataFrame(
+            [], index=df.index[:0].copy(), columns=mi, dtype=np.float64
+        )
+        expected.index = _asfreq_compat(df.index, freq)
+
+    elif resample_method != "size":
+        expected = df.copy()
+    else:
+        # GH14962
+        expected = Series([], dtype=np.int64)
+
+    expected.index = _asfreq_compat(df.index, freq)
+
+    tm.assert_index_equal(result.index, expected.index)
+    assert result.index.freq == expected.index.freq
+    tm.assert_almost_equal(result, expected)
+
+    # test size for GH13212 (currently stays as df)
+
+
+@all_ts
+@pytest.mark.parametrize("freq", ["ME", "D", "h"])
+def test_resample_count_empty_dataframe(freq, empty_frame_dti):
+    # GH28427
+
+    empty_frame_dti["a"] = []
+
+    if freq == "ME" and isinstance(empty_frame_dti.index, TimedeltaIndex):
+        msg = (
+            "Resampling on a TimedeltaIndex requires fixed-duration `freq`, "
+            "e.g. '24h' or '3D', not <MonthEnd>"
+        )
+        with pytest.raises(ValueError, match=msg):
+            empty_frame_dti.resample(freq)
+        return
+    elif freq == "ME" and isinstance(empty_frame_dti.index, PeriodIndex):
+        # index is PeriodIndex, so convert to corresponding Period freq
+        freq = "M"
+    result = empty_frame_dti.resample(freq).count()
+
+    index = _asfreq_compat(empty_frame_dti.index, freq)
+
+    expected = DataFrame(dtype="int64", index=index, columns=["a"])
+
+    tm.assert_frame_equal(result, expected)
+
+
+@all_ts
+@pytest.mark.parametrize("freq", ["ME", "D", "h"])
+def test_resample_size_empty_dataframe(freq, empty_frame_dti):
+    # GH28427
+
+    empty_frame_dti["a"] = []
+
+    if freq == "ME" and isinstance(empty_frame_dti.index, TimedeltaIndex):
+        msg = (
+            "Resampling on a TimedeltaIndex requires fixed-duration `freq`, "
+            "e.g. '24h' or '3D', not <MonthEnd>"
+        )
+        with pytest.raises(ValueError, match=msg):
+            empty_frame_dti.resample(freq)
+        return
+    elif freq == "ME" and isinstance(empty_frame_dti.index, PeriodIndex):
+        # index is PeriodIndex, so convert to corresponding Period freq
+        freq = "M"
+    result = empty_frame_dti.resample(freq).size()
+
+    index = _asfreq_compat(empty_frame_dti.index, freq)
+
+    expected = Series([], dtype="int64", index=index)
+
+    tm.assert_series_equal(result, expected)
 
 
 @pytest.mark.parametrize(
-    "loader_func, data_dtype, target_dtype",
+    "index",
     [
-        (load_breast_cancer, np.float64, int),
-        (load_diabetes, np.float64, np.float64),
-        (load_digits, np.float64, int),
-        (load_iris, np.float64, int),
-        (load_linnerud, np.float64, np.float64),
-        (load_wine, np.float64, int),
+        PeriodIndex([], freq="M", name="a"),
+        DatetimeIndex([], name="a"),
+        TimedeltaIndex([], name="a"),
     ],
 )
-def test_toy_dataset_frame_dtype(loader_func, data_dtype, target_dtype):
-    default_result = loader_func()
-    check_as_frame(
-        default_result,
-        loader_func,
-        expected_data_dtype=data_dtype,
-        expected_target_dtype=target_dtype,
-    )
-
-
-def test_loads_dumps_bunch():
-    bunch = Bunch(x="x")
-    bunch_from_pkl = loads(dumps(bunch))
-    bunch_from_pkl.x = "y"
-    assert bunch_from_pkl["x"] == bunch_from_pkl.x
-
-
-def test_bunch_pickle_generated_with_0_16_and_read_with_0_17():
-    bunch = Bunch(key="original")
-    # This reproduces a problem when Bunch pickles have been created
-    # with scikit-learn 0.16 and are read with 0.17. Basically there
-    # is a surprising behaviour because reading bunch.key uses
-    # bunch.__dict__ (which is non empty for 0.16 Bunch objects)
-    # whereas assigning into bunch.key uses bunch.__setattr__. See
-    # https://github.com/scikit-learn/scikit-learn/issues/6196 for
-    # more details
-    bunch.__dict__["key"] = "set from __dict__"
-    bunch_from_pkl = loads(dumps(bunch))
-    # After loading from pickle the __dict__ should have been ignored
-    assert bunch_from_pkl.key == "original"
-    assert bunch_from_pkl["key"] == "original"
-    # Making sure that changing the attr does change the value
-    # associated with __getitem__ as well
-    bunch_from_pkl.key = "changed"
-    assert bunch_from_pkl.key == "changed"
-    assert bunch_from_pkl["key"] == "changed"
-
-
-def test_bunch_dir():
-    # check that dir (important for autocomplete) shows attributes
-    data = load_iris()
-    assert "data" in dir(data)
-
-
-# FIXME: to be removed in 1.2
-def test_load_boston_warning():
-    """Check that we raise the ethical warning when loading `load_boston`."""
-    warn_msg = "The Boston housing prices dataset has an ethical problem"
-    with pytest.warns(FutureWarning, match=warn_msg):
-        load_boston()
-
-
-@pytest.mark.filterwarnings("ignore:Function load_boston is deprecated")
-def test_load_boston_alternative():
-    pd = pytest.importorskip("pandas")
-    if os.environ.get("SKLEARN_SKIP_NETWORK_TESTS", "1") == "1":
-        raise SkipTest(
-            "This test requires an internet connection to fetch the dataset."
-        )
-
-    boston_sklearn = load_boston()
-
-    data_url = "http://lib.stat.cmu.edu/datasets/boston"
+@pytest.mark.parametrize("dtype", [float, int, object, "datetime64[ns]"])
+def test_resample_empty_dtypes(index, dtype, resample_method):
+    # Empty series were sometimes causing a segfault (for the functions
+    # with Cython bounds-checking disabled) or an IndexError.  We just run
+    # them to ensure they no longer do.  (GH #10228)
+    empty_series_dti = Series([], index, dtype)
+    rs = empty_series_dti.resample("d", group_keys=False)
     try:
-        raw_df = pd.read_csv(data_url, sep=r"\s+", skiprows=22, header=None)
-    except ConnectionError as e:
-        pytest.xfail(f"The dataset can't be downloaded. Got exception: {e}")
-    data = np.hstack([raw_df.values[::2, :], raw_df.values[1::2, :2]])
-    target = raw_df.values[1::2, 2]
+        getattr(rs, resample_method)()
+    except DataError:
+        # Ignore these since some combinations are invalid
+        # (ex: doing mean with dtype of np.object_)
+        pass
 
-    np.testing.assert_allclose(data, boston_sklearn.data)
-    np.testing.assert_allclose(target, boston_sklearn.target)
+
+@all_ts
+@pytest.mark.parametrize("freq", ["ME", "D", "h"])
+def test_apply_to_empty_series(empty_series_dti, freq):
+    # GH 14313
+    ser = empty_series_dti
+
+    if freq == "ME" and isinstance(empty_series_dti.index, TimedeltaIndex):
+        msg = (
+            "Resampling on a TimedeltaIndex requires fixed-duration `freq`, "
+            "e.g. '24h' or '3D', not <MonthEnd>"
+        )
+        with pytest.raises(ValueError, match=msg):
+            empty_series_dti.resample(freq)
+        return
+    elif freq == "ME" and isinstance(empty_series_dti.index, PeriodIndex):
+        # index is PeriodIndex, so convert to corresponding Period freq
+        freq = "M"
+
+    result = ser.resample(freq, group_keys=False).apply(lambda x: 1)
+    expected = ser.resample(freq).apply("sum")
+
+    tm.assert_series_equal(result, expected, check_dtype=False)
+
+
+@all_ts
+def test_resampler_is_iterable(series):
+    # GH 15314
+    freq = "h"
+    tg = Grouper(freq=freq, convention="start")
+    grouped = series.groupby(tg)
+    resampled = series.resample(freq)
+    for (rk, rv), (gk, gv) in zip(resampled, grouped):
+        assert rk == gk
+        tm.assert_series_equal(rv, gv)
+
+
+@all_ts
+def test_resample_quantile(series):
+    # GH 15023
+    ser = series
+    q = 0.75
+    freq = "h"
+
+    result = ser.resample(freq).quantile(q)
+    expected = ser.resample(freq).agg(lambda x: x.quantile(q)).rename(ser.name)
+    tm.assert_series_equal(result, expected)
+
+
+@pytest.mark.parametrize("how", ["first", "last"])
+def test_first_last_skipna(any_real_nullable_dtype, skipna, how):
+    # GH#57019
+    if is_extension_array_dtype(any_real_nullable_dtype):
+        na_value = Series(dtype=any_real_nullable_dtype).dtype.na_value
+    else:
+        na_value = np.nan
+    df = DataFrame(
+        {
+            "a": [2, 1, 1, 2],
+            "b": [na_value, 3.0, na_value, 4.0],
+            "c": [na_value, 3.0, na_value, 4.0],
+        },
+        index=date_range("2020-01-01", periods=4, freq="D"),
+        dtype=any_real_nullable_dtype,
+    )
+    rs = df.resample("ME")
+    method = getattr(rs, how)
+    result = method(skipna=skipna)
+
+    gb = df.groupby(df.shape[0] * [pd.to_datetime("2020-01-31")])
+    expected = getattr(gb, how)(skipna=skipna)
+    expected.index.freq = "ME"
+    tm.assert_frame_equal(result, expected)

@@ -1,14 +1,6 @@
-"""
-Tests dtype specification during parsing
-for all of the parsers defined in parsers.py
-"""
-from io import StringIO
-import os
+from datetime import datetime
 
 import numpy as np
-import pytest
-
-from pandas._libs import parsers as libparsers
 
 from pandas.core.dtypes.dtypes import CategoricalDtype
 
@@ -16,319 +8,264 @@ import pandas as pd
 from pandas import (
     Categorical,
     DataFrame,
-    Timestamp,
+    Series,
 )
 import pandas._testing as tm
 
-pytestmark = pytest.mark.filterwarnings(
-    "ignore:Passing a BlockManager to DataFrame:DeprecationWarning"
-)
 
-xfail_pyarrow = pytest.mark.usefixtures("pyarrow_xfail")
-
-
-@xfail_pyarrow  # AssertionError: Attributes of DataFrame.iloc[:, 0] are different
-@pytest.mark.parametrize(
-    "dtype",
-    [
-        "category",
-        CategoricalDtype(),
-        {"a": "category", "b": "category", "c": CategoricalDtype()},
-    ],
-)
-def test_categorical_dtype(all_parsers, dtype):
-    # see gh-10153
-    parser = all_parsers
-    data = """a,b,c
-1,a,3.4
-1,a,3.4
-2,b,4.5"""
-    expected = DataFrame(
-        {
-            "a": Categorical(["1", "1", "2"]),
-            "b": Categorical(["a", "a", "b"]),
-            "c": Categorical(["3.4", "3.4", "4.5"]),
-        }
-    )
-    actual = parser.read_csv(StringIO(data), dtype=dtype)
-    tm.assert_frame_equal(actual, expected)
-
-
-@pytest.mark.parametrize("dtype", [{"b": "category"}, {1: "category"}])
-def test_categorical_dtype_single(all_parsers, dtype, request):
-    # see gh-10153
-    parser = all_parsers
-    data = """a,b,c
-1,a,3.4
-1,a,3.4
-2,b,4.5"""
-    expected = DataFrame(
-        {"a": [1, 1, 2], "b": Categorical(["a", "a", "b"]), "c": [3.4, 3.4, 4.5]}
-    )
-    if parser.engine == "pyarrow":
-        mark = pytest.mark.xfail(
-            strict=False,
-            reason="Flaky test sometimes gives object dtype instead of Categorical",
+class TestCategoricalConcat:
+    def test_categorical_concat(self, sort):
+        # See GH 10177
+        df1 = DataFrame(
+            np.arange(18, dtype="int64").reshape(6, 3), columns=["a", "b", "c"]
         )
-        request.applymarker(mark)
 
-    actual = parser.read_csv(StringIO(data), dtype=dtype)
-    tm.assert_frame_equal(actual, expected)
+        df2 = DataFrame(np.arange(14, dtype="int64").reshape(7, 2), columns=["a", "c"])
 
+        cat_values = ["one", "one", "two", "one", "two", "two", "one"]
+        df2["h"] = Series(Categorical(cat_values))
 
-@xfail_pyarrow  # AssertionError: Attributes of DataFrame.iloc[:, 0] are different
-def test_categorical_dtype_unsorted(all_parsers):
-    # see gh-10153
-    parser = all_parsers
-    data = """a,b,c
-1,b,3.4
-1,b,3.4
-2,a,4.5"""
-    expected = DataFrame(
-        {
-            "a": Categorical(["1", "1", "2"]),
-            "b": Categorical(["b", "b", "a"]),
-            "c": Categorical(["3.4", "3.4", "4.5"]),
-        }
-    )
-    actual = parser.read_csv(StringIO(data), dtype="category")
-    tm.assert_frame_equal(actual, expected)
+        res = pd.concat((df1, df2), axis=0, ignore_index=True, sort=sort)
+        exp = DataFrame(
+            {
+                "a": [0, 3, 6, 9, 12, 15, 0, 2, 4, 6, 8, 10, 12],
+                "b": [
+                    1,
+                    4,
+                    7,
+                    10,
+                    13,
+                    16,
+                    np.nan,
+                    np.nan,
+                    np.nan,
+                    np.nan,
+                    np.nan,
+                    np.nan,
+                    np.nan,
+                ],
+                "c": [2, 5, 8, 11, 14, 17, 1, 3, 5, 7, 9, 11, 13],
+                "h": [None] * 6 + cat_values,
+            }
+        )
+        exp["h"] = exp["h"].astype(df2["h"].dtype)
+        tm.assert_frame_equal(res, exp)
 
+    def test_categorical_concat_dtypes(self, using_infer_string):
+        # GH8143
+        index = ["cat", "obj", "num"]
+        cat = Categorical(["a", "b", "c"])
+        obj = Series(["a", "b", "c"])
+        num = Series([1, 2, 3])
+        df = pd.concat([Series(cat), obj, num], axis=1, keys=index)
 
-@xfail_pyarrow  # AssertionError: Attributes of DataFrame.iloc[:, 0] are different
-def test_categorical_dtype_missing(all_parsers):
-    # see gh-10153
-    parser = all_parsers
-    data = """a,b,c
-1,b,3.4
-1,nan,3.4
-2,a,4.5"""
-    expected = DataFrame(
-        {
-            "a": Categorical(["1", "1", "2"]),
-            "b": Categorical(["b", np.nan, "a"]),
-            "c": Categorical(["3.4", "3.4", "4.5"]),
-        }
-    )
-    actual = parser.read_csv(StringIO(data), dtype="category")
-    tm.assert_frame_equal(actual, expected)
+        result = df.dtypes == (object if not using_infer_string else "str")
+        expected = Series([False, True, False], index=index)
+        tm.assert_series_equal(result, expected)
 
+        result = df.dtypes == "int64"
+        expected = Series([False, False, True], index=index)
+        tm.assert_series_equal(result, expected)
 
-@xfail_pyarrow  # AssertionError: Attributes of DataFrame.iloc[:, 0] are different
-@pytest.mark.slow
-def test_categorical_dtype_high_cardinality_numeric(all_parsers, monkeypatch):
-    # see gh-18186
-    # was an issue with C parser, due to DEFAULT_BUFFER_HEURISTIC
-    parser = all_parsers
-    heuristic = 2**5
-    data = np.sort([str(i) for i in range(heuristic + 1)])
-    expected = DataFrame({"a": Categorical(data, ordered=True)})
-    with monkeypatch.context() as m:
-        m.setattr(libparsers, "DEFAULT_BUFFER_HEURISTIC", heuristic)
-        actual = parser.read_csv(StringIO("a\n" + "\n".join(data)), dtype="category")
-    actual["a"] = actual["a"].cat.reorder_categories(
-        np.sort(actual.a.cat.categories), ordered=True
-    )
-    tm.assert_frame_equal(actual, expected)
+        result = df.dtypes == "category"
+        expected = Series([True, False, False], index=index)
+        tm.assert_series_equal(result, expected)
 
+    def test_concat_categoricalindex(self):
+        # GH 16111, categories that aren't lexsorted
+        categories = [9, 0, 1, 2, 3]
 
-def test_categorical_dtype_utf16(all_parsers, csv_dir_path):
-    # see gh-10153
-    pth = os.path.join(csv_dir_path, "utf16_ex.txt")
-    parser = all_parsers
-    encoding = "utf-16"
-    sep = "\t"
+        a = Series(1, index=pd.CategoricalIndex([9, 0], categories=categories))
+        b = Series(2, index=pd.CategoricalIndex([0, 1], categories=categories))
+        c = Series(3, index=pd.CategoricalIndex([1, 2], categories=categories))
 
-    expected = parser.read_csv(pth, sep=sep, encoding=encoding)
-    expected = expected.apply(Categorical)
+        result = pd.concat([a, b, c], axis=1)
 
-    actual = parser.read_csv(pth, sep=sep, encoding=encoding, dtype="category")
-    tm.assert_frame_equal(actual, expected)
+        exp_idx = pd.CategoricalIndex([9, 0, 1, 2], categories=categories)
+        exp = DataFrame(
+            {
+                0: [1, 1, np.nan, np.nan],
+                1: [np.nan, 2, 2, np.nan],
+                2: [np.nan, np.nan, 3, 3],
+            },
+            columns=[0, 1, 2],
+            index=exp_idx,
+        )
+        tm.assert_frame_equal(result, exp)
 
+    def test_categorical_concat_preserve(self):
+        # GH 8641  series concat not preserving category dtype
+        # GH 13524 can concat different categories
+        s = Series(list("abc"), dtype="category")
+        s2 = Series(list("abd"), dtype="category")
 
-def test_categorical_dtype_chunksize_infer_categories(all_parsers):
-    # see gh-10153
-    parser = all_parsers
-    data = """a,b
-1,a
-1,b
-1,b
-2,c"""
-    expecteds = [
-        DataFrame({"a": [1, 1], "b": Categorical(["a", "b"])}),
-        DataFrame({"a": [1, 2], "b": Categorical(["b", "c"])}, index=[2, 3]),
-    ]
+        exp = Series(list("abcabd"))
+        res = pd.concat([s, s2], ignore_index=True)
+        tm.assert_series_equal(res, exp)
 
-    if parser.engine == "pyarrow":
-        msg = "The 'chunksize' option is not supported with the 'pyarrow' engine"
-        with pytest.raises(ValueError, match=msg):
-            parser.read_csv(StringIO(data), dtype={"b": "category"}, chunksize=2)
-        return
+        exp = Series(list("abcabc"), dtype="category")
+        res = pd.concat([s, s], ignore_index=True)
+        tm.assert_series_equal(res, exp)
 
-    with parser.read_csv(
-        StringIO(data), dtype={"b": "category"}, chunksize=2
-    ) as actuals:
-        for actual, expected in zip(actuals, expecteds):
-            tm.assert_frame_equal(actual, expected)
+        exp = Series(list("abcabc"), index=[0, 1, 2, 0, 1, 2], dtype="category")
+        res = pd.concat([s, s])
+        tm.assert_series_equal(res, exp)
 
+        a = Series(np.arange(6, dtype="int64"))
+        b = Series(list("aabbca"))
 
-def test_categorical_dtype_chunksize_explicit_categories(all_parsers):
-    # see gh-10153
-    parser = all_parsers
-    data = """a,b
-1,a
-1,b
-1,b
-2,c"""
-    cats = ["a", "b", "c"]
-    expecteds = [
-        DataFrame({"a": [1, 1], "b": Categorical(["a", "b"], categories=cats)}),
-        DataFrame(
-            {"a": [1, 2], "b": Categorical(["b", "c"], categories=cats)},
-            index=[2, 3],
-        ),
-    ]
-    dtype = CategoricalDtype(cats)
+        df2 = DataFrame({"A": a, "B": b.astype(CategoricalDtype(list("cab")))})
+        res = pd.concat([df2, df2])
+        exp = DataFrame(
+            {
+                "A": pd.concat([a, a]),
+                "B": pd.concat([b, b]).astype(CategoricalDtype(list("cab"))),
+            }
+        )
+        tm.assert_frame_equal(res, exp)
 
-    if parser.engine == "pyarrow":
-        msg = "The 'chunksize' option is not supported with the 'pyarrow' engine"
-        with pytest.raises(ValueError, match=msg):
-            parser.read_csv(StringIO(data), dtype={"b": dtype}, chunksize=2)
-        return
+    def test_categorical_index_preserver(self):
+        a = Series(np.arange(6, dtype="int64"))
+        b = Series(list("aabbca"))
 
-    with parser.read_csv(StringIO(data), dtype={"b": dtype}, chunksize=2) as actuals:
-        for actual, expected in zip(actuals, expecteds):
-            tm.assert_frame_equal(actual, expected)
+        df2 = DataFrame(
+            {"A": a, "B": b.astype(CategoricalDtype(list("cab")))}
+        ).set_index("B")
+        result = pd.concat([df2, df2])
+        expected = DataFrame(
+            {
+                "A": pd.concat([a, a]),
+                "B": pd.concat([b, b]).astype(CategoricalDtype(list("cab"))),
+            }
+        ).set_index("B")
+        tm.assert_frame_equal(result, expected)
 
+        # wrong categories -> uses concat_compat, which casts to object
+        df3 = DataFrame(
+            {"A": a, "B": Categorical(b, categories=list("abe"))}
+        ).set_index("B")
+        result = pd.concat([df2, df3])
+        expected = pd.concat(
+            [
+                df2.set_axis(df2.index.astype(object), axis=0),
+                df3.set_axis(df3.index.astype(object), axis=0),
+            ]
+        )
+        tm.assert_frame_equal(result, expected)
 
-def test_categorical_dtype_latin1(all_parsers, csv_dir_path):
-    # see gh-10153
-    pth = os.path.join(csv_dir_path, "unicode_series.csv")
-    parser = all_parsers
-    encoding = "latin-1"
+    def test_concat_categorical_tz(self):
+        # GH-23816
+        a = Series(pd.date_range("2017-01-01", periods=2, tz="US/Pacific"))
+        b = Series(["a", "b"], dtype="category")
+        result = pd.concat([a, b], ignore_index=True)
+        expected = Series(
+            [
+                pd.Timestamp("2017-01-01", tz="US/Pacific"),
+                pd.Timestamp("2017-01-02", tz="US/Pacific"),
+                "a",
+                "b",
+            ]
+        )
+        tm.assert_series_equal(result, expected)
 
-    expected = parser.read_csv(pth, header=None, encoding=encoding)
-    expected[1] = Categorical(expected[1])
+    def test_concat_categorical_datetime(self):
+        # GH-39443
+        df1 = DataFrame(
+            {"x": Series(datetime(2021, 1, 1), index=[0], dtype="category")}
+        )
+        df2 = DataFrame(
+            {"x": Series(datetime(2021, 1, 2), index=[1], dtype="category")}
+        )
 
-    actual = parser.read_csv(pth, header=None, encoding=encoding, dtype={1: "category"})
-    tm.assert_frame_equal(actual, expected)
+        result = pd.concat([df1, df2])
+        expected = DataFrame(
+            {"x": Series([datetime(2021, 1, 1), datetime(2021, 1, 2)])}
+        )
 
+        tm.assert_equal(result, expected)
 
-@pytest.mark.parametrize("ordered", [False, True])
-@pytest.mark.parametrize(
-    "categories",
-    [["a", "b", "c"], ["a", "c", "b"], ["a", "b", "c", "d"], ["c", "b", "a"]],
-)
-def test_categorical_category_dtype(all_parsers, categories, ordered):
-    parser = all_parsers
-    data = """a,b
-1,a
-1,b
-1,b
-2,c"""
-    expected = DataFrame(
-        {
-            "a": [1, 1, 1, 2],
-            "b": Categorical(
-                ["a", "b", "b", "c"], categories=categories, ordered=ordered
-            ),
-        }
-    )
+    def test_concat_categorical_unchanged(self):
+        # GH-12007
+        # test fix for when concat on categorical and float
+        # coerces dtype categorical -> float
+        df = DataFrame(Series(["a", "b", "c"], dtype="category", name="A"))
+        ser = Series([0, 1, 2], index=[0, 1, 3], name="B")
+        result = pd.concat([df, ser], axis=1)
+        expected = DataFrame(
+            {
+                "A": Series(["a", "b", "c", np.nan], dtype="category"),
+                "B": Series([0, 1, np.nan, 2], dtype="float"),
+            }
+        )
+        tm.assert_equal(result, expected)
 
-    dtype = {"b": CategoricalDtype(categories=categories, ordered=ordered)}
-    result = parser.read_csv(StringIO(data), dtype=dtype)
-    tm.assert_frame_equal(result, expected)
+    def test_categorical_concat_gh7864(self):
+        # GH 7864
+        # make sure ordering is preserved
+        df = DataFrame({"id": [1, 2, 3, 4, 5, 6], "raw_grade": list("abbaae")})
+        df["grade"] = Categorical(df["raw_grade"])
+        df["grade"].cat.set_categories(["e", "a", "b"])
 
+        df1 = df[0:3]
+        df2 = df[3:]
 
-def test_categorical_category_dtype_unsorted(all_parsers):
-    parser = all_parsers
-    data = """a,b
-1,a
-1,b
-1,b
-2,c"""
-    dtype = CategoricalDtype(["c", "b", "a"])
-    expected = DataFrame(
-        {
-            "a": [1, 1, 1, 2],
-            "b": Categorical(["a", "b", "b", "c"], categories=["c", "b", "a"]),
-        }
-    )
+        tm.assert_index_equal(df["grade"].cat.categories, df1["grade"].cat.categories)
+        tm.assert_index_equal(df["grade"].cat.categories, df2["grade"].cat.categories)
 
-    result = parser.read_csv(StringIO(data), dtype={"b": dtype})
-    tm.assert_frame_equal(result, expected)
+        dfx = pd.concat([df1, df2])
+        tm.assert_index_equal(df["grade"].cat.categories, dfx["grade"].cat.categories)
 
+        dfa = df1._append(df2)
+        tm.assert_index_equal(df["grade"].cat.categories, dfa["grade"].cat.categories)
 
-def test_categorical_coerces_numeric(all_parsers):
-    parser = all_parsers
-    dtype = {"b": CategoricalDtype([1, 2, 3])}
+    def test_categorical_index_upcast(self):
+        # GH 17629
+        # test upcasting to object when concatenating on categorical indexes
+        # with non-identical categories
 
-    data = "b\n1\n1\n2\n3"
-    expected = DataFrame({"b": Categorical([1, 1, 2, 3])})
+        a = DataFrame({"foo": [1, 2]}, index=Categorical(["foo", "bar"]))
+        b = DataFrame({"foo": [4, 3]}, index=Categorical(["baz", "bar"]))
 
-    result = parser.read_csv(StringIO(data), dtype=dtype)
-    tm.assert_frame_equal(result, expected)
+        res = pd.concat([a, b])
+        exp = DataFrame({"foo": [1, 2, 4, 3]}, index=["foo", "bar", "baz", "bar"])
 
+        tm.assert_equal(res, exp)
 
-def test_categorical_coerces_datetime(all_parsers):
-    parser = all_parsers
-    dti = pd.DatetimeIndex(["2017-01-01", "2018-01-01", "2019-01-01"], freq=None)
-    dtype = {"b": CategoricalDtype(dti)}
+        a = Series([1, 2], index=Categorical(["foo", "bar"]))
+        b = Series([4, 3], index=Categorical(["baz", "bar"]))
 
-    data = "b\n2017-01-01\n2018-01-01\n2019-01-01"
-    expected = DataFrame({"b": Categorical(dtype["b"].categories)})
+        res = pd.concat([a, b])
+        exp = Series([1, 2, 4, 3], index=["foo", "bar", "baz", "bar"])
 
-    result = parser.read_csv(StringIO(data), dtype=dtype)
-    tm.assert_frame_equal(result, expected)
+        tm.assert_equal(res, exp)
 
+    def test_categorical_missing_from_one_frame(self):
+        # GH 25412
+        df1 = DataFrame({"f1": [1, 2, 3]})
+        df2 = DataFrame({"f1": [2, 3, 1], "f2": Series([4, 4, 4]).astype("category")})
+        result = pd.concat([df1, df2], sort=True)
+        dtype = CategoricalDtype([4])
+        expected = DataFrame(
+            {
+                "f1": [1, 2, 3, 2, 3, 1],
+                "f2": Categorical.from_codes([-1, -1, -1, 0, 0, 0], dtype=dtype),
+            },
+            index=[0, 1, 2, 0, 1, 2],
+        )
+        tm.assert_frame_equal(result, expected)
 
-def test_categorical_coerces_timestamp(all_parsers):
-    parser = all_parsers
-    dtype = {"b": CategoricalDtype([Timestamp("2014")])}
+    def test_concat_categorical_same_categories_different_order(self):
+        # https://github.com/pandas-dev/pandas/issues/24845
 
-    data = "b\n2014-01-01\n2014-01-01"
-    expected = DataFrame({"b": Categorical([Timestamp("2014")] * 2)})
+        c1 = pd.CategoricalIndex(["a", "a"], categories=["a", "b"], ordered=False)
+        c2 = pd.CategoricalIndex(["b", "b"], categories=["b", "a"], ordered=False)
+        c3 = pd.CategoricalIndex(
+            ["a", "a", "b", "b"], categories=["a", "b"], ordered=False
+        )
 
-    result = parser.read_csv(StringIO(data), dtype=dtype)
-    tm.assert_frame_equal(result, expected)
+        df1 = DataFrame({"A": [1, 2]}, index=c1)
+        df2 = DataFrame({"A": [3, 4]}, index=c2)
 
-
-def test_categorical_coerces_timedelta(all_parsers):
-    parser = all_parsers
-    dtype = {"b": CategoricalDtype(pd.to_timedelta(["1h", "2h", "3h"]))}
-
-    data = "b\n1h\n2h\n3h"
-    expected = DataFrame({"b": Categorical(dtype["b"].categories)})
-
-    result = parser.read_csv(StringIO(data), dtype=dtype)
-    tm.assert_frame_equal(result, expected)
-
-
-@pytest.mark.parametrize(
-    "data",
-    [
-        "b\nTrue\nFalse\nNA\nFalse",
-        "b\ntrue\nfalse\nNA\nfalse",
-        "b\nTRUE\nFALSE\nNA\nFALSE",
-        "b\nTrue\nFalse\nNA\nFALSE",
-    ],
-)
-def test_categorical_dtype_coerces_boolean(all_parsers, data):
-    # see gh-20498
-    parser = all_parsers
-    dtype = {"b": CategoricalDtype([False, True])}
-    expected = DataFrame({"b": Categorical([True, False, None, False])})
-
-    result = parser.read_csv(StringIO(data), dtype=dtype)
-    tm.assert_frame_equal(result, expected)
-
-
-def test_categorical_unexpected_categories(all_parsers):
-    parser = all_parsers
-    dtype = {"b": CategoricalDtype(["a", "b", "d", "e"])}
-
-    data = "b\nd\na\nc\nd"  # Unexpected c
-    expected = DataFrame({"b": Categorical(list("dacd"), dtype=dtype["b"])})
-
-    result = parser.read_csv(StringIO(data), dtype=dtype)
-    tm.assert_frame_equal(result, expected)
+        result = pd.concat((df1, df2))
+        expected = DataFrame({"A": [1, 2, 3, 4]}, index=c3)
+        tm.assert_frame_equal(result, expected)

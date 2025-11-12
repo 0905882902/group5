@@ -1,26 +1,52 @@
-from pandas import Categorical
+import numpy as np
+import pytest
+
+from pandas import (
+    DataFrame,
+    Series,
+)
 import pandas._testing as tm
 
+from pandas.io.pytables import (
+    HDFStore,
+    read_hdf,
+)
 
-class SubclassedCategorical(Categorical):
-    pass
+pytest.importorskip("tables")
 
 
-class TestCategoricalSubclassing:
-    def test_constructor(self):
-        sc = SubclassedCategorical(["a", "b", "c"])
-        assert isinstance(sc, SubclassedCategorical)
-        tm.assert_categorical_equal(sc, Categorical(["a", "b", "c"]))
+class TestHDFStoreSubclass:
+    # GH 33748
+    def test_supported_for_subclass_dataframe(self, tmp_path):
+        data = {"a": [1, 2], "b": [3, 4]}
+        sdf = tm.SubclassedDataFrame(data, dtype=np.intp)
 
-    def test_from_codes(self):
-        sc = SubclassedCategorical.from_codes([1, 0, 2], ["a", "b", "c"])
-        assert isinstance(sc, SubclassedCategorical)
-        exp = Categorical.from_codes([1, 0, 2], ["a", "b", "c"])
-        tm.assert_categorical_equal(sc, exp)
+        expected = DataFrame(data, dtype=np.intp)
 
-    def test_map(self):
-        sc = SubclassedCategorical(["a", "b", "c"])
-        res = sc.map(lambda x: x.upper(), na_action=None)
-        assert isinstance(res, SubclassedCategorical)
-        exp = Categorical(["A", "B", "C"])
-        tm.assert_categorical_equal(res, exp)
+        path = tmp_path / "temp.h5"
+        sdf.to_hdf(path, key="df")
+        result = read_hdf(path, "df")
+        tm.assert_frame_equal(result, expected)
+
+        path = tmp_path / "temp.h5"
+        with HDFStore(path) as store:
+            store.put("df", sdf)
+        result = read_hdf(path, "df")
+        tm.assert_frame_equal(result, expected)
+
+    def test_supported_for_subclass_series(self, tmp_path):
+        data = [1, 2, 3]
+        sser = tm.SubclassedSeries(data, dtype=np.intp)
+
+        expected = Series(data, dtype=np.intp)
+
+        path = tmp_path / "temp.h5"
+        sser.to_hdf(path, key="ser")
+        result = read_hdf(path, "ser")
+        tm.assert_series_equal(result, expected)
+
+        path = tmp_path / "temp.h5"
+        with HDFStore(path) as store:
+            store.put("ser", sser)
+        result = read_hdf(path, "ser")
+        tm.assert_series_equal(result, expected)
