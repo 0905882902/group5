@@ -1,930 +1,1462 @@
-# Authors: Nicolas Tresegnie <nicolas.tresegnie@gmail.com>
-#          Sergey Feldman <sergeyfeldman@gmail.com>
-# License: BSD 3 clause
+"""
+Base IO code for all datasets
+"""
 
-import numbers
-import warnings
-from collections import Counter
+# Copyright (c) 2007 David Cournapeau <cournape@gmail.com>
+#               2010 Fabian Pedregosa <fabian.pedregosa@inria.fr>
+#               2010 Olivier Grisel <olivier.grisel@ensta.org>
+# License: BSD 3 clause
+import csv
+import hashlib
+import gzip
+import shutil
+from collections import namedtuple
+from os import environ, listdir, makedirs
+from os.path import expanduser, isdir, join, splitext
+from importlib import resources
+
+from ..utils import Bunch
+from ..utils import check_random_state
+from ..utils import check_pandas_support
+from ..utils.deprecation import deprecated
 
 import numpy as np
-import numpy.ma as ma
-from scipy import sparse as sp
-from scipy import stats
 
-from ..base import BaseEstimator, TransformerMixin
-from ..utils.sparsefuncs import _get_median
-from ..utils.validation import check_is_fitted
-from ..utils.validation import FLOAT_DTYPES
-from ..utils._mask import _get_mask
-from ..utils import is_scalar_nan
+from urllib.request import urlretrieve
+
+DATA_MODULE = "sklearn.datasets.data"
+DESCR_MODULE = "sklearn.datasets.descr"
+IMAGES_MODULE = "sklearn.datasets.images"
+
+RemoteFileMetadata = namedtuple("RemoteFileMetadata", ["filename", "url", "checksum"])
 
 
-def _check_inputs_dtype(X, missing_values):
-    if X.dtype.kind in ("f", "i", "u") and not isinstance(missing_values, numbers.Real):
-        raise ValueError(
-            "'X' and 'missing_values' types are expected to be"
-            " both numerical. Got X.dtype={} and "
-            " type(missing_values)={}.".format(X.dtype, type(missing_values))
-        )
+def get_data_home(data_home=None) -> str:
+    """Return the path of the scikit-learn data dir.
 
+    This folder is used by some large dataset loaders to avoid downloading the
+    data several times.
 
-def _most_frequent(array, extra_value, n_repeat):
-    """Compute the most frequent value in a 1d array extended with
-    [extra_value] * n_repeat, where extra_value is assumed to be not part
-    of the array."""
-    # Compute the most frequent value in array only
-    if array.size > 0:
-        if array.dtype == object:
-            # scipy.stats.mode is slow with object dtype array.
-            # Python Counter is more efficient
-            counter = Counter(array)
-            most_frequent_count = counter.most_common(1)[0][1]
-            # tie breaking similarly to scipy.stats.mode
-            most_frequent_value = min(
-                value
-                for value, count in counter.items()
-                if count == most_frequent_count
-            )
-        else:
-            mode = stats.mode(array)
-            most_frequent_value = mode[0][0]
-            most_frequent_count = mode[1][0]
-    else:
-        most_frequent_value = 0
-        most_frequent_count = 0
+    By default the data dir is set to a folder named 'scikit_learn_data' in the
+    user home folder.
 
-    # Compare to array + [extra_value] * n_repeat
-    if most_frequent_count == 0 and n_repeat == 0:
-        return np.nan
-    elif most_frequent_count < n_repeat:
-        return extra_value
-    elif most_frequent_count > n_repeat:
-        return most_frequent_value
-    elif most_frequent_count == n_repeat:
-        # tie breaking similarly to scipy.stats.mode
-        return min(most_frequent_value, extra_value)
+    Alternatively, it can be set by the 'SCIKIT_LEARN_DATA' environment
+    variable or programmatically by giving an explicit folder path. The '~'
+    symbol is expanded to the user home folder.
 
-
-class _BaseImputer(TransformerMixin, BaseEstimator):
-    """Base class for all imputers.
-
-    It adds automatically support for `add_indicator`.
-    """
-
-    def __init__(self, *, missing_values=np.nan, add_indicator=False):
-        self.missing_values = missing_values
-        self.add_indicator = add_indicator
-
-    def _fit_indicator(self, X):
-        """Fit a MissingIndicator."""
-        if self.add_indicator:
-            self.indicator_ = MissingIndicator(
-                missing_values=self.missing_values, error_on_new=False
-            )
-            self.indicator_._fit(X, precomputed=True)
-        else:
-            self.indicator_ = None
-
-    def _transform_indicator(self, X):
-        """Compute the indicator mask.'
-
-        Note that X must be the original data as passed to the imputer before
-        any imputation, since imputation may be done inplace in some cases.
-        """
-        if self.add_indicator:
-            if not hasattr(self, "indicator_"):
-                raise ValueError(
-                    "Make sure to call _fit_indicator before _transform_indicator"
-                )
-            return self.indicator_.transform(X)
-
-    def _concatenate_indicator(self, X_imputed, X_indicator):
-        """Concatenate indicator mask with the imputed data."""
-        if not self.add_indicator:
-            return X_imputed
-
-        hstack = sp.hstack if sp.issparse(X_imputed) else np.hstack
-        if X_indicator is None:
-            raise ValueError(
-                "Data from the missing indicator are not provided. Call "
-                "_fit_indicator and _transform_indicator in the imputer "
-                "implementation."
-            )
-
-        return hstack((X_imputed, X_indicator))
-
-    def _more_tags(self):
-        return {"allow_nan": is_scalar_nan(self.missing_values)}
-
-
-class SimpleImputer(_BaseImputer):
-    """Imputation transformer for completing missing values.
-
-    Read more in the :ref:`User Guide <impute>`.
-
-    .. versionadded:: 0.20
-       `SimpleImputer` replaces the previous `sklearn.preprocessing.Imputer`
-       estimator which is now removed.
+    If the folder does not already exist, it is automatically created.
 
     Parameters
     ----------
-    missing_values : int, float, str, np.nan or None, default=np.nan
-        The placeholder for the missing values. All occurrences of
-        `missing_values` will be imputed. For pandas' dataframes with
-        nullable integer dtypes with missing values, `missing_values`
-        should be set to `np.nan`, since `pd.NA` will be converted to `np.nan`.
+    data_home : str, default=None
+        The path to scikit-learn data directory. If `None`, the default path
+        is `~/sklearn_learn_data`.
+    """
+    if data_home is None:
+        data_home = environ.get("SCIKIT_LEARN_DATA", join("~", "scikit_learn_data"))
+    data_home = expanduser(data_home)
+    makedirs(data_home, exist_ok=True)
+    return data_home
 
-    strategy : str, default='mean'
-        The imputation strategy.
 
-        - If "mean", then replace missing values using the mean along
-          each column. Can only be used with numeric data.
-        - If "median", then replace missing values using the median along
-          each column. Can only be used with numeric data.
-        - If "most_frequent", then replace missing using the most frequent
-          value along each column. Can be used with strings or numeric data.
-          If there is more than one such value, only the smallest is returned.
-        - If "constant", then replace missing values with fill_value. Can be
-          used with strings or numeric data.
+def clear_data_home(data_home=None):
+    """Delete all the content of the data home cache.
 
-        .. versionadded:: 0.20
-           strategy="constant" for fixed value imputation.
-
-    fill_value : str or numerical value, default=None
-        When strategy == "constant", fill_value is used to replace all
-        occurrences of missing_values.
-        If left to the default, fill_value will be 0 when imputing numerical
-        data and "missing_value" for strings or object data types.
-
-    verbose : int, default=0
-        Controls the verbosity of the imputer.
-
-    copy : bool, default=True
-        If True, a copy of `X` will be created. If False, imputation will
-        be done in-place whenever possible. Note that, in the following cases,
-        a new copy will always be made, even if `copy=False`:
-
-        - If `X` is not an array of floating values;
-        - If `X` is encoded as a CSR matrix;
-        - If `add_indicator=True`.
-
-    add_indicator : bool, default=False
-        If True, a :class:`MissingIndicator` transform will stack onto output
-        of the imputer's transform. This allows a predictive estimator
-        to account for missingness despite imputation. If a feature has no
-        missing values at fit/train time, the feature won't appear on
-        the missing indicator even if there are missing values at
-        transform/test time.
-
-    Attributes
+    Parameters
     ----------
-    statistics_ : array of shape (n_features,)
-        The imputation fill value for each feature.
-        Computing statistics can result in `np.nan` values.
-        During :meth:`transform`, features corresponding to `np.nan`
-        statistics will be discarded.
+    data_home : str, default=None
+        The path to scikit-learn data directory. If `None`, the default path
+        is `~/sklearn_learn_data`.
+    """
+    data_home = get_data_home(data_home)
+    shutil.rmtree(data_home)
 
-    indicator_ : :class:`~sklearn.impute.MissingIndicator`
-        Indicator used to add binary indicators for missing values.
-        `None` if `add_indicator=False`.
 
-    n_features_in_ : int
-        Number of features seen during :term:`fit`.
+def _convert_data_dataframe(
+    caller_name, data, target, feature_names, target_names, sparse_data=False
+):
+    pd = check_pandas_support("{} with as_frame=True".format(caller_name))
+    if not sparse_data:
+        data_df = pd.DataFrame(data, columns=feature_names)
+    else:
+        data_df = pd.DataFrame.sparse.from_spmatrix(data, columns=feature_names)
 
-        .. versionadded:: 0.24
+    target_df = pd.DataFrame(target, columns=target_names)
+    combined_df = pd.concat([data_df, target_df], axis=1)
+    X = combined_df[feature_names]
+    y = combined_df[target_names]
+    if y.shape[1] == 1:
+        y = y.iloc[:, 0]
+    return combined_df, X, y
 
-    feature_names_in_ : ndarray of shape (`n_features_in_`,)
-        Names of features seen during :term:`fit`. Defined only when `X`
-        has feature names that are all strings.
 
-        .. versionadded:: 1.0
+def load_files(
+    container_path,
+    *,
+    description=None,
+    categories=None,
+    load_content=True,
+    shuffle=True,
+    encoding=None,
+    decode_error="strict",
+    random_state=0,
+):
+    """Load text files with categories as subfolder names.
 
-    See Also
+    Individual samples are assumed to be files stored a two levels folder
+    structure such as the following:
+
+        container_folder/
+            category_1_folder/
+                file_1.txt
+                file_2.txt
+                ...
+                file_42.txt
+            category_2_folder/
+                file_43.txt
+                file_44.txt
+                ...
+
+    The folder names are used as supervised signal label names. The individual
+    file names are not important.
+
+    This function does not try to extract features into a numpy array or scipy
+    sparse matrix. In addition, if load_content is false it does not try to
+    load the files in memory.
+
+    To use text files in a scikit-learn classification or clustering algorithm,
+    you will need to use the :mod`~sklearn.feature_extraction.text` module to
+    build a feature extraction transformer that suits your problem.
+
+    If you set load_content=True, you should also specify the encoding of the
+    text using the 'encoding' parameter. For many modern text files, 'utf-8'
+    will be the correct encoding. If you leave encoding equal to None, then the
+    content will be made of bytes instead of Unicode, and you will not be able
+    to use most functions in :mod:`~sklearn.feature_extraction.text`.
+
+    Similar feature extractors should be built for other kind of unstructured
+    data input such as images, audio, video, ...
+
+    Read more in the :ref:`User Guide <datasets>`.
+
+    Parameters
+    ----------
+    container_path : str
+        Path to the main folder holding one subfolder per category.
+
+    description : str, default=None
+        A paragraph describing the characteristic of the dataset: its source,
+        reference, etc.
+
+    categories : list of str, default=None
+        If None (default), load all the categories. If not None, list of
+        category names to load (other categories ignored).
+
+    load_content : bool, default=True
+        Whether to load or not the content of the different files. If true a
+        'data' attribute containing the text information is present in the data
+        structure returned. If not, a filenames attribute gives the path to the
+        files.
+
+    shuffle : bool, default=True
+        Whether or not to shuffle the data: might be important for models that
+        make the assumption that the samples are independent and identically
+        distributed (i.i.d.), such as stochastic gradient descent.
+
+    encoding : str, default=None
+        If None, do not try to decode the content of the files (e.g. for images
+        or other non-text content). If not None, encoding to use to decode text
+        files to Unicode if load_content is True.
+
+    decode_error : {'strict', 'ignore', 'replace'}, default='strict'
+        Instruction on what to do if a byte sequence is given to analyze that
+        contains characters not of the given `encoding`. Passed as keyword
+        argument 'errors' to bytes.decode.
+
+    random_state : int, RandomState instance or None, default=0
+        Determines random number generation for dataset shuffling. Pass an int
+        for reproducible output across multiple function calls.
+        See :term:`Glossary <random_state>`.
+
+    Returns
+    -------
+    data : :class:`~sklearn.utils.Bunch`
+        Dictionary-like object, with the following attributes.
+
+        data : list of str
+            Only present when `load_content=True`.
+            The raw text data to learn.
+        target : ndarray
+            The target labels (integer index).
+        target_names : list
+            The names of target classes.
+        DESCR : str
+            The full description of the dataset.
+        filenames: ndarray
+            The filenames holding the dataset.
+    """
+    target = []
+    target_names = []
+    filenames = []
+
+    folders = [
+        f for f in sorted(listdir(container_path)) if isdir(join(container_path, f))
+    ]
+
+    if categories is not None:
+        folders = [f for f in folders if f in categories]
+
+    for label, folder in enumerate(folders):
+        target_names.append(folder)
+        folder_path = join(container_path, folder)
+        documents = [join(folder_path, d) for d in sorted(listdir(folder_path))]
+        target.extend(len(documents) * [label])
+        filenames.extend(documents)
+
+    # convert to array for fancy indexing
+    filenames = np.array(filenames)
+    target = np.array(target)
+
+    if shuffle:
+        random_state = check_random_state(random_state)
+        indices = np.arange(filenames.shape[0])
+        random_state.shuffle(indices)
+        filenames = filenames[indices]
+        target = target[indices]
+
+    if load_content:
+        data = []
+        for filename in filenames:
+            with open(filename, "rb") as f:
+                data.append(f.read())
+        if encoding is not None:
+            data = [d.decode(encoding, decode_error) for d in data]
+        return Bunch(
+            data=data,
+            filenames=filenames,
+            target_names=target_names,
+            target=target,
+            DESCR=description,
+        )
+
+    return Bunch(
+        filenames=filenames, target_names=target_names, target=target, DESCR=description
+    )
+
+
+def load_csv_data(
+    data_file_name,
+    *,
+    data_module=DATA_MODULE,
+    descr_file_name=None,
+    descr_module=DESCR_MODULE,
+):
+    """Loads `data_file_name` from `data_module with `importlib.resources`.
+
+    Parameters
+    ----------
+    data_file_name : str
+        Name of csv file to be loaded from `data_module/data_file_name`.
+        For example `'wine_data.csv'`.
+
+    data_module : str or module, default='sklearn.datasets.data'
+        Module where data lives. The default is `'sklearn.datasets.data'`.
+
+    descr_file_name : str, default=None
+        Name of rst file to be loaded from `descr_module/descr_file_name`.
+        For example `'wine_data.rst'`. See also :func:`load_descr`.
+        If not None, also returns the corresponding description of
+        the dataset.
+
+    descr_module : str or module, default='sklearn.datasets.descr'
+        Module where `descr_file_name` lives. See also :func:`load_descr`.
+        The default is `'sklearn.datasets.descr'`.
+
+    Returns
+    -------
+    data : ndarray of shape (n_samples, n_features)
+        A 2D array with each row representing one sample and each column
+        representing the features of a given sample.
+
+    target : ndarry of shape (n_samples,)
+        A 1D array holding target variables for all the samples in `data`.
+        For example target[0] is the target variable for data[0].
+
+    target_names : ndarry of shape (n_samples,)
+        A 1D array containing the names of the classifications. For example
+        target_names[0] is the name of the target[0] class.
+
+    descr : str, optional
+        Description of the dataset (the content of `descr_file_name`).
+        Only returned if `descr_file_name` is not None.
+    """
+    with resources.open_text(data_module, data_file_name) as csv_file:
+        data_file = csv.reader(csv_file)
+        temp = next(data_file)
+        n_samples = int(temp[0])
+        n_features = int(temp[1])
+        target_names = np.array(temp[2:])
+        data = np.empty((n_samples, n_features))
+        target = np.empty((n_samples,), dtype=int)
+
+        for i, ir in enumerate(data_file):
+            data[i] = np.asarray(ir[:-1], dtype=np.float64)
+            target[i] = np.asarray(ir[-1], dtype=int)
+
+    if descr_file_name is None:
+        return data, target, target_names
+    else:
+        assert descr_module is not None
+        descr = load_descr(descr_module=descr_module, descr_file_name=descr_file_name)
+        return data, target, target_names, descr
+
+
+def load_gzip_compressed_csv_data(
+    data_file_name,
+    *,
+    data_module=DATA_MODULE,
+    descr_file_name=None,
+    descr_module=DESCR_MODULE,
+    encoding="utf-8",
+    **kwargs,
+):
+    """Loads gzip-compressed `data_file_name` from `data_module` with `importlib.resources`.
+
+    1) Open resource file with `importlib.resources.open_binary`
+    2) Decompress file obj with `gzip.open`
+    3) Load decompressed data with `np.loadtxt`
+
+    Parameters
+    ----------
+    data_file_name : str
+        Name of gzip-compressed csv file  (`'*.csv.gz'`) to be loaded from
+        `data_module/data_file_name`. For example `'diabetes_data.csv.gz'`.
+
+    data_module : str or module, default='sklearn.datasets.data'
+        Module where data lives. The default is `'sklearn.datasets.data'`.
+
+    descr_file_name : str, default=None
+        Name of rst file to be loaded from `descr_module/descr_file_name`.
+        For example `'wine_data.rst'`. See also :func:`load_descr`.
+        If not None, also returns the corresponding description of
+        the dataset.
+
+    descr_module : str or module, default='sklearn.datasets.descr'
+        Module where `descr_file_name` lives. See also :func:`load_descr`.
+        The default  is `'sklearn.datasets.descr'`.
+
+    encoding : str, default="utf-8"
+        Name of the encoding that the gzip-decompressed file will be
+        decoded with. The default is 'utf-8'.
+
+    **kwargs : dict, optional
+        Keyword arguments to be passed to `np.loadtxt`;
+        e.g. delimiter=','.
+
+    Returns
+    -------
+    data : ndarray of shape (n_samples, n_features)
+        A 2D array with each row representing one sample and each column
+        representing the features and/or target of a given sample.
+
+    descr : str, optional
+        Description of the dataset (the content of `descr_file_name`).
+        Only returned if `descr_file_name` is not None.
+    """
+    with resources.open_binary(data_module, data_file_name) as compressed_file:
+        compressed_file = gzip.open(compressed_file, mode="rt", encoding=encoding)
+        data = np.loadtxt(compressed_file, **kwargs)
+
+    if descr_file_name is None:
+        return data
+    else:
+        assert descr_module is not None
+        descr = load_descr(descr_module=descr_module, descr_file_name=descr_file_name)
+        return data, descr
+
+
+def load_descr(descr_file_name, *, descr_module=DESCR_MODULE):
+    """Load `descr_file_name` from `descr_module` with `importlib.resources`.
+
+    Parameters
+    ----------
+    descr_file_name : str, default=None
+        Name of rst file to be loaded from `descr_module/descr_file_name`.
+        For example `'wine_data.rst'`. See also :func:`load_descr`.
+        If not None, also returns the corresponding description of
+        the dataset.
+
+    descr_module : str or module, default='sklearn.datasets.descr'
+        Module where `descr_file_name` lives. See also :func:`load_descr`.
+        The default  is `'sklearn.datasets.descr'`.
+
+    Returns
+    -------
+    fdescr : str
+        Content of `descr_file_name`.
+    """
+    fdescr = resources.read_text(descr_module, descr_file_name)
+
+    return fdescr
+
+
+def load_wine(*, return_X_y=False, as_frame=False):
+    """Load and return the wine dataset (classification).
+
+    .. versionadded:: 0.18
+
+    The wine dataset is a classic and very easy multi-class classification
+    dataset.
+
+    =================   ==============
+    Classes                          3
+    Samples per class        [59,71,48]
+    Samples total                  178
+    Dimensionality                  13
+    Features            real, positive
+    =================   ==============
+
+    Read more in the :ref:`User Guide <wine_dataset>`.
+
+    Parameters
+    ----------
+    return_X_y : bool, default=False
+        If True, returns ``(data, target)`` instead of a Bunch object.
+        See below for more information about the `data` and `target` object.
+
+    as_frame : bool, default=False
+        If True, the data is a pandas DataFrame including columns with
+        appropriate dtypes (numeric). The target is
+        a pandas DataFrame or Series depending on the number of target columns.
+        If `return_X_y` is True, then (`data`, `target`) will be pandas
+        DataFrames or Series as described below.
+
+        .. versionadded:: 0.23
+
+    Returns
+    -------
+    data : :class:`~sklearn.utils.Bunch`
+        Dictionary-like object, with the following attributes.
+
+        data : {ndarray, dataframe} of shape (178, 13)
+            The data matrix. If `as_frame=True`, `data` will be a pandas
+            DataFrame.
+        target: {ndarray, Series} of shape (178,)
+            The classification target. If `as_frame=True`, `target` will be
+            a pandas Series.
+        feature_names: list
+            The names of the dataset columns.
+        target_names: list
+            The names of target classes.
+        frame: DataFrame of shape (178, 14)
+            Only present when `as_frame=True`. DataFrame with `data` and
+            `target`.
+
+            .. versionadded:: 0.23
+        DESCR: str
+            The full description of the dataset.
+
+    (data, target) : tuple if ``return_X_y`` is True
+
+    The copy of UCI ML Wine Data Set dataset is downloaded and modified to fit
+    standard format from:
+    https://archive.ics.uci.edu/ml/machine-learning-databases/wine/wine.data
+
+    Examples
     --------
-    IterativeImputer : Multivariate imputation of missing values.
+    Let's say you are interested in the samples 10, 80, and 140, and want to
+    know their class name.
+
+    >>> from sklearn.datasets import load_wine
+    >>> data = load_wine()
+    >>> data.target[[10, 80, 140]]
+    array([0, 1, 2])
+    >>> list(data.target_names)
+    ['class_0', 'class_1', 'class_2']
+    """
+
+    data, target, target_names, fdescr = load_csv_data(
+        data_file_name="wine_data.csv", descr_file_name="wine_data.rst"
+    )
+
+    feature_names = [
+        "alcohol",
+        "malic_acid",
+        "ash",
+        "alcalinity_of_ash",
+        "magnesium",
+        "total_phenols",
+        "flavanoids",
+        "nonflavanoid_phenols",
+        "proanthocyanins",
+        "color_intensity",
+        "hue",
+        "od280/od315_of_diluted_wines",
+        "proline",
+    ]
+
+    frame = None
+    target_columns = [
+        "target",
+    ]
+    if as_frame:
+        frame, data, target = _convert_data_dataframe(
+            "load_wine", data, target, feature_names, target_columns
+        )
+
+    if return_X_y:
+        return data, target
+
+    return Bunch(
+        data=data,
+        target=target,
+        frame=frame,
+        target_names=target_names,
+        DESCR=fdescr,
+        feature_names=feature_names,
+    )
+
+
+def load_iris(*, return_X_y=False, as_frame=False):
+    """Load and return the iris dataset (classification).
+
+    The iris dataset is a classic and very easy multi-class classification
+    dataset.
+
+    =================   ==============
+    Classes                          3
+    Samples per class               50
+    Samples total                  150
+    Dimensionality                   4
+    Features            real, positive
+    =================   ==============
+
+    Read more in the :ref:`User Guide <iris_dataset>`.
+
+    Parameters
+    ----------
+    return_X_y : bool, default=False
+        If True, returns ``(data, target)`` instead of a Bunch object. See
+        below for more information about the `data` and `target` object.
+
+        .. versionadded:: 0.18
+
+    as_frame : bool, default=False
+        If True, the data is a pandas DataFrame including columns with
+        appropriate dtypes (numeric). The target is
+        a pandas DataFrame or Series depending on the number of target columns.
+        If `return_X_y` is True, then (`data`, `target`) will be pandas
+        DataFrames or Series as described below.
+
+        .. versionadded:: 0.23
+
+    Returns
+    -------
+    data : :class:`~sklearn.utils.Bunch`
+        Dictionary-like object, with the following attributes.
+
+        data : {ndarray, dataframe} of shape (150, 4)
+            The data matrix. If `as_frame=True`, `data` will be a pandas
+            DataFrame.
+        target: {ndarray, Series} of shape (150,)
+            The classification target. If `as_frame=True`, `target` will be
+            a pandas Series.
+        feature_names: list
+            The names of the dataset columns.
+        target_names: list
+            The names of target classes.
+        frame: DataFrame of shape (150, 5)
+            Only present when `as_frame=True`. DataFrame with `data` and
+            `target`.
+
+            .. versionadded:: 0.23
+        DESCR: str
+            The full description of the dataset.
+        filename: str
+            The path to the location of the data.
+
+            .. versionadded:: 0.20
+
+    (data, target) : tuple if ``return_X_y`` is True
+        A tuple of two ndarray. The first containing a 2D array of shape
+        (n_samples, n_features) with each row representing one sample and
+        each column representing the features. The second ndarray of shape
+        (n_samples,) containing the target samples.
+
+        .. versionadded:: 0.18
 
     Notes
     -----
-    Columns which only contained missing values at :meth:`fit` are discarded
-    upon :meth:`transform` if strategy is not `"constant"`.
+        .. versionchanged:: 0.20
+            Fixed two wrong data points according to Fisher's paper.
+            The new version is the same as in R, but not as in the UCI
+            Machine Learning Repository.
 
     Examples
     --------
-    >>> import numpy as np
-    >>> from sklearn.impute import SimpleImputer
-    >>> imp_mean = SimpleImputer(missing_values=np.nan, strategy='mean')
-    >>> imp_mean.fit([[7, 2, 3], [4, np.nan, 6], [10, 5, 9]])
-    SimpleImputer()
-    >>> X = [[np.nan, 2, 3], [4, np.nan, 6], [10, np.nan, 9]]
-    >>> print(imp_mean.transform(X))
-    [[ 7.   2.   3. ]
-     [ 4.   3.5  6. ]
-     [10.   3.5  9. ]]
+    Let's say you are interested in the samples 10, 25, and 50, and want to
+    know their class name.
+
+    >>> from sklearn.datasets import load_iris
+    >>> data = load_iris()
+    >>> data.target[[10, 25, 50]]
+    array([0, 0, 1])
+    >>> list(data.target_names)
+    ['setosa', 'versicolor', 'virginica']
     """
-
-    def __init__(
-        self,
-        *,
-        missing_values=np.nan,
-        strategy="mean",
-        fill_value=None,
-        verbose=0,
-        copy=True,
-        add_indicator=False,
-    ):
-        super().__init__(missing_values=missing_values, add_indicator=add_indicator)
-        self.strategy = strategy
-        self.fill_value = fill_value
-        self.verbose = verbose
-        self.copy = copy
-
-    def _validate_input(self, X, in_fit):
-        allowed_strategies = ["mean", "median", "most_frequent", "constant"]
-        if self.strategy not in allowed_strategies:
-            raise ValueError(
-                "Can only use these strategies: {0}  got strategy={1}".format(
-                    allowed_strategies, self.strategy
-                )
-            )
-
-        if self.strategy in ("most_frequent", "constant"):
-            # If input is a list of strings, dtype = object.
-            # Otherwise ValueError is raised in SimpleImputer
-            # with strategy='most_frequent' or 'constant'
-            # because the list is converted to Unicode numpy array
-            if isinstance(X, list) and any(
-                isinstance(elem, str) for row in X for elem in row
-            ):
-                dtype = object
-            else:
-                dtype = None
-        else:
-            dtype = FLOAT_DTYPES
-
-        if not is_scalar_nan(self.missing_values):
-            force_all_finite = True
-        else:
-            force_all_finite = "allow-nan"
-
-        try:
-            X = self._validate_data(
-                X,
-                reset=in_fit,
-                accept_sparse="csc",
-                dtype=dtype,
-                force_all_finite=force_all_finite,
-                copy=self.copy,
-            )
-        except ValueError as ve:
-            if "could not convert" in str(ve):
-                new_ve = ValueError(
-                    "Cannot use {} strategy with non-numeric data:\n{}".format(
-                        self.strategy, ve
-                    )
-                )
-                raise new_ve from None
-            else:
-                raise ve
-
-        _check_inputs_dtype(X, self.missing_values)
-        if X.dtype.kind not in ("i", "u", "f", "O"):
-            raise ValueError(
-                "SimpleImputer does not support data with dtype "
-                "{0}. Please provide either a numeric array (with"
-                " a floating point or integer dtype) or "
-                "categorical data represented either as an array "
-                "with integer dtype or an array of string values "
-                "with an object dtype.".format(X.dtype)
-            )
-
-        return X
-
-    def fit(self, X, y=None):
-        """Fit the imputer on `X`.
-
-        Parameters
-        ----------
-        X : {array-like, sparse matrix}, shape (n_samples, n_features)
-            Input data, where `n_samples` is the number of samples and
-            `n_features` is the number of features.
-
-        y : Ignored
-            Not used, present here for API consistency by convention.
-
-        Returns
-        -------
-        self : object
-            Fitted estimator.
-        """
-        X = self._validate_input(X, in_fit=True)
-
-        # default fill_value is 0 for numerical input and "missing_value"
-        # otherwise
-        if self.fill_value is None:
-            if X.dtype.kind in ("i", "u", "f"):
-                fill_value = 0
-            else:
-                fill_value = "missing_value"
-        else:
-            fill_value = self.fill_value
-
-        # fill_value should be numerical in case of numerical input
-        if (
-            self.strategy == "constant"
-            and X.dtype.kind in ("i", "u", "f")
-            and not isinstance(fill_value, numbers.Real)
-        ):
-            raise ValueError(
-                "'fill_value'={0} is invalid. Expected a "
-                "numerical value when imputing numerical "
-                "data".format(fill_value)
-            )
-
-        if sp.issparse(X):
-            # missing_values = 0 not allowed with sparse data as it would
-            # force densification
-            if self.missing_values == 0:
-                raise ValueError(
-                    "Imputation not possible when missing_values "
-                    "== 0 and input is sparse. Provide a dense "
-                    "array instead."
-                )
-            else:
-                self.statistics_ = self._sparse_fit(
-                    X, self.strategy, self.missing_values, fill_value
-                )
-
-        else:
-            self.statistics_ = self._dense_fit(
-                X, self.strategy, self.missing_values, fill_value
-            )
-
-        return self
-
-    def _sparse_fit(self, X, strategy, missing_values, fill_value):
-        """Fit the transformer on sparse data."""
-        missing_mask = _get_mask(X, missing_values)
-        mask_data = missing_mask.data
-        n_implicit_zeros = X.shape[0] - np.diff(X.indptr)
-
-        statistics = np.empty(X.shape[1])
-
-        if strategy == "constant":
-            # for constant strategy, self.statistcs_ is used to store
-            # fill_value in each column
-            statistics.fill(fill_value)
-        else:
-            for i in range(X.shape[1]):
-                column = X.data[X.indptr[i] : X.indptr[i + 1]]
-                mask_column = mask_data[X.indptr[i] : X.indptr[i + 1]]
-                column = column[~mask_column]
-
-                # combine explicit and implicit zeros
-                mask_zeros = _get_mask(column, 0)
-                column = column[~mask_zeros]
-                n_explicit_zeros = mask_zeros.sum()
-                n_zeros = n_implicit_zeros[i] + n_explicit_zeros
-
-                if strategy == "mean":
-                    s = column.size + n_zeros
-                    statistics[i] = np.nan if s == 0 else column.sum() / s
-
-                elif strategy == "median":
-                    statistics[i] = _get_median(column, n_zeros)
-
-                elif strategy == "most_frequent":
-                    statistics[i] = _most_frequent(column, 0, n_zeros)
-        super()._fit_indicator(missing_mask)
-
-        return statistics
-
-    def _dense_fit(self, X, strategy, missing_values, fill_value):
-        """Fit the transformer on dense data."""
-        missing_mask = _get_mask(X, missing_values)
-        masked_X = ma.masked_array(X, mask=missing_mask)
-
-        super()._fit_indicator(missing_mask)
-
-        # Mean
-        if strategy == "mean":
-            mean_masked = np.ma.mean(masked_X, axis=0)
-            # Avoid the warning "Warning: converting a masked element to nan."
-            mean = np.ma.getdata(mean_masked)
-            mean[np.ma.getmask(mean_masked)] = np.nan
-
-            return mean
-
-        # Median
-        elif strategy == "median":
-            median_masked = np.ma.median(masked_X, axis=0)
-            # Avoid the warning "Warning: converting a masked element to nan."
-            median = np.ma.getdata(median_masked)
-            median[np.ma.getmaskarray(median_masked)] = np.nan
-
-            return median
-
-        # Most frequent
-        elif strategy == "most_frequent":
-            # Avoid use of scipy.stats.mstats.mode due to the required
-            # additional overhead and slow benchmarking performance.
-            # See Issue 14325 and PR 14399 for full discussion.
-
-            # To be able access the elements by columns
-            X = X.transpose()
-            mask = missing_mask.transpose()
-
-            if X.dtype.kind == "O":
-                most_frequent = np.empty(X.shape[0], dtype=object)
-            else:
-                most_frequent = np.empty(X.shape[0])
-
-            for i, (row, row_mask) in enumerate(zip(X[:], mask[:])):
-                row_mask = np.logical_not(row_mask).astype(bool)
-                row = row[row_mask]
-                most_frequent[i] = _most_frequent(row, np.nan, 0)
-
-            return most_frequent
-
-        # Constant
-        elif strategy == "constant":
-            # for constant strategy, self.statistcs_ is used to store
-            # fill_value in each column
-            return np.full(X.shape[1], fill_value, dtype=X.dtype)
-
-    def transform(self, X):
-        """Impute all missing values in `X`.
-
-        Parameters
-        ----------
-        X : {array-like, sparse matrix}, shape (n_samples, n_features)
-            The input data to complete.
-
-        Returns
-        -------
-        X_imputed : {ndarray, sparse matrix} of shape \
-                (n_samples, n_features_out)
-            `X` with imputed values.
-        """
-        check_is_fitted(self)
-
-        X = self._validate_input(X, in_fit=False)
-        statistics = self.statistics_
-
-        if X.shape[1] != statistics.shape[0]:
-            raise ValueError(
-                "X has %d features per sample, expected %d"
-                % (X.shape[1], self.statistics_.shape[0])
-            )
-
-        # compute mask before eliminating invalid features
-        missing_mask = _get_mask(X, self.missing_values)
-
-        # Delete the invalid columns if strategy is not constant
-        if self.strategy == "constant":
-            valid_statistics = statistics
-            valid_statistics_indexes = None
-        else:
-            # same as np.isnan but also works for object dtypes
-            invalid_mask = _get_mask(statistics, np.nan)
-            valid_mask = np.logical_not(invalid_mask)
-            valid_statistics = statistics[valid_mask]
-            valid_statistics_indexes = np.flatnonzero(valid_mask)
-
-            if invalid_mask.any():
-                missing = np.arange(X.shape[1])[invalid_mask]
-                if self.verbose:
-                    warnings.warn(
-                        "Deleting features without observed values: %s" % missing
-                    )
-                X = X[:, valid_statistics_indexes]
-
-        # Do actual imputation
-        if sp.issparse(X):
-            if self.missing_values == 0:
-                raise ValueError(
-                    "Imputation not possible when missing_values "
-                    "== 0 and input is sparse. Provide a dense "
-                    "array instead."
-                )
-            else:
-                # if no invalid statistics are found, use the mask computed
-                # before, else recompute mask
-                if valid_statistics_indexes is None:
-                    mask = missing_mask.data
-                else:
-                    mask = _get_mask(X.data, self.missing_values)
-                indexes = np.repeat(
-                    np.arange(len(X.indptr) - 1, dtype=int), np.diff(X.indptr)
-                )[mask]
-
-                X.data[mask] = valid_statistics[indexes].astype(X.dtype, copy=False)
-        else:
-            # use mask computed before eliminating invalid mask
-            if valid_statistics_indexes is None:
-                mask_valid_features = missing_mask
-            else:
-                mask_valid_features = missing_mask[:, valid_statistics_indexes]
-            n_missing = np.sum(mask_valid_features, axis=0)
-            values = np.repeat(valid_statistics, n_missing)
-            coordinates = np.where(mask_valid_features.transpose())[::-1]
-
-            X[coordinates] = values
-
-        X_indicator = super()._transform_indicator(missing_mask)
-
-        return super()._concatenate_indicator(X, X_indicator)
-
-    def inverse_transform(self, X):
-        """Convert the data back to the original representation.
-
-        Inverts the `transform` operation performed on an array.
-        This operation can only be performed after :class:`SimpleImputer` is
-        instantiated with `add_indicator=True`.
-
-        Note that `inverse_transform` can only invert the transform in
-        features that have binary indicators for missing values. If a feature
-        has no missing values at `fit` time, the feature won't have a binary
-        indicator, and the imputation done at `transform` time won't be
-        inverted.
-
-        .. versionadded:: 0.24
-
-        Parameters
-        ----------
-        X : array-like of shape \
-                (n_samples, n_features + n_features_missing_indicator)
-            The imputed data to be reverted to original data. It has to be
-            an augmented array of imputed data and the missing indicator mask.
-
-        Returns
-        -------
-        X_original : ndarray of shape (n_samples, n_features)
-            The original `X` with missing values as it was prior
-            to imputation.
-        """
-        check_is_fitted(self)
-
-        if not self.add_indicator:
-            raise ValueError(
-                "'inverse_transform' works only when "
-                "'SimpleImputer' is instantiated with "
-                "'add_indicator=True'. "
-                f"Got 'add_indicator={self.add_indicator}' "
-                "instead."
-            )
-
-        n_features_missing = len(self.indicator_.features_)
-        non_empty_feature_count = X.shape[1] - n_features_missing
-        array_imputed = X[:, :non_empty_feature_count].copy()
-        missing_mask = X[:, non_empty_feature_count:].astype(bool)
-
-        n_features_original = len(self.statistics_)
-        shape_original = (X.shape[0], n_features_original)
-        X_original = np.zeros(shape_original)
-        X_original[:, self.indicator_.features_] = missing_mask
-        full_mask = X_original.astype(bool)
-
-        imputed_idx, original_idx = 0, 0
-        while imputed_idx < len(array_imputed.T):
-            if not np.all(X_original[:, original_idx]):
-                X_original[:, original_idx] = array_imputed.T[imputed_idx]
-                imputed_idx += 1
-                original_idx += 1
-            else:
-                original_idx += 1
-
-        X_original[full_mask] = self.missing_values
-        return X_original
-
-
-class MissingIndicator(TransformerMixin, BaseEstimator):
-    """Binary indicators for missing values.
-
-    Note that this component typically should not be used in a vanilla
-    :class:`Pipeline` consisting of transformers and a classifier, but rather
-    could be added using a :class:`FeatureUnion` or :class:`ColumnTransformer`.
-
-    Read more in the :ref:`User Guide <impute>`.
-
-    .. versionadded:: 0.20
+    data_file_name = "iris.csv"
+    data, target, target_names, fdescr = load_csv_data(
+        data_file_name=data_file_name, descr_file_name="iris.rst"
+    )
+
+    feature_names = [
+        "sepal length (cm)",
+        "sepal width (cm)",
+        "petal length (cm)",
+        "petal width (cm)",
+    ]
+
+    frame = None
+    target_columns = [
+        "target",
+    ]
+    if as_frame:
+        frame, data, target = _convert_data_dataframe(
+            "load_iris", data, target, feature_names, target_columns
+        )
+
+    if return_X_y:
+        return data, target
+
+    return Bunch(
+        data=data,
+        target=target,
+        frame=frame,
+        target_names=target_names,
+        DESCR=fdescr,
+        feature_names=feature_names,
+        filename=data_file_name,
+        data_module=DATA_MODULE,
+    )
+
+
+def load_breast_cancer(*, return_X_y=False, as_frame=False):
+    """Load and return the breast cancer wisconsin dataset (classification).
+
+    The breast cancer dataset is a classic and very easy binary classification
+    dataset.
+
+    =================   ==============
+    Classes                          2
+    Samples per class    212(M),357(B)
+    Samples total                  569
+    Dimensionality                  30
+    Features            real, positive
+    =================   ==============
+
+    Read more in the :ref:`User Guide <breast_cancer_dataset>`.
 
     Parameters
     ----------
-    missing_values : int, float, str, np.nan or None, default=np.nan
-        The placeholder for the missing values. All occurrences of
-        `missing_values` will be imputed. For pandas' dataframes with
-        nullable integer dtypes with missing values, `missing_values`
-        should be set to `np.nan`, since `pd.NA` will be converted to `np.nan`.
+    return_X_y : bool, default=False
+        If True, returns ``(data, target)`` instead of a Bunch object.
+        See below for more information about the `data` and `target` object.
 
-    features : {'missing-only', 'all'}, default='missing-only'
-        Whether the imputer mask should represent all or a subset of
-        features.
+        .. versionadded:: 0.18
 
-        - If `'missing-only'` (default), the imputer mask will only represent
-          features containing missing values during fit time.
-        - If `'all'`, the imputer mask will represent all features.
+    as_frame : bool, default=False
+        If True, the data is a pandas DataFrame including columns with
+        appropriate dtypes (numeric). The target is
+        a pandas DataFrame or Series depending on the number of target columns.
+        If `return_X_y` is True, then (`data`, `target`) will be pandas
+        DataFrames or Series as described below.
 
-    sparse : bool or 'auto', default='auto'
-        Whether the imputer mask format should be sparse or dense.
+        .. versionadded:: 0.23
 
-        - If `'auto'` (default), the imputer mask will be of same type as
-          input.
-        - If `True`, the imputer mask will be a sparse matrix.
-        - If `False`, the imputer mask will be a numpy array.
+    Returns
+    -------
+    data : :class:`~sklearn.utils.Bunch`
+        Dictionary-like object, with the following attributes.
 
-    error_on_new : bool, default=True
-        If `True`, :meth:`transform` will raise an error when there are
-        features with missing values that have no missing values in
-        :meth:`fit`. This is applicable only when `features='missing-only'`.
+        data : {ndarray, dataframe} of shape (569, 30)
+            The data matrix. If `as_frame=True`, `data` will be a pandas
+            DataFrame.
+        target: {ndarray, Series} of shape (569,)
+            The classification target. If `as_frame=True`, `target` will be
+            a pandas Series.
+        feature_names: list
+            The names of the dataset columns.
+        target_names: list
+            The names of target classes.
+        frame: DataFrame of shape (569, 31)
+            Only present when `as_frame=True`. DataFrame with `data` and
+            `target`.
 
-    Attributes
-    ----------
-    features_ : ndarray of shape (n_missing_features,) or (n_features,)
-        The features indices which will be returned when calling
-        :meth:`transform`. They are computed during :meth:`fit`. If
-        `features='all'`, `features_` is equal to `range(n_features)`.
+            .. versionadded:: 0.23
+        DESCR: str
+            The full description of the dataset.
+        filename: str
+            The path to the location of the data.
 
-    n_features_in_ : int
-        Number of features seen during :term:`fit`.
+            .. versionadded:: 0.20
 
-        .. versionadded:: 0.24
+    (data, target) : tuple if ``return_X_y`` is True
 
-    feature_names_in_ : ndarray of shape (`n_features_in_`,)
-        Names of features seen during :term:`fit`. Defined only when `X`
-        has feature names that are all strings.
+        .. versionadded:: 0.18
 
-        .. versionadded:: 1.0
-
-    See Also
-    --------
-    SimpleImputer : Univariate imputation of missing values.
-    IterativeImputer : Multivariate imputation of missing values.
+    The copy of UCI ML Breast Cancer Wisconsin (Diagnostic) dataset is
+    downloaded from:
+    https://goo.gl/U2Uwz2
 
     Examples
     --------
-    >>> import numpy as np
-    >>> from sklearn.impute import MissingIndicator
-    >>> X1 = np.array([[np.nan, 1, 3],
-    ...                [4, 0, np.nan],
-    ...                [8, 1, 0]])
-    >>> X2 = np.array([[5, 1, np.nan],
-    ...                [np.nan, 2, 3],
-    ...                [2, 4, 0]])
-    >>> indicator = MissingIndicator()
-    >>> indicator.fit(X1)
-    MissingIndicator()
-    >>> X2_tr = indicator.transform(X2)
-    >>> X2_tr
-    array([[False,  True],
-           [ True, False],
-           [False, False]])
+    Let's say you are interested in the samples 10, 50, and 85, and want to
+    know their class name.
+
+    >>> from sklearn.datasets import load_breast_cancer
+    >>> data = load_breast_cancer()
+    >>> data.target[[10, 50, 85]]
+    array([0, 1, 0])
+    >>> list(data.target_names)
+    ['malignant', 'benign']
+    """
+    data_file_name = "breast_cancer.csv"
+    data, target, target_names, fdescr = load_csv_data(
+        data_file_name=data_file_name, descr_file_name="breast_cancer.rst"
+    )
+
+    feature_names = np.array(
+        [
+            "mean radius",
+            "mean texture",
+            "mean perimeter",
+            "mean area",
+            "mean smoothness",
+            "mean compactness",
+            "mean concavity",
+            "mean concave points",
+            "mean symmetry",
+            "mean fractal dimension",
+            "radius error",
+            "texture error",
+            "perimeter error",
+            "area error",
+            "smoothness error",
+            "compactness error",
+            "concavity error",
+            "concave points error",
+            "symmetry error",
+            "fractal dimension error",
+            "worst radius",
+            "worst texture",
+            "worst perimeter",
+            "worst area",
+            "worst smoothness",
+            "worst compactness",
+            "worst concavity",
+            "worst concave points",
+            "worst symmetry",
+            "worst fractal dimension",
+        ]
+    )
+
+    frame = None
+    target_columns = [
+        "target",
+    ]
+    if as_frame:
+        frame, data, target = _convert_data_dataframe(
+            "load_breast_cancer", data, target, feature_names, target_columns
+        )
+
+    if return_X_y:
+        return data, target
+
+    return Bunch(
+        data=data,
+        target=target,
+        frame=frame,
+        target_names=target_names,
+        DESCR=fdescr,
+        feature_names=feature_names,
+        filename=data_file_name,
+        data_module=DATA_MODULE,
+    )
+
+
+def load_digits(*, n_class=10, return_X_y=False, as_frame=False):
+    """Load and return the digits dataset (classification).
+
+    Each datapoint is a 8x8 image of a digit.
+
+    =================   ==============
+    Classes                         10
+    Samples per class             ~180
+    Samples total                 1797
+    Dimensionality                  64
+    Features             integers 0-16
+    =================   ==============
+
+    Read more in the :ref:`User Guide <digits_dataset>`.
+
+    Parameters
+    ----------
+    n_class : int, default=10
+        The number of classes to return. Between 0 and 10.
+
+    return_X_y : bool, default=False
+        If True, returns ``(data, target)`` instead of a Bunch object.
+        See below for more information about the `data` and `target` object.
+
+        .. versionadded:: 0.18
+
+    as_frame : bool, default=False
+        If True, the data is a pandas DataFrame including columns with
+        appropriate dtypes (numeric). The target is
+        a pandas DataFrame or Series depending on the number of target columns.
+        If `return_X_y` is True, then (`data`, `target`) will be pandas
+        DataFrames or Series as described below.
+
+        .. versionadded:: 0.23
+
+    Returns
+    -------
+    data : :class:`~sklearn.utils.Bunch`
+        Dictionary-like object, with the following attributes.
+
+        data : {ndarray, dataframe} of shape (1797, 64)
+            The flattened data matrix. If `as_frame=True`, `data` will be
+            a pandas DataFrame.
+        target: {ndarray, Series} of shape (1797,)
+            The classification target. If `as_frame=True`, `target` will be
+            a pandas Series.
+        feature_names: list
+            The names of the dataset columns.
+        target_names: list
+            The names of target classes.
+
+            .. versionadded:: 0.20
+
+        frame: DataFrame of shape (1797, 65)
+            Only present when `as_frame=True`. DataFrame with `data` and
+            `target`.
+
+            .. versionadded:: 0.23
+        images: {ndarray} of shape (1797, 8, 8)
+            The raw image data.
+        DESCR: str
+            The full description of the dataset.
+
+    (data, target) : tuple if ``return_X_y`` is True
+
+        .. versionadded:: 0.18
+
+    This is a copy of the test set of the UCI ML hand-written digits datasets
+    https://archive.ics.uci.edu/ml/datasets/Optical+Recognition+of+Handwritten+Digits
+
+    Examples
+    --------
+    To load the data and visualize the images::
+
+        >>> from sklearn.datasets import load_digits
+        >>> digits = load_digits()
+        >>> print(digits.data.shape)
+        (1797, 64)
+        >>> import matplotlib.pyplot as plt
+        >>> plt.gray()
+        >>> plt.matshow(digits.images[0])
+        <...>
+        >>> plt.show()
     """
 
-    def __init__(
-        self,
-        *,
-        missing_values=np.nan,
-        features="missing-only",
-        sparse="auto",
-        error_on_new=True,
-    ):
-        self.missing_values = missing_values
-        self.features = features
-        self.sparse = sparse
-        self.error_on_new = error_on_new
+    data, fdescr = load_gzip_compressed_csv_data(
+        data_file_name="digits.csv.gz", descr_file_name="digits.rst", delimiter=","
+    )
 
-    def _get_missing_features_info(self, X):
-        """Compute the imputer mask and the indices of the features
-        containing missing values.
+    target = data[:, -1].astype(int, copy=False)
+    flat_data = data[:, :-1]
+    images = flat_data.view()
+    images.shape = (-1, 8, 8)
 
-        Parameters
-        ----------
-        X : {ndarray, sparse matrix} of shape (n_samples, n_features)
-            The input data with missing values. Note that `X` has been
-            checked in :meth:`fit` and :meth:`transform` before to call this
-            function.
+    if n_class < 10:
+        idx = target < n_class
+        flat_data, target = flat_data[idx], target[idx]
+        images = images[idx]
 
-        Returns
-        -------
-        imputer_mask : {ndarray, sparse matrix} of shape \
-        (n_samples, n_features)
-            The imputer mask of the original data.
+    feature_names = [
+        "pixel_{}_{}".format(row_idx, col_idx)
+        for row_idx in range(8)
+        for col_idx in range(8)
+    ]
 
-        features_with_missing : ndarray of shape (n_features_with_missing)
-            The features containing missing values.
-        """
-        if not self._precomputed:
-            imputer_mask = _get_mask(X, self.missing_values)
-        else:
-            imputer_mask = X
-
-        if sp.issparse(X):
-            imputer_mask.eliminate_zeros()
-
-            if self.features == "missing-only":
-                n_missing = imputer_mask.getnnz(axis=0)
-
-            if self.sparse is False:
-                imputer_mask = imputer_mask.toarray()
-            elif imputer_mask.format == "csr":
-                imputer_mask = imputer_mask.tocsc()
-        else:
-            if not self._precomputed:
-                imputer_mask = _get_mask(X, self.missing_values)
-            else:
-                imputer_mask = X
-
-            if self.features == "missing-only":
-                n_missing = imputer_mask.sum(axis=0)
-
-            if self.sparse is True:
-                imputer_mask = sp.csc_matrix(imputer_mask)
-
-        if self.features == "all":
-            features_indices = np.arange(X.shape[1])
-        else:
-            features_indices = np.flatnonzero(n_missing)
-
-        return imputer_mask, features_indices
-
-    def _validate_input(self, X, in_fit):
-        if not is_scalar_nan(self.missing_values):
-            force_all_finite = True
-        else:
-            force_all_finite = "allow-nan"
-        X = self._validate_data(
-            X,
-            reset=in_fit,
-            accept_sparse=("csc", "csr"),
-            dtype=None,
-            force_all_finite=force_all_finite,
+    frame = None
+    target_columns = [
+        "target",
+    ]
+    if as_frame:
+        frame, flat_data, target = _convert_data_dataframe(
+            "load_digits", flat_data, target, feature_names, target_columns
         )
-        _check_inputs_dtype(X, self.missing_values)
-        if X.dtype.kind not in ("i", "u", "f", "O"):
-            raise ValueError(
-                "MissingIndicator does not support data with "
-                "dtype {0}. Please provide either a numeric array"
-                " (with a floating point or integer dtype) or "
-                "categorical data represented either as an array "
-                "with integer dtype or an array of string values "
-                "with an object dtype.".format(X.dtype)
-            )
 
-        if sp.issparse(X) and self.missing_values == 0:
-            # missing_values = 0 not allowed with sparse data as it would
-            # force densification
-            raise ValueError(
-                "Sparse input with missing_values=0 is "
-                "not supported. Provide a dense "
-                "array instead."
-            )
+    if return_X_y:
+        return flat_data, target
 
-        return X
+    return Bunch(
+        data=flat_data,
+        target=target,
+        frame=frame,
+        feature_names=feature_names,
+        target_names=np.arange(10),
+        images=images,
+        DESCR=fdescr,
+    )
 
-    def _fit(self, X, y=None, precomputed=False):
-        """Fit the transformer on `X`.
 
-        Parameters
-        ----------
-        X : {array-like, sparse matrix} of shape (n_samples, n_features)
-            Input data, where `n_samples` is the number of samples and
-            `n_features` is the number of features.
-            If `precomputed=True`, then `X` is a mask of the input data.
+def load_diabetes(*, return_X_y=False, as_frame=False):
+    """Load and return the diabetes dataset (regression).
 
-        precomputed : bool
-            Whether the input data is a mask.
+    ==============   ==================
+    Samples total    442
+    Dimensionality   10
+    Features         real, -.2 < x < .2
+    Targets          integer 25 - 346
+    ==============   ==================
 
-        Returns
-        -------
-        imputer_mask : {ndarray, sparse matrix} of shape (n_samples, \
-        n_features)
-            The imputer mask of the original data.
-        """
-        if precomputed:
-            if not (hasattr(X, "dtype") and X.dtype.kind == "b"):
-                raise ValueError("precomputed is True but the input data is not a mask")
-            self._precomputed = True
-        else:
-            self._precomputed = False
+    .. note::
+       The meaning of each feature (i.e. `feature_names`) might be unclear
+       (especially for `ltg`) as the documentation of the original dataset is
+       not explicit. We provide information that seems correct in regard with
+       the scientific literature in this field of research.
 
-        # Need not validate X again as it would have already been validated
-        # in the Imputer calling MissingIndicator
-        if not self._precomputed:
-            X = self._validate_input(X, in_fit=True)
+    Read more in the :ref:`User Guide <diabetes_dataset>`.
 
-        self._n_features = X.shape[1]
+    Parameters
+    ----------
+    return_X_y : bool, default=False
+        If True, returns ``(data, target)`` instead of a Bunch object.
+        See below for more information about the `data` and `target` object.
 
-        if self.features not in ("missing-only", "all"):
-            raise ValueError(
-                "'features' has to be either 'missing-only' or "
-                "'all'. Got {} instead.".format(self.features)
-            )
+        .. versionadded:: 0.18
 
-        if not (
-            (isinstance(self.sparse, str) and self.sparse == "auto")
-            or isinstance(self.sparse, bool)
-        ):
-            raise ValueError(
-                "'sparse' has to be a boolean or 'auto'. Got {!r} instead.".format(
-                    self.sparse
-                )
-            )
+    as_frame : bool, default=False
+        If True, the data is a pandas DataFrame including columns with
+        appropriate dtypes (numeric). The target is
+        a pandas DataFrame or Series depending on the number of target columns.
+        If `return_X_y` is True, then (`data`, `target`) will be pandas
+        DataFrames or Series as described below.
 
-        missing_features_info = self._get_missing_features_info(X)
-        self.features_ = missing_features_info[1]
+        .. versionadded:: 0.23
 
-        return missing_features_info[0]
+    Returns
+    -------
+    data : :class:`~sklearn.utils.Bunch`
+        Dictionary-like object, with the following attributes.
 
-    def fit(self, X, y=None):
-        """Fit the transformer on `X`.
+        data : {ndarray, dataframe} of shape (442, 10)
+            The data matrix. If `as_frame=True`, `data` will be a pandas
+            DataFrame.
+        target: {ndarray, Series} of shape (442,)
+            The regression target. If `as_frame=True`, `target` will be
+            a pandas Series.
+        feature_names: list
+            The names of the dataset columns.
+        frame: DataFrame of shape (442, 11)
+            Only present when `as_frame=True`. DataFrame with `data` and
+            `target`.
 
-        Parameters
-        ----------
-        X : {array-like, sparse matrix} of shape (n_samples, n_features)
-            Input data, where `n_samples` is the number of samples and
-            `n_features` is the number of features.
+            .. versionadded:: 0.23
+        DESCR: str
+            The full description of the dataset.
+        data_filename: str
+            The path to the location of the data.
+        target_filename: str
+            The path to the location of the target.
 
-        y : Ignored
-            Not used, present for API consistency by convention.
+    (data, target) : tuple if ``return_X_y`` is True
+        Returns a tuple of two ndarray of shape (n_samples, n_features)
+        A 2D array with each row representing one sample and each column
+        representing the features and/or target of a given sample.
+        .. versionadded:: 0.18
+    """
+    data_filename = "diabetes_data.csv.gz"
+    target_filename = "diabetes_target.csv.gz"
+    data = load_gzip_compressed_csv_data(data_filename)
+    target = load_gzip_compressed_csv_data(target_filename)
 
-        Returns
-        -------
-        self : object
-            Fitted estimator.
-        """
-        self._fit(X, y)
+    fdescr = load_descr("diabetes.rst")
 
-        return self
+    feature_names = ["age", "sex", "bmi", "bp", "s1", "s2", "s3", "s4", "s5", "s6"]
 
-    def transform(self, X):
-        """Generate missing values indicator for `X`.
+    frame = None
+    target_columns = [
+        "target",
+    ]
+    if as_frame:
+        frame, data, target = _convert_data_dataframe(
+            "load_diabetes", data, target, feature_names, target_columns
+        )
 
-        Parameters
-        ----------
-        X : {array-like, sparse matrix} of shape (n_samples, n_features)
-            The input data to complete.
+    if return_X_y:
+        return data, target
 
-        Returns
-        -------
-        Xt : {ndarray, sparse matrix} of shape (n_samples, n_features) \
-        or (n_samples, n_features_with_missing)
-            The missing indicator for input data. The data type of `Xt`
-            will be boolean.
-        """
-        check_is_fitted(self)
+    return Bunch(
+        data=data,
+        target=target,
+        frame=frame,
+        DESCR=fdescr,
+        feature_names=feature_names,
+        data_filename=data_filename,
+        target_filename=target_filename,
+        data_module=DATA_MODULE,
+    )
 
-        # Need not validate X again as it would have already been validated
-        # in the Imputer calling MissingIndicator
-        if not self._precomputed:
-            X = self._validate_input(X, in_fit=False)
-        else:
-            if not (hasattr(X, "dtype") and X.dtype.kind == "b"):
-                raise ValueError("precomputed is True but the input data is not a mask")
 
-        imputer_mask, features = self._get_missing_features_info(X)
+def load_linnerud(*, return_X_y=False, as_frame=False):
+    """Load and return the physical exercise Linnerud dataset.
 
-        if self.features == "missing-only":
-            features_diff_fit_trans = np.setdiff1d(features, self.features_)
-            if self.error_on_new and features_diff_fit_trans.size > 0:
-                raise ValueError(
-                    "The features {} have missing values "
-                    "in transform but have no missing values "
-                    "in fit.".format(features_diff_fit_trans)
-                )
+    This dataset is suitable for multi-ouput regression tasks.
 
-            if self.features_.size < self._n_features:
-                imputer_mask = imputer_mask[:, self.features_]
+    ==============   ============================
+    Samples total    20
+    Dimensionality   3 (for both data and target)
+    Features         integer
+    Targets          integer
+    ==============   ============================
 
-        return imputer_mask
+    Read more in the :ref:`User Guide <linnerrud_dataset>`.
 
-    def fit_transform(self, X, y=None):
-        """Generate missing values indicator for `X`.
+    Parameters
+    ----------
+    return_X_y : bool, default=False
+        If True, returns ``(data, target)`` instead of a Bunch object.
+        See below for more information about the `data` and `target` object.
 
-        Parameters
-        ----------
-        X : {array-like, sparse matrix} of shape (n_samples, n_features)
-            The input data to complete.
+        .. versionadded:: 0.18
 
-        y : Ignored
-            Not used, present for API consistency by convention.
+    as_frame : bool, default=False
+        If True, the data is a pandas DataFrame including columns with
+        appropriate dtypes (numeric, string or categorical). The target is
+        a pandas DataFrame or Series depending on the number of target columns.
+        If `return_X_y` is True, then (`data`, `target`) will be pandas
+        DataFrames or Series as described below.
 
-        Returns
-        -------
-        Xt : {ndarray, sparse matrix} of shape (n_samples, n_features) \
-        or (n_samples, n_features_with_missing)
-            The missing indicator for input data. The data type of `Xt`
-            will be boolean.
-        """
-        imputer_mask = self._fit(X, y)
+        .. versionadded:: 0.23
 
-        if self.features_.size < self._n_features:
-            imputer_mask = imputer_mask[:, self.features_]
+    Returns
+    -------
+    data : :class:`~sklearn.utils.Bunch`
+        Dictionary-like object, with the following attributes.
 
-        return imputer_mask
+        data : {ndarray, dataframe} of shape (20, 3)
+            The data matrix. If `as_frame=True`, `data` will be a pandas
+            DataFrame.
+        target: {ndarray, dataframe} of shape (20, 3)
+            The regression targets. If `as_frame=True`, `target` will be
+            a pandas DataFrame.
+        feature_names: list
+            The names of the dataset columns.
+        target_names: list
+            The names of the target columns.
+        frame: DataFrame of shape (20, 6)
+            Only present when `as_frame=True`. DataFrame with `data` and
+            `target`.
 
-    def _more_tags(self):
-        return {
-            "allow_nan": True,
-            "X_types": ["2darray", "string"],
-            "preserves_dtype": [],
-        }
+            .. versionadded:: 0.23
+        DESCR: str
+            The full description of the dataset.
+        data_filename: str
+            The path to the location of the data.
+        target_filename: str
+            The path to the location of the target.
+
+            .. versionadded:: 0.20
+
+    (data, target) : tuple if ``return_X_y`` is True
+
+        .. versionadded:: 0.18
+    """
+    data_filename = "linnerud_exercise.csv"
+    target_filename = "linnerud_physiological.csv"
+
+    # Read header and data
+    with resources.open_text(DATA_MODULE, data_filename) as f:
+        header_exercise = f.readline().split()
+        f.seek(0)  # reset file obj
+        data_exercise = np.loadtxt(f, skiprows=1)
+
+    with resources.open_text(DATA_MODULE, target_filename) as f:
+        header_physiological = f.readline().split()
+        f.seek(0)  # reset file obj
+        data_physiological = np.loadtxt(f, skiprows=1)
+
+    fdescr = load_descr("linnerud.rst")
+
+    frame = None
+    if as_frame:
+        (frame, data_exercise, data_physiological) = _convert_data_dataframe(
+            "load_linnerud",
+            data_exercise,
+            data_physiological,
+            header_exercise,
+            header_physiological,
+        )
+    if return_X_y:
+        return data_exercise, data_physiological
+
+    return Bunch(
+        data=data_exercise,
+        feature_names=header_exercise,
+        target=data_physiological,
+        target_names=header_physiological,
+        frame=frame,
+        DESCR=fdescr,
+        data_filename=data_filename,
+        target_filename=target_filename,
+        data_module=DATA_MODULE,
+    )
+
+
+@deprecated(
+    r"""`load_boston` is deprecated in 1.0 and will be removed in 1.2.
+
+    The Boston housing prices dataset has an ethical problem. You can refer to
+    the documentation of this function for further details.
+
+    The scikit-learn maintainers therefore strongly discourage the use of this
+    dataset unless the purpose of the code is to study and educate about
+    ethical issues in data science and machine learning.
+
+    In this special case, you can fetch the dataset from the original
+    source::
+
+        import pandas as pd
+        import numpy as np
+
+
+        data_url = "http://lib.stat.cmu.edu/datasets/boston"
+        raw_df = pd.read_csv(data_url, sep="\s+", skiprows=22, header=None)
+        data = np.hstack([raw_df.values[::2, :], raw_df.values[1::2, :2]])
+        target = raw_df.values[1::2, 2]
+
+    Alternative datasets include the California housing dataset (i.e.
+    :func:`~sklearn.datasets.fetch_california_housing`) and the Ames housing
+    dataset. You can load the datasets as follows::
+
+        from sklearn.datasets import fetch_california_housing
+        housing = fetch_california_housing()
+
+    for the California housing dataset and::
+
+        from sklearn.datasets import fetch_openml
+        housing = fetch_openml(name="house_prices", as_frame=True)
+
+    for the Ames housing dataset.
+    """
+)
+def load_boston(*, return_X_y=False):
+    r"""Load and return the boston house-prices dataset (regression).
+
+    ==============   ==============
+    Samples total               506
+    Dimensionality               13
+    Features         real, positive
+    Targets           real 5. - 50.
+    ==============   ==============
+
+    Read more in the :ref:`User Guide <boston_dataset>`.
+
+    .. deprecated:: 1.0
+       This function is deprecated in 1.0 and will be removed in 1.2. See the
+       warning message below for further details regarding the alternative
+       datasets.
+
+    .. warning::
+        The Boston housing prices dataset has an ethical problem: as
+        investigated in [1]_, the authors of this dataset engineered a
+        non-invertible variable "B" assuming that racial self-segregation had a
+        positive impact on house prices [2]_. Furthermore the goal of the
+        research that led to the creation of this dataset was to study the
+        impact of air quality but it did not give adequate demonstration of the
+        validity of this assumption.
+
+        The scikit-learn maintainers therefore strongly discourage the use of
+        this dataset unless the purpose of the code is to study and educate
+        about ethical issues in data science and machine learning.
+
+        In this special case, you can fetch the dataset from the original
+        source::
+
+            import pandas as pd  # doctest: +SKIP
+            import numpy as np
+
+
+            data_url = "http://lib.stat.cmu.edu/datasets/boston"
+            raw_df = pd.read_csv(data_url, sep="s+", skiprows=22, header=None)
+            data = np.hstack([raw_df.values[::2, :], raw_df.values[1::2, :2]])
+            target = raw_df.values[1::2, 2]
+
+        Alternative datasets include the California housing dataset [3]_
+        (i.e. :func:`~sklearn.datasets.fetch_california_housing`) and Ames
+        housing dataset [4]_. You can load the datasets as follows::
+
+            from sklearn.datasets import fetch_california_housing
+            housing = fetch_california_housing()
+
+        for the California housing dataset and::
+
+            from sklearn.datasets import fetch_openml
+            housing = fetch_openml(name="house_prices", as_frame=True)  # noqa
+
+        for the Ames housing dataset.
+
+    Parameters
+    ----------
+    return_X_y : bool, default=False
+        If True, returns ``(data, target)`` instead of a Bunch object.
+        See below for more information about the `data` and `target` object.
+
+        .. versionadded:: 0.18
+
+    Returns
+    -------
+    data : :class:`~sklearn.utils.Bunch`
+        Dictionary-like object, with the following attributes.
+
+        data : ndarray of shape (506, 13)
+            The data matrix.
+        target : ndarray of shape (506,)
+            The regression target.
+        filename : str
+            The physical location of boston csv dataset.
+
+            .. versionadded:: 0.20
+
+        DESCR : str
+            The full description of the dataset.
+        feature_names : ndarray
+            The names of features
+
+    (data, target) : tuple if ``return_X_y`` is True
+
+        .. versionadded:: 0.18
+
+    Notes
+    -----
+        .. versionchanged:: 0.20
+            Fixed a wrong data point at [445, 0].
+
+    References
+    ----------
+    .. [1] `Racist data destruction? M Carlisle,
+            <https://medium.com/@docintangible/racist-data-destruction-113e3eff54a8>`_
+    .. [2] `Harrison Jr, David, and Daniel L. Rubinfeld.
+           "Hedonic housing prices and the demand for clean air."
+           Journal of environmental economics and management 5.1 (1978): 81-102.
+           <https://www.researchgate.net/publication/4974606_Hedonic_housing_prices_and_the_demand_for_clean_air>`_
+    .. [3] `California housing dataset
+            <https://scikit-learn.org/stable/datasets/real_world.html#california-housing-dataset>`_
+    .. [4] `Ames housing dataset
+            <https://www.openml.org/d/42165>`_
+
+    Examples
+    --------
+    >>> import warnings
+    >>> from sklearn.datasets import load_boston
+    >>> with warnings.catch_warnings():
+    ...     # You should probably not use this dataset.
+    ...     warnings.filterwarnings("ignore")
+    ...     X, y = load_boston(return_X_y=True)
+    >>> print(X.shape)
+    (506, 13)
+    """
+    # TODO: once the deprecation period is over, implement a module level
+    # `__getattr__` function in`sklearn.datasets` to raise an exception with
+    # an informative error message at import time instead of just removing
+    # load_boston. The goal is to avoid having beginners that copy-paste code
+    # from numerous books and tutorials that use this dataset loader get
+    # a confusing ImportError when trying to learn scikit-learn.
+    # See: https://www.python.org/dev/peps/pep-0562/
+
+    descr_text = load_descr("boston_house_prices.rst")
+
+    data_file_name = "boston_house_prices.csv"
+    with resources.open_text(DATA_MODULE, data_file_name) as f:
+        data_file = csv.reader(f)
+        temp = next(data_file)
+        n_samples = int(temp[0])
+        n_features = int(temp[1])
+        data = np.empty((n_samples, n_features))
+        target = np.empty((n_samples,))
+        temp = next(data_file)  # names of features
+        feature_names = np.array(temp)
+
+        for i, d in enumerate(data_file):
+            data[i] = np.asarray(d[:-1], dtype=np.float64)
+            target[i] = np.asarray(d[-1], dtype=np.float64)
+
+    if return_X_y:
+        return data, target
+
+    return Bunch(
+        data=data,
+        target=target,
+        # last column is target value
+        feature_names=feature_names[:-1],
+        DESCR=descr_text,
+        filename=data_file_name,
+        data_module=DATA_MODULE,
+    )
+
+
+def load_sample_images():
+    """Load sample images for image manipulation.
+
+    Loads both, ``china`` and ``flower``.
+
+    Read more in the :ref:`User Guide <sample_images>`.
+
+    Returns
+    -------
+    data : :class:`~sklearn.utils.Bunch`
+        Dictionary-like object, with the following attributes.
+
+        images : list of ndarray of shape (427, 640, 3)
+            The two sample image.
+        filenames : list
+            The filenames for the images.
+        DESCR : str
+            The full description of the dataset.
+
+    Examples
+    --------
+    To load the data and visualize the images:
+
+    >>> from sklearn.datasets import load_sample_images
+    >>> dataset = load_sample_images()     #doctest: +SKIP
+    >>> len(dataset.images)                #doctest: +SKIP
+    2
+    >>> first_img_data = dataset.images[0] #doctest: +SKIP
+    >>> first_img_data.shape               #doctest: +SKIP
+    (427, 640, 3)
+    >>> first_img_data.dtype               #doctest: +SKIP
+    dtype('uint8')
+    """
+    # import PIL only when needed
+    from ..externals._pilutil import imread
+
+    descr = load_descr("README.txt", descr_module=IMAGES_MODULE)
+
+    filenames, images = [], []
+    for filename in sorted(resources.contents(IMAGES_MODULE)):
+        if filename.endswith(".jpg"):
+            filenames.append(filename)
+            with resources.open_binary(IMAGES_MODULE, filename) as image_file:
+                image = imread(image_file)
+            images.append(image)
+
+    return Bunch(images=images, filenames=filenames, DESCR=descr)
+
+
+def load_sample_image(image_name):
+    """Load the numpy array of a single sample image
+
+    Read more in the :ref:`User Guide <sample_images>`.
+
+    Parameters
+    ----------
+    image_name : {`china.jpg`, `flower.jpg`}
+        The name of the sample image loaded
+
+    Returns
+    -------
+    img : 3D array
+        The image as a numpy array: height x width x color
+
+    Examples
+    --------
+
+    >>> from sklearn.datasets import load_sample_image
+    >>> china = load_sample_image('china.jpg')   # doctest: +SKIP
+    >>> china.dtype                              # doctest: +SKIP
+    dtype('uint8')
+    >>> china.shape                              # doctest: +SKIP
+    (427, 640, 3)
+    >>> flower = load_sample_image('flower.jpg') # doctest: +SKIP
+    >>> flower.dtype                             # doctest: +SKIP
+    dtype('uint8')
+    >>> flower.shape                             # doctest: +SKIP
+    (427, 640, 3)
+    """
+    images = load_sample_images()
+    index = None
+    for i, filename in enumerate(images.filenames):
+        if filename.endswith(image_name):
+            index = i
+            break
+    if index is None:
+        raise AttributeError("Cannot find sample image: %s" % image_name)
+    return images.images[index]
+
+
+def _pkl_filepath(*args, **kwargs):
+    """Return filename for Python 3 pickles
+
+    args[-1] is expected to be the ".pkl" filename. For compatibility with
+    older scikit-learn versions, a suffix is inserted before the extension.
+
+    _pkl_filepath('/path/to/folder', 'filename.pkl') returns
+    '/path/to/folder/filename_py3.pkl'
+
+    """
+    py3_suffix = kwargs.get("py3_suffix", "_py3")
+    basename, ext = splitext(args[-1])
+    basename += py3_suffix
+    new_args = args[:-1] + (basename + ext,)
+    return join(*new_args)
+
+
+def _sha256(path):
+    """Calculate the sha256 hash of the file at path."""
+    sha256hash = hashlib.sha256()
+    chunk_size = 8192
+    with open(path, "rb") as f:
+        while True:
+            buffer = f.read(chunk_size)
+            if not buffer:
+                break
+            sha256hash.update(buffer)
+    return sha256hash.hexdigest()
+
+
+def _fetch_remote(remote, dirname=None):
+    """Helper function to download a remote dataset into path
+
+    Fetch a dataset pointed by remote's url, save into path using remote's
+    filename and ensure its integrity based on the SHA256 Checksum of the
+    downloaded file.
+
+    Parameters
+    ----------
+    remote : RemoteFileMetadata
+        Named tuple containing remote dataset meta information: url, filename
+        and checksum
+
+    dirname : str
+        Directory to save the file to.
+
+    Returns
+    -------
+    file_path: str
+        Full path of the created file.
+    """
+
+    file_path = remote.filename if dirname is None else join(dirname, remote.filename)
+    urlretrieve(remote.url, file_path)
+    checksum = _sha256(file_path)
+    if remote.checksum != checksum:
+        raise IOError(
+            "{} has an SHA256 checksum ({}) "
+            "differing from expected ({}), "
+            "file may be corrupted.".format(file_path, checksum, remote.checksum)
+        )
+    return file_path
