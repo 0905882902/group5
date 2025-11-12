@@ -1,79 +1,80 @@
+import pytest
 import numpy as np
+from scipy.sparse.csgraph import connected_components
 
-from sklearn.metrics import euclidean_distances
-from sklearn.neighbors import KNeighborsTransformer, RadiusNeighborsTransformer
-from sklearn.neighbors._base import _is_sorted_by_data
-
-
-def test_transformer_result():
-    # Test the number of neighbors returned
-    n_neighbors = 5
-    n_samples_fit = 20
-    n_queries = 18
-    n_features = 10
-
-    rng = np.random.RandomState(42)
-    X = rng.randn(n_samples_fit, n_features)
-    X2 = rng.randn(n_queries, n_features)
-    radius = np.percentile(euclidean_distances(X), 10)
-
-    # with n_neighbors
-    for mode in ["distance", "connectivity"]:
-        add_one = mode == "distance"
-        nnt = KNeighborsTransformer(n_neighbors=n_neighbors, mode=mode)
-        Xt = nnt.fit_transform(X)
-        assert Xt.shape == (n_samples_fit, n_samples_fit)
-        assert Xt.data.shape == (n_samples_fit * (n_neighbors + add_one),)
-        assert Xt.format == "csr"
-        assert _is_sorted_by_data(Xt)
-
-        X2t = nnt.transform(X2)
-        assert X2t.shape == (n_queries, n_samples_fit)
-        assert X2t.data.shape == (n_queries * (n_neighbors + add_one),)
-        assert X2t.format == "csr"
-        assert _is_sorted_by_data(X2t)
-
-    # with radius
-    for mode in ["distance", "connectivity"]:
-        add_one = mode == "distance"
-        nnt = RadiusNeighborsTransformer(radius=radius, mode=mode)
-        Xt = nnt.fit_transform(X)
-        assert Xt.shape == (n_samples_fit, n_samples_fit)
-        assert not Xt.data.shape == (n_samples_fit * (n_neighbors + add_one),)
-        assert Xt.format == "csr"
-        assert _is_sorted_by_data(Xt)
-
-        X2t = nnt.transform(X2)
-        assert X2t.shape == (n_queries, n_samples_fit)
-        assert not X2t.data.shape == (n_queries * (n_neighbors + add_one),)
-        assert X2t.format == "csr"
-        assert _is_sorted_by_data(X2t)
+from sklearn.neighbors import kneighbors_graph
+from sklearn.utils.graph import _fix_connected_components
+from sklearn.metrics.pairwise import pairwise_distances
 
 
-def _has_explicit_diagonal(X):
-    """Return True if the diagonal is explicitly stored"""
-    X = X.tocoo()
-    explicit = X.row[X.row == X.col]
-    return len(explicit) == X.shape[0]
+def test_fix_connected_components():
+    # Test that _fix_connected_components reduces the number of component to 1.
+    X = np.array([0, 1, 2, 5, 6, 7])[:, None]
+    graph = kneighbors_graph(X, n_neighbors=2, mode="distance")
+
+    n_connected_components, labels = connected_components(graph)
+    assert n_connected_components > 1
+
+    graph = _fix_connected_components(X, graph, n_connected_components, labels)
+
+    n_connected_components, labels = connected_components(graph)
+    assert n_connected_components == 1
 
 
-def test_explicit_diagonal():
-    # Test that the diagonal is explicitly stored in the sparse graph
-    n_neighbors = 5
-    n_samples_fit, n_samples_transform, n_features = 20, 18, 10
-    rng = np.random.RandomState(42)
-    X = rng.randn(n_samples_fit, n_features)
-    X2 = rng.randn(n_samples_transform, n_features)
+def test_fix_connected_components_precomputed():
+    # Test that _fix_connected_components accepts precomputed distance matrix.
+    X = np.array([0, 1, 2, 5, 6, 7])[:, None]
+    graph = kneighbors_graph(X, n_neighbors=2, mode="distance")
 
-    nnt = KNeighborsTransformer(n_neighbors=n_neighbors)
-    Xt = nnt.fit_transform(X)
-    assert _has_explicit_diagonal(Xt)
-    assert np.all(Xt.data.reshape(n_samples_fit, n_neighbors + 1)[:, 0] == 0)
+    n_connected_components, labels = connected_components(graph)
+    assert n_connected_components > 1
 
-    Xt = nnt.transform(X)
-    assert _has_explicit_diagonal(Xt)
-    assert np.all(Xt.data.reshape(n_samples_fit, n_neighbors + 1)[:, 0] == 0)
+    distances = pairwise_distances(X)
+    graph = _fix_connected_components(
+        distances, graph, n_connected_components, labels, metric="precomputed"
+    )
 
-    # Using transform on new data should not always have zero diagonal
-    X2t = nnt.transform(X2)
-    assert not _has_explicit_diagonal(X2t)
+    n_connected_components, labels = connected_components(graph)
+    assert n_connected_components == 1
+
+    # but it does not work with precomputed neighbors graph
+    with pytest.raises(RuntimeError, match="does not work with a sparse"):
+        _fix_connected_components(
+            graph, graph, n_connected_components, labels, metric="precomputed"
+        )
+
+
+def test_fix_connected_components_wrong_mode():
+    # Test that the an error is raised if the mode string is incorrect.
+    X = np.array([0, 1, 2, 5, 6, 7])[:, None]
+    graph = kneighbors_graph(X, n_neighbors=2, mode="distance")
+    n_connected_components, labels = connected_components(graph)
+
+    with pytest.raises(ValueError, match="Unknown mode"):
+        graph = _fix_connected_components(
+            X, graph, n_connected_components, labels, mode="foo"
+        )
+
+
+def test_fix_connected_components_connectivity_mode():
+    # Test that the connectivity mode fill new connections with ones.
+    X = np.array([0, 1, 6, 7])[:, None]
+    graph = kneighbors_graph(X, n_neighbors=1, mode="connectivity")
+    n_connected_components, labels = connected_components(graph)
+    graph = _fix_connected_components(
+        X, graph, n_connected_components, labels, mode="connectivity"
+    )
+    assert np.all(graph.data == 1)
+
+
+def test_fix_connected_components_distance_mode():
+    # Test that the distance mode does not fill new connections with ones.
+    X = np.array([0, 1, 6, 7])[:, None]
+    graph = kneighbors_graph(X, n_neighbors=1, mode="distance")
+    assert np.all(graph.data == 1)
+
+    n_connected_components, labels = connected_components(graph)
+    graph = _fix_connected_components(
+        X, graph, n_connected_components, labels, mode="distance"
+    )
+    assert not np.all(graph.data == 1)
