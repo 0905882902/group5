@@ -1,44 +1,32 @@
 import os
-import numpy
+import numpy as np
 
-from sklearn._build_utils import gen_from_templates
+from numpy.distutils.misc_util import Configuration
 
 
 def configuration(parent_package="", top_path=None):
-    from numpy.distutils.misc_util import Configuration
-
-    config = Configuration("linear_model", parent_package, top_path)
+    config = Configuration("metrics", parent_package, top_path)
 
     libraries = []
     if os.name == "posix":
         libraries.append("m")
 
+    config.add_subpackage("_plot")
+    config.add_subpackage("_plot.tests")
+    config.add_subpackage("cluster")
+
     config.add_extension(
-        "_cd_fast",
-        sources=["_cd_fast.pyx"],
-        include_dirs=numpy.get_include(),
+        "_pairwise_fast", sources=["_pairwise_fast.pyx"], libraries=libraries
+    )
+
+    config.add_extension(
+        "_dist_metrics",
+        sources=["_dist_metrics.pyx"],
+        include_dirs=[np.get_include(), os.path.join(np.get_include(), "numpy")],
         libraries=libraries,
     )
 
-    config.add_extension(
-        "_sgd_fast",
-        sources=["_sgd_fast.pyx"],
-        include_dirs=numpy.get_include(),
-        libraries=libraries,
-    )
-
-    # generate sag_fast from template
-    templates = ["sklearn/linear_model/_sag_fast.pyx.tp"]
-    gen_from_templates(templates)
-
-    config.add_extension(
-        "_sag_fast", sources=["_sag_fast.pyx"], include_dirs=numpy.get_include()
-    )
-
-    # add other directories
     config.add_subpackage("tests")
-    config.add_subpackage("_glm")
-    config.add_subpackage("_glm/tests")
 
     return config
 
@@ -46,4 +34,4 @@ def configuration(parent_package="", top_path=None):
 if __name__ == "__main__":
     from numpy.distutils.core import setup
 
-    setup(**configuration(top_path="").todict())
+    setup(**configuration().todict())
