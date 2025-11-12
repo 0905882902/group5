@@ -1,33 +1,22 @@
-import pytest
-
 from pandas import (
-    DatetimeIndex,
-    Series,
-    date_range,
+    TimedeltaIndex,
+    timedelta_range,
 )
 import pandas._testing as tm
 
 
-class TestDelete:
-    def test_delete(self, unit):
-        idx = date_range(
-            start="2000-01-01", periods=5, freq="ME", name="idx", unit=unit
-        )
+class TestTimedeltaIndexDelete:
+    def test_delete(self):
+        idx = timedelta_range(start="1 Days", periods=5, freq="D", name="idx")
 
         # preserve freq
-        expected_0 = date_range(
-            start="2000-02-01", periods=4, freq="ME", name="idx", unit=unit
-        )
-        expected_4 = date_range(
-            start="2000-01-01", periods=4, freq="ME", name="idx", unit=unit
-        )
+        expected_0 = timedelta_range(start="2 Days", periods=4, freq="D", name="idx")
+        expected_4 = timedelta_range(start="1 Days", periods=4, freq="D", name="idx")
 
         # reset freq to None
-        expected_1 = DatetimeIndex(
-            ["2000-01-31", "2000-03-31", "2000-04-30", "2000-05-31"],
-            freq=None,
-            name="idx",
-        ).as_unit(unit)
+        expected_1 = TimedeltaIndex(
+            ["1 day", "3 day", "4 day", "5 day"], freq=None, name="idx"
+        )
 
         cases = {
             0: expected_0,
@@ -42,61 +31,21 @@ class TestDelete:
             assert result.name == expected.name
             assert result.freq == expected.freq
 
-        with pytest.raises((IndexError, ValueError), match="out of bounds"):
+        with tm.external_error_raised((IndexError, ValueError)):
             # either depending on numpy version
             idx.delete(5)
 
-    @pytest.mark.parametrize("tz", [None, "Asia/Tokyo", "US/Pacific"])
-    def test_delete2(self, tz):
-        idx = date_range(
-            start="2000-01-01 09:00", periods=10, freq="h", name="idx", tz=tz
-        )
-
-        expected = date_range(
-            start="2000-01-01 10:00", periods=9, freq="h", name="idx", tz=tz
-        )
-        result = idx.delete(0)
-        tm.assert_index_equal(result, expected)
-        assert result.name == expected.name
-        assert result.freqstr == "h"
-        assert result.tz == expected.tz
-
-        expected = date_range(
-            start="2000-01-01 09:00", periods=9, freq="h", name="idx", tz=tz
-        )
-        result = idx.delete(-1)
-        tm.assert_index_equal(result, expected)
-        assert result.name == expected.name
-        assert result.freqstr == "h"
-        assert result.tz == expected.tz
-
-    def test_delete_slice(self, unit):
-        idx = date_range(
-            start="2000-01-01", periods=10, freq="D", name="idx", unit=unit
-        )
+    def test_delete_slice(self):
+        idx = timedelta_range(start="1 days", periods=10, freq="D", name="idx")
 
         # preserve freq
-        expected_0_2 = date_range(
-            start="2000-01-04", periods=7, freq="D", name="idx", unit=unit
-        )
-        expected_7_9 = date_range(
-            start="2000-01-01", periods=7, freq="D", name="idx", unit=unit
-        )
+        expected_0_2 = timedelta_range(start="4 days", periods=7, freq="D", name="idx")
+        expected_7_9 = timedelta_range(start="1 days", periods=7, freq="D", name="idx")
 
         # reset freq to None
-        expected_3_5 = DatetimeIndex(
-            [
-                "2000-01-01",
-                "2000-01-02",
-                "2000-01-03",
-                "2000-01-07",
-                "2000-01-08",
-                "2000-01-09",
-                "2000-01-10",
-            ],
-            freq=None,
-            name="idx",
-        ).as_unit(unit)
+        expected_3_5 = TimedeltaIndex(
+            ["1 d", "2 d", "3 d", "7 d", "8 d", "9 d", "10d"], freq=None, name="idx"
+        )
 
         cases = {
             (0, 1, 2): expected_0_2,
@@ -114,28 +63,9 @@ class TestDelete:
             assert result.name == expected.name
             assert result.freq == expected.freq
 
-    # TODO: belongs in Series.drop tests?
-    @pytest.mark.parametrize("tz", [None, "Asia/Tokyo", "US/Pacific"])
-    def test_delete_slice2(self, tz, unit):
-        dti = date_range(
-            "2000-01-01 09:00", periods=10, freq="h", name="idx", tz=tz, unit=unit
-        )
-        ts = Series(
-            1,
-            index=dti,
-        )
-        # preserve freq
-        result = ts.drop(ts.index[:5]).index
-        expected = dti[5:]
-        tm.assert_index_equal(result, expected)
-        assert result.name == expected.name
-        assert result.freq == expected.freq
-        assert result.tz == expected.tz
+    def test_delete_doesnt_infer_freq(self):
+        # GH#30655 behavior matches DatetimeIndex
 
-        # reset freq to None
-        result = ts.drop(ts.index[[1, 3, 5, 7, 9]]).index
-        expected = dti[::2]._with_freq(None)
-        tm.assert_index_equal(result, expected)
-        assert result.name == expected.name
-        assert result.freq == expected.freq
-        assert result.tz == expected.tz
+        tdi = TimedeltaIndex(["1 Day", "2 Days", None, "3 Days", "4 Days"])
+        result = tdi.delete(2)
+        assert result.freq is None

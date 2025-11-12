@@ -1,26 +1,34 @@
 import numpy as np
-import pytest
 
 from pandas import (
-    PeriodIndex,
-    period_range,
+    TimedeltaIndex,
+    timedelta_range,
 )
 import pandas._testing as tm
 
 
 class TestRepeat:
-    @pytest.mark.parametrize("use_numpy", [True, False])
-    @pytest.mark.parametrize(
-        "index",
-        [
-            period_range("2000-01-01", periods=3, freq="D"),
-            period_range("2001-01-01", periods=3, freq="2D"),
-            PeriodIndex(["2001-01", "NaT", "2003-01"], freq="M"),
-        ],
-    )
-    def test_repeat_freqstr(self, index, use_numpy):
-        # GH#10183
-        expected = PeriodIndex([per for per in index for _ in range(3)])
-        result = np.repeat(index, 3) if use_numpy else index.repeat(3)
-        tm.assert_index_equal(result, expected)
-        assert result.freqstr == index.freqstr
+    def test_repeat(self):
+        index = timedelta_range("1 days", periods=2, freq="D")
+        exp = TimedeltaIndex(["1 days", "1 days", "2 days", "2 days"])
+        for res in [index.repeat(2), np.repeat(index, 2)]:
+            tm.assert_index_equal(res, exp)
+            assert res.freq is None
+
+        index = TimedeltaIndex(["1 days", "NaT", "3 days"])
+        exp = TimedeltaIndex(
+            [
+                "1 days",
+                "1 days",
+                "1 days",
+                "NaT",
+                "NaT",
+                "NaT",
+                "3 days",
+                "3 days",
+                "3 days",
+            ]
+        )
+        for res in [index.repeat(3), np.repeat(index, 3)]:
+            tm.assert_index_equal(res, exp)
+            assert res.freq is None

@@ -3,361 +3,252 @@ import pytest
 
 import pandas as pd
 from pandas import (
-    PeriodIndex,
-    date_range,
-    period_range,
+    Index,
+    TimedeltaIndex,
+    timedelta_range,
 )
 import pandas._testing as tm
 
-
-def _permute(obj):
-    return obj.take(np.random.default_rng(2).permutation(len(obj)))
+from pandas.tseries.offsets import Hour
 
 
-class TestPeriodIndex:
-    def test_union(self, sort):
-        # union
-        other1 = period_range("1/1/2000", freq="D", periods=5)
-        rng1 = period_range("1/6/2000", freq="D", periods=5)
-        expected1 = PeriodIndex(
-            [
-                "2000-01-06",
-                "2000-01-07",
-                "2000-01-08",
-                "2000-01-09",
-                "2000-01-10",
-                "2000-01-01",
-                "2000-01-02",
-                "2000-01-03",
-                "2000-01-04",
-                "2000-01-05",
-            ],
-            freq="D",
-        )
-
-        rng2 = period_range("1/1/2000", freq="D", periods=5)
-        other2 = period_range("1/4/2000", freq="D", periods=5)
-        expected2 = period_range("1/1/2000", freq="D", periods=8)
-
-        rng3 = period_range("1/1/2000", freq="D", periods=5)
-        other3 = PeriodIndex([], freq="D")
-        expected3 = period_range("1/1/2000", freq="D", periods=5)
-
-        rng4 = period_range("2000-01-01 09:00", freq="h", periods=5)
-        other4 = period_range("2000-01-02 09:00", freq="h", periods=5)
-        expected4 = PeriodIndex(
-            [
-                "2000-01-01 09:00",
-                "2000-01-01 10:00",
-                "2000-01-01 11:00",
-                "2000-01-01 12:00",
-                "2000-01-01 13:00",
-                "2000-01-02 09:00",
-                "2000-01-02 10:00",
-                "2000-01-02 11:00",
-                "2000-01-02 12:00",
-                "2000-01-02 13:00",
-            ],
-            freq="h",
-        )
-
-        rng5 = PeriodIndex(
-            ["2000-01-01 09:01", "2000-01-01 09:03", "2000-01-01 09:05"], freq="min"
-        )
-        other5 = PeriodIndex(
-            ["2000-01-01 09:01", "2000-01-01 09:05", "2000-01-01 09:08"], freq="min"
-        )
-        expected5 = PeriodIndex(
-            [
-                "2000-01-01 09:01",
-                "2000-01-01 09:03",
-                "2000-01-01 09:05",
-                "2000-01-01 09:08",
-            ],
-            freq="min",
-        )
-
-        rng6 = period_range("2000-01-01", freq="M", periods=7)
-        other6 = period_range("2000-04-01", freq="M", periods=7)
-        expected6 = period_range("2000-01-01", freq="M", periods=10)
-
-        rng7 = period_range("2003-01-01", freq="Y", periods=5)
-        other7 = period_range("1998-01-01", freq="Y", periods=8)
-        expected7 = PeriodIndex(
-            [
-                "2003",
-                "2004",
-                "2005",
-                "2006",
-                "2007",
-                "1998",
-                "1999",
-                "2000",
-                "2001",
-                "2002",
-            ],
-            freq="Y",
-        )
-
-        rng8 = PeriodIndex(
-            ["1/3/2000", "1/2/2000", "1/1/2000", "1/5/2000", "1/4/2000"], freq="D"
-        )
-        other8 = period_range("1/6/2000", freq="D", periods=5)
-        expected8 = PeriodIndex(
-            [
-                "1/3/2000",
-                "1/2/2000",
-                "1/1/2000",
-                "1/5/2000",
-                "1/4/2000",
-                "1/6/2000",
-                "1/7/2000",
-                "1/8/2000",
-                "1/9/2000",
-                "1/10/2000",
-            ],
-            freq="D",
-        )
-
-        for rng, other, expected in [
-            (rng1, other1, expected1),
-            (rng2, other2, expected2),
-            (rng3, other3, expected3),
-            (rng4, other4, expected4),
-            (rng5, other5, expected5),
-            (rng6, other6, expected6),
-            (rng7, other7, expected7),
-            (rng8, other8, expected8),
-        ]:
-            result_union = rng.union(other, sort=sort)
-            if sort is None:
-                expected = expected.sort_values()
-            tm.assert_index_equal(result_union, expected)
-
-    def test_union_misc(self, sort):
-        index = period_range("1/1/2000", "1/20/2000", freq="D")
-
-        result = index[:-5].union(index[10:], sort=sort)
-        tm.assert_index_equal(result, index)
-
-        # not in order
-        result = _permute(index[:-5]).union(_permute(index[10:]), sort=sort)
-        if sort is False:
-            tm.assert_index_equal(result.sort_values(), index)
-        else:
-            tm.assert_index_equal(result, index)
-
-        # cast if different frequencies
-        index = period_range("1/1/2000", "1/20/2000", freq="D")
-        index2 = period_range("1/1/2000", "1/20/2000", freq="W-WED")
-        result = index.union(index2, sort=sort)
-        expected = index.astype(object).union(index2.astype(object), sort=sort)
+class TestTimedeltaIndex:
+    def test_union(self):
+        i1 = timedelta_range("1day", periods=5)
+        i2 = timedelta_range("3day", periods=5)
+        result = i1.union(i2)
+        expected = timedelta_range("1day", periods=7)
         tm.assert_index_equal(result, expected)
 
-    def test_intersection(self, sort):
-        index = period_range("1/1/2000", "1/20/2000", freq="D")
+        i1 = Index(np.arange(0, 20, 2, dtype=np.int64))
+        i2 = timedelta_range(start="1 day", periods=10, freq="D")
+        i1.union(i2)  # Works
+        i2.union(i1)  # Fails with "AttributeError: can't set attribute"
 
-        result = index[:-5].intersection(index[10:], sort=sort)
-        tm.assert_index_equal(result, index[10:-5])
+    def test_union_sort_false(self):
+        tdi = timedelta_range("1day", periods=5)
 
-        # not in order
-        left = _permute(index[:-5])
-        right = _permute(index[10:])
-        result = left.intersection(right, sort=sort)
-        if sort is False:
-            tm.assert_index_equal(result.sort_values(), index[10:-5])
-        else:
-            tm.assert_index_equal(result, index[10:-5])
+        left = tdi[3:]
+        right = tdi[:3]
 
-        # cast if different frequencies
-        index = period_range("1/1/2000", "1/20/2000", freq="D")
-        index2 = period_range("1/1/2000", "1/20/2000", freq="W-WED")
+        # Check that we are testing the desired code path
+        assert left._can_fast_union(right)
 
-        result = index.intersection(index2, sort=sort)
-        expected = pd.Index([], dtype=object)
+        result = left.union(right)
+        tm.assert_index_equal(result, tdi)
+
+        result = left.union(right, sort=False)
+        expected = TimedeltaIndex(["4 Days", "5 Days", "1 Days", "2 Day", "3 Days"])
         tm.assert_index_equal(result, expected)
 
-        index3 = period_range("1/1/2000", "1/20/2000", freq="2D")
-        result = index.intersection(index3, sort=sort)
+    def test_union_coverage(self):
+        idx = TimedeltaIndex(["3d", "1d", "2d"])
+        ordered = TimedeltaIndex(idx.sort_values(), freq="infer")
+        result = ordered.union(idx)
+        tm.assert_index_equal(result, ordered)
+
+        result = ordered[:0].union(ordered)
+        tm.assert_index_equal(result, ordered)
+        assert result.freq == ordered.freq
+
+    def test_union_bug_1730(self):
+        rng_a = timedelta_range("1 day", periods=4, freq="3h")
+        rng_b = timedelta_range("1 day", periods=4, freq="4h")
+
+        result = rng_a.union(rng_b)
+        exp = TimedeltaIndex(sorted(set(rng_a) | set(rng_b)))
+        tm.assert_index_equal(result, exp)
+
+    def test_union_bug_1745(self):
+        left = TimedeltaIndex(["1 day 15:19:49.695000"])
+        right = TimedeltaIndex(
+            ["2 day 13:04:21.322000", "1 day 15:27:24.873000", "1 day 15:31:05.350000"]
+        )
+
+        result = left.union(right)
+        exp = TimedeltaIndex(sorted(set(left) | set(right)))
+        tm.assert_index_equal(result, exp)
+
+    def test_union_bug_4564(self):
+        left = timedelta_range("1 day", "30d")
+        right = left + pd.offsets.Minute(15)
+
+        result = left.union(right)
+        exp = TimedeltaIndex(sorted(set(left) | set(right)))
+        tm.assert_index_equal(result, exp)
+
+    def test_union_freq_infer(self):
+        # When taking the union of two TimedeltaIndexes, we infer
+        #  a freq even if the arguments don't have freq.  This matches
+        #  DatetimeIndex behavior.
+        tdi = timedelta_range("1 Day", periods=5)
+        left = tdi[[0, 1, 3, 4]]
+        right = tdi[[2, 3, 1]]
+
+        assert left.freq is None
+        assert right.freq is None
+
+        result = left.union(right)
+        tm.assert_index_equal(result, tdi)
+        assert result.freq == "D"
+
+    def test_intersection_bug_1708(self):
+        index_1 = timedelta_range("1 day", periods=4, freq="h")
+        index_2 = index_1 + pd.offsets.Hour(5)
+
+        result = index_1.intersection(index_2)
+        assert len(result) == 0
+
+        index_1 = timedelta_range("1 day", periods=4, freq="h")
+        index_2 = index_1 + pd.offsets.Hour(1)
+
+        result = index_1.intersection(index_2)
+        expected = timedelta_range("1 day 01:00:00", periods=3, freq="h")
+        tm.assert_index_equal(result, expected)
+        assert result.freq == expected.freq
+
+    def test_intersection_equal(self, sort):
+        # GH 24471 Test intersection outcome given the sort keyword
+        # for equal indices intersection should return the original index
+        first = timedelta_range("1 day", periods=4, freq="h")
+        second = timedelta_range("1 day", periods=4, freq="h")
+        intersect = first.intersection(second, sort=sort)
+        if sort is None:
+            tm.assert_index_equal(intersect, second.sort_values())
+        tm.assert_index_equal(intersect, second)
+
+        # Corner cases
+        inter = first.intersection(first, sort=sort)
+        assert inter is first
+
+    @pytest.mark.parametrize("period_1, period_2", [(0, 4), (4, 0)])
+    def test_intersection_zero_length(self, period_1, period_2, sort):
+        # GH 24471 test for non overlap the intersection should be zero length
+        index_1 = timedelta_range("1 day", periods=period_1, freq="h")
+        index_2 = timedelta_range("1 day", periods=period_2, freq="h")
+        expected = timedelta_range("1 day", periods=0, freq="h")
+        result = index_1.intersection(index_2, sort=sort)
         tm.assert_index_equal(result, expected)
 
-    def test_intersection_cases(self, sort):
-        base = period_range("6/1/2000", "6/30/2000", freq="D", name="idx")
+    def test_zero_length_input_index(self, sort):
+        # GH 24966 test for 0-len intersections are copied
+        index_1 = timedelta_range("1 day", periods=0, freq="h")
+        index_2 = timedelta_range("1 day", periods=3, freq="h")
+        result = index_1.intersection(index_2, sort=sort)
+        assert index_1 is not result
+        assert index_2 is not result
+        tm.assert_copy(result, index_1)
 
+    @pytest.mark.parametrize(
+        "rng, expected",
         # if target has the same name, it is preserved
-        rng2 = period_range("5/15/2000", "6/20/2000", freq="D", name="idx")
-        expected2 = period_range("6/1/2000", "6/20/2000", freq="D", name="idx")
-
-        # if target name is different, it will be reset
-        rng3 = period_range("5/15/2000", "6/20/2000", freq="D", name="other")
-        expected3 = period_range("6/1/2000", "6/20/2000", freq="D", name=None)
-
-        rng4 = period_range("7/1/2000", "7/31/2000", freq="D", name="idx")
-        expected4 = PeriodIndex([], name="idx", freq="D")
-
-        for rng, expected in [
-            (rng2, expected2),
-            (rng3, expected3),
-            (rng4, expected4),
-        ]:
-            result = base.intersection(rng, sort=sort)
-            tm.assert_index_equal(result, expected)
-            assert result.name == expected.name
-            assert result.freq == expected.freq
-
-        # non-monotonic
-        base = PeriodIndex(
-            ["2011-01-05", "2011-01-04", "2011-01-02", "2011-01-03"],
-            freq="D",
-            name="idx",
-        )
-
-        rng2 = PeriodIndex(
-            ["2011-01-04", "2011-01-02", "2011-02-02", "2011-02-03"],
-            freq="D",
-            name="idx",
-        )
-        expected2 = PeriodIndex(["2011-01-04", "2011-01-02"], freq="D", name="idx")
-
-        rng3 = PeriodIndex(
-            ["2011-01-04", "2011-01-02", "2011-02-02", "2011-02-03"],
-            freq="D",
-            name="other",
-        )
-        expected3 = PeriodIndex(["2011-01-04", "2011-01-02"], freq="D", name=None)
-
-        rng4 = period_range("7/1/2000", "7/31/2000", freq="D", name="idx")
-        expected4 = PeriodIndex([], freq="D", name="idx")
-
-        for rng, expected in [
-            (rng2, expected2),
-            (rng3, expected3),
-            (rng4, expected4),
-        ]:
-            result = base.intersection(rng, sort=sort)
-            if sort is None:
-                expected = expected.sort_values()
-            tm.assert_index_equal(result, expected)
-            assert result.name == expected.name
-            assert result.freq == "D"
-
-        # empty same freq
-        rng = date_range("6/1/2000", "6/15/2000", freq="min")
-        result = rng[0:0].intersection(rng)
-        assert len(result) == 0
-
-        result = rng.intersection(rng[0:0])
-        assert len(result) == 0
-
-    def test_difference(self, sort):
-        # diff
-        period_rng = ["1/3/2000", "1/2/2000", "1/1/2000", "1/5/2000", "1/4/2000"]
-        rng1 = PeriodIndex(period_rng, freq="D")
-        other1 = period_range("1/6/2000", freq="D", periods=5)
-        expected1 = rng1
-
-        rng2 = PeriodIndex(period_rng, freq="D")
-        other2 = period_range("1/4/2000", freq="D", periods=5)
-        expected2 = PeriodIndex(["1/3/2000", "1/2/2000", "1/1/2000"], freq="D")
-
-        rng3 = PeriodIndex(period_rng, freq="D")
-        other3 = PeriodIndex([], freq="D")
-        expected3 = rng3
-
-        period_rng = [
-            "2000-01-01 10:00",
-            "2000-01-01 09:00",
-            "2000-01-01 12:00",
-            "2000-01-01 11:00",
-            "2000-01-01 13:00",
-        ]
-        rng4 = PeriodIndex(period_rng, freq="h")
-        other4 = period_range("2000-01-02 09:00", freq="h", periods=5)
-        expected4 = rng4
-
-        rng5 = PeriodIndex(
-            ["2000-01-01 09:03", "2000-01-01 09:01", "2000-01-01 09:05"], freq="min"
-        )
-        other5 = PeriodIndex(["2000-01-01 09:01", "2000-01-01 09:05"], freq="min")
-        expected5 = PeriodIndex(["2000-01-01 09:03"], freq="min")
-
-        period_rng = [
-            "2000-02-01",
-            "2000-01-01",
-            "2000-06-01",
-            "2000-07-01",
-            "2000-05-01",
-            "2000-03-01",
-            "2000-04-01",
-        ]
-        rng6 = PeriodIndex(period_rng, freq="M")
-        other6 = period_range("2000-04-01", freq="M", periods=7)
-        expected6 = PeriodIndex(["2000-02-01", "2000-01-01", "2000-03-01"], freq="M")
-
-        period_rng = ["2003", "2007", "2006", "2005", "2004"]
-        rng7 = PeriodIndex(period_rng, freq="Y")
-        other7 = period_range("1998-01-01", freq="Y", periods=8)
-        expected7 = PeriodIndex(["2007", "2006"], freq="Y")
-
-        for rng, other, expected in [
-            (rng1, other1, expected1),
-            (rng2, other2, expected2),
-            (rng3, other3, expected3),
-            (rng4, other4, expected4),
-            (rng5, other5, expected5),
-            (rng6, other6, expected6),
-            (rng7, other7, expected7),
-        ]:
-            result_difference = rng.difference(other, sort=sort)
-            if sort is None and len(other):
-                # We dont sort (yet?) when empty GH#24959
-                expected = expected.sort_values()
-            tm.assert_index_equal(result_difference, expected)
-
-    def test_difference_freq(self, sort):
-        # GH14323: difference of Period MUST preserve frequency
-        # but the ability to union results must be preserved
-
-        index = period_range("20160920", "20160925", freq="D")
-
-        other = period_range("20160921", "20160924", freq="D")
-        expected = PeriodIndex(["20160920", "20160925"], freq="D")
-        idx_diff = index.difference(other, sort)
-        tm.assert_index_equal(idx_diff, expected)
-        tm.assert_attr_equal("freq", idx_diff, expected)
-
-        other = period_range("20160922", "20160925", freq="D")
-        idx_diff = index.difference(other, sort)
-        expected = PeriodIndex(["20160920", "20160921"], freq="D")
-        tm.assert_index_equal(idx_diff, expected)
-        tm.assert_attr_equal("freq", idx_diff, expected)
-
-    def test_intersection_equal_duplicates(self):
-        # GH#38302
-        idx = period_range("2011-01-01", periods=2)
-        idx_dup = idx.append(idx)
-        result = idx_dup.intersection(idx_dup)
-        tm.assert_index_equal(result, idx)
-
-    @pytest.mark.filterwarnings(r"ignore:PeriodDtype\[B\] is deprecated:FutureWarning")
-    def test_union_duplicates(self):
-        # GH#36289
-        idx = period_range("2011-01-01", periods=2)
-        idx_dup = idx.append(idx)
-
-        idx2 = period_range("2011-01-02", periods=2)
-        idx2_dup = idx2.append(idx2)
-        result = idx_dup.union(idx2_dup)
-
-        expected = PeriodIndex(
-            [
-                "2011-01-01",
-                "2011-01-01",
-                "2011-01-02",
-                "2011-01-02",
-                "2011-01-03",
-                "2011-01-03",
-            ],
-            freq="D",
-        )
+        [
+            (
+                timedelta_range("1 day", periods=5, freq="h", name="idx"),
+                timedelta_range("1 day", periods=4, freq="h", name="idx"),
+            ),
+            # if target name is different, it will be reset
+            (
+                timedelta_range("1 day", periods=5, freq="h", name="other"),
+                timedelta_range("1 day", periods=4, freq="h", name=None),
+            ),
+            # if no overlap exists return empty index
+            (
+                timedelta_range("1 day", periods=10, freq="h", name="idx")[5:],
+                TimedeltaIndex([], freq="h", name="idx"),
+            ),
+        ],
+    )
+    def test_intersection(self, rng, expected, sort):
+        # GH 4690 (with tz)
+        base = timedelta_range("1 day", periods=4, freq="h", name="idx")
+        result = base.intersection(rng, sort=sort)
+        if sort is None:
+            expected = expected.sort_values()
         tm.assert_index_equal(result, expected)
+        assert result.name == expected.name
+        assert result.freq == expected.freq
+
+    @pytest.mark.parametrize(
+        "rng, expected",
+        # part intersection works
+        [
+            (
+                TimedeltaIndex(["5 hour", "2 hour", "4 hour", "9 hour"], name="idx"),
+                TimedeltaIndex(["2 hour", "4 hour"], name="idx"),
+            ),
+            # reordered part intersection
+            (
+                TimedeltaIndex(["2 hour", "5 hour", "5 hour", "1 hour"], name="other"),
+                TimedeltaIndex(["1 hour", "2 hour"], name=None),
+            ),
+            # reversed index
+            (
+                TimedeltaIndex(["1 hour", "2 hour", "4 hour", "3 hour"], name="idx")[
+                    ::-1
+                ],
+                TimedeltaIndex(["1 hour", "2 hour", "4 hour", "3 hour"], name="idx"),
+            ),
+        ],
+    )
+    def test_intersection_non_monotonic(self, rng, expected, sort):
+        # 24471 non-monotonic
+        base = TimedeltaIndex(["1 hour", "2 hour", "4 hour", "3 hour"], name="idx")
+        result = base.intersection(rng, sort=sort)
+        if sort is None:
+            expected = expected.sort_values()
+        tm.assert_index_equal(result, expected)
+        assert result.name == expected.name
+
+        # if reversed order, frequency is still the same
+        if all(base == rng[::-1]) and sort is None:
+            assert isinstance(result.freq, Hour)
+        else:
+            assert result.freq is None
+
+
+class TestTimedeltaIndexDifference:
+    def test_difference_freq(self, sort):
+        # GH14323: Difference of TimedeltaIndex should not preserve frequency
+
+        index = timedelta_range("0 days", "5 days", freq="D")
+
+        other = timedelta_range("1 days", "4 days", freq="D")
+        expected = TimedeltaIndex(["0 days", "5 days"], freq=None)
+        idx_diff = index.difference(other, sort)
+        tm.assert_index_equal(idx_diff, expected)
+        tm.assert_attr_equal("freq", idx_diff, expected)
+
+        # preserve frequency when the difference is a contiguous
+        # subset of the original range
+        other = timedelta_range("2 days", "5 days", freq="D")
+        idx_diff = index.difference(other, sort)
+        expected = TimedeltaIndex(["0 days", "1 days"], freq="D")
+        tm.assert_index_equal(idx_diff, expected)
+        tm.assert_attr_equal("freq", idx_diff, expected)
+
+    def test_difference_sort(self, sort):
+        index = TimedeltaIndex(
+            ["5 days", "3 days", "2 days", "4 days", "1 days", "0 days"]
+        )
+
+        other = timedelta_range("1 days", "4 days", freq="D")
+        idx_diff = index.difference(other, sort)
+
+        expected = TimedeltaIndex(["5 days", "0 days"], freq=None)
+
+        if sort is None:
+            expected = expected.sort_values()
+
+        tm.assert_index_equal(idx_diff, expected)
+        tm.assert_attr_equal("freq", idx_diff, expected)
+
+        other = timedelta_range("2 days", "5 days", freq="D")
+        idx_diff = index.difference(other, sort)
+        expected = TimedeltaIndex(["1 days", "0 days"], freq=None)
+
+        if sort is None:
+            expected = expected.sort_values()
+
+        tm.assert_index_equal(idx_diff, expected)
+        tm.assert_attr_equal("freq", idx_diff, expected)

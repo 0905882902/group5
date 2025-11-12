@@ -1,41 +1,22 @@
 from pandas import (
     Index,
     NaT,
-    Period,
-    PeriodIndex,
+    Timedelta,
+    TimedeltaIndex,
 )
 import pandas._testing as tm
 
 
 class TestFillNA:
-    def test_fillna_period(self):
+    def test_fillna_timedelta(self):
         # GH#11343
-        idx = PeriodIndex(["2011-01-01 09:00", NaT, "2011-01-01 11:00"], freq="h")
+        idx = TimedeltaIndex(["1 day", NaT, "3 day"])
 
-        exp = PeriodIndex(
-            ["2011-01-01 09:00", "2011-01-01 10:00", "2011-01-01 11:00"], freq="h"
-        )
-        result = idx.fillna(Period("2011-01-01 10:00", freq="h"))
-        tm.assert_index_equal(result, exp)
+        exp = TimedeltaIndex(["1 day", "2 day", "3 day"])
+        tm.assert_index_equal(idx.fillna(Timedelta("2 day")), exp)
 
-        exp = Index(
-            [
-                Period("2011-01-01 09:00", freq="h"),
-                "x",
-                Period("2011-01-01 11:00", freq="h"),
-            ],
-            dtype=object,
-        )
-        result = idx.fillna("x")
-        tm.assert_index_equal(result, exp)
+        exp = TimedeltaIndex(["1 day", "3 hour", "3 day"])
+        idx.fillna(Timedelta("3 hour"))
 
-        exp = Index(
-            [
-                Period("2011-01-01 09:00", freq="h"),
-                Period("2011-01-01", freq="D"),
-                Period("2011-01-01 11:00", freq="h"),
-            ],
-            dtype=object,
-        )
-        result = idx.fillna(Period("2011-01-01", freq="D"))
-        tm.assert_index_equal(result, exp)
+        exp = Index([Timedelta("1 day"), "x", Timedelta("3 day")], dtype=object)
+        tm.assert_index_equal(idx.fillna("x"), exp)

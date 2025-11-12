@@ -1,41 +1,40 @@
 import numpy as np
 
-from pandas import PeriodIndex
+from pandas import (
+    TimedeltaIndex,
+    factorize,
+    timedelta_range,
+)
 import pandas._testing as tm
 
 
-class TestFactorize:
-    def test_factorize_period(self):
-        idx1 = PeriodIndex(
-            ["2014-01", "2014-01", "2014-02", "2014-02", "2014-03", "2014-03"],
-            freq="M",
-        )
+class TestTimedeltaIndexFactorize:
+    def test_factorize(self):
+        idx1 = TimedeltaIndex(["1 day", "1 day", "2 day", "2 day", "3 day", "3 day"])
 
         exp_arr = np.array([0, 0, 1, 1, 2, 2], dtype=np.intp)
-        exp_idx = PeriodIndex(["2014-01", "2014-02", "2014-03"], freq="M")
+        exp_idx = TimedeltaIndex(["1 day", "2 day", "3 day"])
 
         arr, idx = idx1.factorize()
         tm.assert_numpy_array_equal(arr, exp_arr)
         tm.assert_index_equal(idx, exp_idx)
+        assert idx.freq == exp_idx.freq
 
         arr, idx = idx1.factorize(sort=True)
         tm.assert_numpy_array_equal(arr, exp_arr)
         tm.assert_index_equal(idx, exp_idx)
+        assert idx.freq == exp_idx.freq
 
-    def test_factorize_period_nonmonotonic(self):
-        idx2 = PeriodIndex(
-            ["2014-03", "2014-03", "2014-02", "2014-01", "2014-03", "2014-01"],
-            freq="M",
-        )
-        exp_idx = PeriodIndex(["2014-01", "2014-02", "2014-03"], freq="M")
-
-        exp_arr = np.array([2, 2, 1, 0, 2, 0], dtype=np.intp)
-        arr, idx = idx2.factorize(sort=True)
+    def test_factorize_preserves_freq(self):
+        # GH#38120 freq should be preserved
+        idx3 = timedelta_range("1 day", periods=4, freq="s")
+        exp_arr = np.array([0, 1, 2, 3], dtype=np.intp)
+        arr, idx = idx3.factorize()
         tm.assert_numpy_array_equal(arr, exp_arr)
-        tm.assert_index_equal(idx, exp_idx)
+        tm.assert_index_equal(idx, idx3)
+        assert idx.freq == idx3.freq
 
-        exp_arr = np.array([0, 0, 1, 2, 0, 2], dtype=np.intp)
-        exp_idx = PeriodIndex(["2014-03", "2014-02", "2014-01"], freq="M")
-        arr, idx = idx2.factorize()
+        arr, idx = factorize(idx3)
         tm.assert_numpy_array_equal(arr, exp_arr)
-        tm.assert_index_equal(idx, exp_idx)
+        tm.assert_index_equal(idx, idx3)
+        assert idx.freq == idx3.freq

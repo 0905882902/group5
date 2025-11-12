@@ -1,56 +1,51 @@
-# Arithmetic tests specific to DatetimeIndex are generally about `freq`
-#  rentention or inference.  Other arithmetic tests belong in
-#  tests/arithmetic/test_datetime64.py
-import pytest
+# Arithmetic tests for TimedeltaIndex are generally about the result's `freq` attribute.
+# Other cases can be shared in tests.arithmetic.test_timedelta64
+import numpy as np
 
 from pandas import (
+    NaT,
     Timedelta,
-    TimedeltaIndex,
-    Timestamp,
-    date_range,
     timedelta_range,
 )
 import pandas._testing as tm
 
 
-class TestDatetimeIndexArithmetic:
-    def test_add_timedelta_preserves_freq(self):
-        # GH#37295 should hold for any DTI with freq=None or Tick freq
-        tz = "Canada/Eastern"
-        dti = date_range(
-            start=Timestamp("2019-03-26 00:00:00-0400", tz=tz),
-            end=Timestamp("2020-10-17 00:00:00-0400", tz=tz),
-            freq="D",
+class TestTimedeltaIndexArithmetic:
+    def test_arithmetic_zero_freq(self):
+        # GH#51575 don't get a .freq with freq.n = 0
+        tdi = timedelta_range(0, periods=100, freq="ns")
+        result = tdi / 2
+        assert result.freq is None
+        expected = tdi[:50].repeat(2)
+        tm.assert_index_equal(result, expected)
+
+        result2 = tdi // 2
+        assert result2.freq is None
+        expected2 = expected
+        tm.assert_index_equal(result2, expected2)
+
+        result3 = tdi * 0
+        assert result3.freq is None
+        expected3 = tdi[:1].repeat(100)
+        tm.assert_index_equal(result3, expected3)
+
+    def test_tdi_division(self, index_or_series):
+        # doc example
+
+        scalar = Timedelta(days=31)
+        td = index_or_series(
+            [scalar, scalar, scalar + Timedelta(minutes=5, seconds=3), NaT],
+            dtype="m8[ns]",
         )
-        result = dti + Timedelta(days=1)
-        assert result.freq == dti.freq
 
-    def test_sub_datetime_preserves_freq(self, tz_naive_fixture):
-        # GH#48818
-        dti = date_range("2016-01-01", periods=12, tz=tz_naive_fixture)
-
-        res = dti - dti[0]
-        expected = timedelta_range("0 Days", "11 Days")
-        tm.assert_index_equal(res, expected)
-        assert res.freq == expected.freq
-
-    @pytest.mark.xfail(
-        reason="The inherited freq is incorrect bc dti.freq is incorrect "
-        "https://github.com/pandas-dev/pandas/pull/48818/files#r982793461"
-    )
-    def test_sub_datetime_preserves_freq_across_dst(self):
-        # GH#48818
-        ts = Timestamp("2016-03-11", tz="US/Pacific")
-        dti = date_range(ts, periods=4)
-
-        res = dti - dti[0]
-        expected = TimedeltaIndex(
-            [
-                Timedelta(days=0),
-                Timedelta(days=1),
-                Timedelta(days=2),
-                Timedelta(days=2, hours=23),
-            ]
+        result = td / np.timedelta64(1, "D")
+        expected = index_or_series(
+            [31, 31, (31 * 86400 + 5 * 60 + 3) / 86400.0, np.nan]
         )
-        tm.assert_index_equal(res, expected)
-        assert res.freq == expected.freq
+        tm.assert_equal(result, expected)
+
+        result = td / np.timedelta64(1, "s")
+        expected = index_or_series(
+            [31 * 86400, 31 * 86400, 31 * 86400 + 5 * 60 + 3, np.nan]
+        )
+        tm.assert_equal(result, expected)
