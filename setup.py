@@ -1,21 +1,23 @@
-# Author: Virgile Fritsch <virgile.fritsch@inria.fr>
-# License: BSD 3 clause
-
-import numpy
+import os
+import platform
 
 
 def configuration(parent_package="", top_path=None):
+    import numpy
     from numpy.distutils.misc_util import Configuration
 
-    config = Configuration("__check_build", parent_package, top_path)
-    config.add_extension(
-        "_check_build", sources=["_check_build.pyx"], include_dirs=[numpy.get_include()]
-    )
+    config = Configuration("feature_extraction", parent_package, top_path)
+    libraries = []
+    if os.name == "posix":
+        libraries.append("m")
+
+    if platform.python_implementation() != "PyPy":
+        config.add_extension(
+            "_hashing_fast",
+            sources=["_hashing_fast.pyx"],
+            include_dirs=[numpy.get_include()],
+            libraries=libraries,
+        )
+    config.add_subpackage("tests")
 
     return config
-
-
-if __name__ == "__main__":
-    from numpy.distutils.core import setup
-
-    setup(**configuration(top_path="").todict())
