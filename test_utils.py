@@ -1,25 +1,9 @@
-import pytest
+import numpy as np
+from pytest import raises as assert_raises
 
-from joblib._utils import eval_expr
-
-
-@pytest.mark.parametrize(
-    "expr",
-    ["exec('import os')", "print(1)", "import os", "1+1; import os", "1^1"],
-)
-def test_eval_expr_invalid(expr):
-    with pytest.raises(ValueError, match="is not a valid or supported arithmetic"):
-        eval_expr(expr)
+import scipy.sparse.linalg._isolve.utils as utils
 
 
-@pytest.mark.parametrize(
-    "expr, result",
-    [
-        ("2*6", 12),
-        ("2**6", 64),
-        ("1 + 2*3**(4) / (6 + -7)", -161.0),
-        ("(20 // 3) % 5", 1),
-    ],
-)
-def test_eval_expr_valid(expr, result):
-    assert eval_expr(expr) == result
+def test_make_system_bad_shape():
+    assert_raises(ValueError,
+                  utils.make_system, np.zeros((5,3)), None, np.zeros(4), np.zeros(4))

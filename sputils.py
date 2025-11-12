@@ -6,19 +6,30 @@ from scipy._lib.deprecation import _sub_module_deprecation
 
 
 __all__ = [  # noqa: F822
-    'MAXPRINT',
-    'SparseEfficiencyWarning',
-    'SparseFormatWarning',
-    'SparseWarning',
     'asmatrix',
     'check_reshape_kwargs',
     'check_shape',
+    'downcast_intp_index',
+    'get_index_dtype',
     'get_sum_dtype',
+    'getdata',
+    'getdtype',
+    'is_pydata_spmatrix',
     'isdense',
+    'isintlike',
+    'ismatrix',
     'isscalarlike',
-    'issparse',
-    'isspmatrix',
-    'spmatrix',
+    'issequence',
+    'isshape',
+    'matrix',
+    'operator',
+    'prod',
+    'supported_dtypes',
+    'sys',
+    'to_native',
+    'upcast',
+    'upcast_char',
+    'upcast_scalar',
     'validateaxis',
 ]
 
@@ -28,6 +39,6 @@ def __dir__():
 
 
 def __getattr__(name):
-    return _sub_module_deprecation(sub_package="sparse", module="base",
-                                   private_modules=["_base"], all=__all__,
+    return _sub_module_deprecation(sub_package="sparse", module="sputils",
+                                   private_modules=["_sputils"], all=__all__,
                                    attribute=name)

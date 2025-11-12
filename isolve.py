@@ -6,9 +6,9 @@ from scipy._lib.deprecation import _sub_module_deprecation
 
 
 __all__ = [  # noqa: F822
-    'expm', 'inv', 'solve', 'solve_triangular',
-    'spsolve', 'is_pydata_spmatrix', 'LinearOperator',
-    'UPPER_TRIANGULAR', 'MatrixPowerOperator', 'ProductOperator'
+    'bicg', 'bicgstab', 'cg', 'cgs', 'gcrotmk', 'gmres',
+    'lgmres', 'lsmr', 'lsqr',
+    'minres', 'qmr', 'tfqmr', 'utils', 'iterative', 'test'
 ]
 
 
@@ -17,6 +17,6 @@ def __dir__():
 
 
 def __getattr__(name):
-    return _sub_module_deprecation(sub_package="sparse.linalg", module="matfuncs",
-                                   private_modules=["_matfuncs"], all=__all__,
+    return _sub_module_deprecation(sub_package="sparse.linalg", module="isolve",
+                                   private_modules=["_isolve"], all=__all__,
                                    attribute=name)
