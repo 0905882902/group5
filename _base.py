@@ -1,251 +1,567 @@
-"""
-Common code for all metrics.
+"""Base class for mixture models."""
 
-"""
-# Authors: Alexandre Gramfort <alexandre.gramfort@inria.fr>
-#          Mathieu Blondel <mathieu@mblondel.org>
-#          Olivier Grisel <olivier.grisel@ensta.org>
-#          Arnaud Joly <a.joly@ulg.ac.be>
-#          Jochen Wersdorfer <jochen@wersdoerfer.de>
-#          Lars Buitinck
-#          Joel Nothman <joel.nothman@gmail.com>
-#          Noel Dawe <noel@dawe.me>
+# Author: Wei Xue <xuewei4d@gmail.com>
+# Modified by Thierry Guillemot <thierry.guillemot.work@gmail.com>
 # License: BSD 3 clause
 
-from itertools import combinations
+import warnings
+from abc import ABCMeta, abstractmethod
+from time import time
 
 import numpy as np
+from scipy.special import logsumexp
 
-from ..utils import check_array, check_consistent_length
-from ..utils.multiclass import type_of_target
+from .. import cluster
+from ..base import BaseEstimator
+from ..base import DensityMixin
+from ..exceptions import ConvergenceWarning
+from ..utils import check_random_state
+from ..utils.validation import check_is_fitted
 
 
-def _average_binary_score(binary_metric, y_true, y_score, average, sample_weight=None):
-    """Average a binary metric for multilabel classification.
+def _check_shape(param, param_shape, name):
+    """Validate the shape of the input parameter 'param'.
 
     Parameters
     ----------
-    y_true : array, shape = [n_samples] or [n_samples, n_classes]
-        True binary labels in binary label indicators.
+    param : array
 
-    y_score : array, shape = [n_samples] or [n_samples, n_classes]
-        Target scores, can either be probability estimates of the positive
-        class, confidence values, or binary decisions.
+    param_shape : tuple
 
-    average : {None, 'micro', 'macro', 'samples', 'weighted'}, default='macro'
-        If ``None``, the scores for each class are returned. Otherwise,
-        this determines the type of averaging performed on the data:
-
-        ``'micro'``:
-            Calculate metrics globally by considering each element of the label
-            indicator matrix as a label.
-        ``'macro'``:
-            Calculate metrics for each label, and find their unweighted
-            mean.  This does not take label imbalance into account.
-        ``'weighted'``:
-            Calculate metrics for each label, and find their average, weighted
-            by support (the number of true instances for each label).
-        ``'samples'``:
-            Calculate metrics for each instance, and find their average.
-
-        Will be ignored when ``y_true`` is binary.
-
-    sample_weight : array-like of shape (n_samples,), default=None
-        Sample weights.
-
-    binary_metric : callable, returns shape [n_classes]
-        The binary metric function to use.
-
-    Returns
-    -------
-    score : float or array of shape [n_classes]
-        If not ``None``, average the score, else return the score for each
-        classes.
-
+    name : str
     """
-    average_options = (None, "micro", "macro", "weighted", "samples")
-    if average not in average_options:
-        raise ValueError("average has to be one of {0}".format(average_options))
+    param = np.array(param)
+    if param.shape != param_shape:
+        raise ValueError(
+            "The parameter '%s' should have the shape of %s, but got %s"
+            % (name, param_shape, param.shape)
+        )
 
-    y_type = type_of_target(y_true)
-    if y_type not in ("binary", "multilabel-indicator"):
-        raise ValueError("{0} format is not supported".format(y_type))
 
-    if y_type == "binary":
-        return binary_metric(y_true, y_score, sample_weight=sample_weight)
+class BaseMixture(DensityMixin, BaseEstimator, metaclass=ABCMeta):
+    """Base class for mixture models.
 
-    check_consistent_length(y_true, y_score, sample_weight)
-    y_true = check_array(y_true)
-    y_score = check_array(y_score)
+    This abstract class specifies an interface for all mixture classes and
+    provides basic common methods for mixture models.
+    """
 
-    not_average_axis = 1
-    score_weight = sample_weight
-    average_weight = None
+    def __init__(
+        self,
+        n_components,
+        tol,
+        reg_covar,
+        max_iter,
+        n_init,
+        init_params,
+        random_state,
+        warm_start,
+        verbose,
+        verbose_interval,
+    ):
+        self.n_components = n_components
+        self.tol = tol
+        self.reg_covar = reg_covar
+        self.max_iter = max_iter
+        self.n_init = n_init
+        self.init_params = init_params
+        self.random_state = random_state
+        self.warm_start = warm_start
+        self.verbose = verbose
+        self.verbose_interval = verbose_interval
 
-    if average == "micro":
-        if score_weight is not None:
-            score_weight = np.repeat(score_weight, y_true.shape[1])
-        y_true = y_true.ravel()
-        y_score = y_score.ravel()
+    def _check_initial_parameters(self, X):
+        """Check values of the basic parameters.
 
-    elif average == "weighted":
-        if score_weight is not None:
-            average_weight = np.sum(
-                np.multiply(y_true, np.reshape(score_weight, (-1, 1))), axis=0
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+        """
+        if self.n_components < 1:
+            raise ValueError(
+                "Invalid value for 'n_components': %d "
+                "Estimation requires at least one component"
+                % self.n_components
+            )
+
+        if self.tol < 0.0:
+            raise ValueError(
+                "Invalid value for 'tol': %.5f "
+                "Tolerance used by the EM must be non-negative"
+                % self.tol
+            )
+
+        if self.n_init < 1:
+            raise ValueError(
+                "Invalid value for 'n_init': %d Estimation requires at least one run"
+                % self.n_init
+            )
+
+        if self.max_iter < 1:
+            raise ValueError(
+                "Invalid value for 'max_iter': %d "
+                "Estimation requires at least one iteration"
+                % self.max_iter
+            )
+
+        if self.reg_covar < 0.0:
+            raise ValueError(
+                "Invalid value for 'reg_covar': %.5f "
+                "regularization on covariance must be "
+                "non-negative"
+                % self.reg_covar
+            )
+
+        # Check all the parameters values of the derived class
+        self._check_parameters(X)
+
+    @abstractmethod
+    def _check_parameters(self, X):
+        """Check initial parameters of the derived class.
+
+        Parameters
+        ----------
+        X : array-like of shape  (n_samples, n_features)
+        """
+        pass
+
+    def _initialize_parameters(self, X, random_state):
+        """Initialize the model parameters.
+
+        Parameters
+        ----------
+        X : array-like of shape  (n_samples, n_features)
+
+        random_state : RandomState
+            A random number generator instance that controls the random seed
+            used for the method chosen to initialize the parameters.
+        """
+        n_samples, _ = X.shape
+
+        if self.init_params == "kmeans":
+            resp = np.zeros((n_samples, self.n_components))
+            label = (
+                cluster.KMeans(
+                    n_clusters=self.n_components, n_init=1, random_state=random_state
+                )
+                .fit(X)
+                .labels_
+            )
+            resp[np.arange(n_samples), label] = 1
+        elif self.init_params == "random":
+            resp = random_state.rand(n_samples, self.n_components)
+            resp /= resp.sum(axis=1)[:, np.newaxis]
+        else:
+            raise ValueError(
+                "Unimplemented initialization method '%s'" % self.init_params
+            )
+
+        self._initialize(X, resp)
+
+    @abstractmethod
+    def _initialize(self, X, resp):
+        """Initialize the model parameters of the derived class.
+
+        Parameters
+        ----------
+        X : array-like of shape  (n_samples, n_features)
+
+        resp : array-like of shape (n_samples, n_components)
+        """
+        pass
+
+    def fit(self, X, y=None):
+        """Estimate model parameters with the EM algorithm.
+
+        The method fits the model ``n_init`` times and sets the parameters with
+        which the model has the largest likelihood or lower bound. Within each
+        trial, the method iterates between E-step and M-step for ``max_iter``
+        times until the change of likelihood or lower bound is less than
+        ``tol``, otherwise, a ``ConvergenceWarning`` is raised.
+        If ``warm_start`` is ``True``, then ``n_init`` is ignored and a single
+        initialization is performed upon the first call. Upon consecutive
+        calls, training starts where it left off.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            List of n_features-dimensional data points. Each row
+            corresponds to a single data point.
+
+        y : Ignored
+            Not used, present for API consistency by convention.
+
+        Returns
+        -------
+        self : object
+            The fitted mixture.
+        """
+        self.fit_predict(X, y)
+        return self
+
+    def fit_predict(self, X, y=None):
+        """Estimate model parameters using X and predict the labels for X.
+
+        The method fits the model n_init times and sets the parameters with
+        which the model has the largest likelihood or lower bound. Within each
+        trial, the method iterates between E-step and M-step for `max_iter`
+        times until the change of likelihood or lower bound is less than
+        `tol`, otherwise, a :class:`~sklearn.exceptions.ConvergenceWarning` is
+        raised. After fitting, it predicts the most probable label for the
+        input data points.
+
+        .. versionadded:: 0.20
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            List of n_features-dimensional data points. Each row
+            corresponds to a single data point.
+
+        y : Ignored
+            Not used, present for API consistency by convention.
+
+        Returns
+        -------
+        labels : array, shape (n_samples,)
+            Component labels.
+        """
+        X = self._validate_data(X, dtype=[np.float64, np.float32], ensure_min_samples=2)
+        if X.shape[0] < self.n_components:
+            raise ValueError(
+                "Expected n_samples >= n_components "
+                f"but got n_components = {self.n_components}, "
+                f"n_samples = {X.shape[0]}"
+            )
+        self._check_initial_parameters(X)
+
+        # if we enable warm_start, we will have a unique initialisation
+        do_init = not (self.warm_start and hasattr(self, "converged_"))
+        n_init = self.n_init if do_init else 1
+
+        max_lower_bound = -np.inf
+        self.converged_ = False
+
+        random_state = check_random_state(self.random_state)
+
+        n_samples, _ = X.shape
+        for init in range(n_init):
+            self._print_verbose_msg_init_beg(init)
+
+            if do_init:
+                self._initialize_parameters(X, random_state)
+
+            lower_bound = -np.inf if do_init else self.lower_bound_
+
+            for n_iter in range(1, self.max_iter + 1):
+                prev_lower_bound = lower_bound
+
+                log_prob_norm, log_resp = self._e_step(X)
+                self._m_step(X, log_resp)
+                lower_bound = self._compute_lower_bound(log_resp, log_prob_norm)
+
+                change = lower_bound - prev_lower_bound
+                self._print_verbose_msg_iter_end(n_iter, change)
+
+                if abs(change) < self.tol:
+                    self.converged_ = True
+                    break
+
+            self._print_verbose_msg_init_end(lower_bound)
+
+            if lower_bound > max_lower_bound or max_lower_bound == -np.inf:
+                max_lower_bound = lower_bound
+                best_params = self._get_parameters()
+                best_n_iter = n_iter
+
+        if not self.converged_:
+            warnings.warn(
+                "Initialization %d did not converge. "
+                "Try different init parameters, "
+                "or increase max_iter, tol "
+                "or check for degenerate data." % (init + 1),
+                ConvergenceWarning,
+            )
+
+        self._set_parameters(best_params)
+        self.n_iter_ = best_n_iter
+        self.lower_bound_ = max_lower_bound
+
+        # Always do a final e-step to guarantee that the labels returned by
+        # fit_predict(X) are always consistent with fit(X).predict(X)
+        # for any value of max_iter and tol (and any random_state).
+        _, log_resp = self._e_step(X)
+
+        return log_resp.argmax(axis=1)
+
+    def _e_step(self, X):
+        """E step.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+
+        Returns
+        -------
+        log_prob_norm : float
+            Mean of the logarithms of the probabilities of each sample in X
+
+        log_responsibility : array, shape (n_samples, n_components)
+            Logarithm of the posterior probabilities (or responsibilities) of
+            the point of each sample in X.
+        """
+        log_prob_norm, log_resp = self._estimate_log_prob_resp(X)
+        return np.mean(log_prob_norm), log_resp
+
+    @abstractmethod
+    def _m_step(self, X, log_resp):
+        """M step.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+
+        log_resp : array-like of shape (n_samples, n_components)
+            Logarithm of the posterior probabilities (or responsibilities) of
+            the point of each sample in X.
+        """
+        pass
+
+    @abstractmethod
+    def _get_parameters(self):
+        pass
+
+    @abstractmethod
+    def _set_parameters(self, params):
+        pass
+
+    def score_samples(self, X):
+        """Compute the log-likelihood of each sample.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            List of n_features-dimensional data points. Each row
+            corresponds to a single data point.
+
+        Returns
+        -------
+        log_prob : array, shape (n_samples,)
+            Log-likelihood of each sample in `X` under the current model.
+        """
+        check_is_fitted(self)
+        X = self._validate_data(X, reset=False)
+
+        return logsumexp(self._estimate_weighted_log_prob(X), axis=1)
+
+    def score(self, X, y=None):
+        """Compute the per-sample average log-likelihood of the given data X.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_dimensions)
+            List of n_features-dimensional data points. Each row
+            corresponds to a single data point.
+
+        y : Ignored
+            Not used, present for API consistency by convention.
+
+        Returns
+        -------
+        log_likelihood : float
+            Log-likelihood of `X` under the Gaussian mixture model.
+        """
+        return self.score_samples(X).mean()
+
+    def predict(self, X):
+        """Predict the labels for the data samples in X using trained model.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            List of n_features-dimensional data points. Each row
+            corresponds to a single data point.
+
+        Returns
+        -------
+        labels : array, shape (n_samples,)
+            Component labels.
+        """
+        check_is_fitted(self)
+        X = self._validate_data(X, reset=False)
+        return self._estimate_weighted_log_prob(X).argmax(axis=1)
+
+    def predict_proba(self, X):
+        """Evaluate the components' density for each sample.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            List of n_features-dimensional data points. Each row
+            corresponds to a single data point.
+
+        Returns
+        -------
+        resp : array, shape (n_samples, n_components)
+            Density of each Gaussian component for each sample in X.
+        """
+        check_is_fitted(self)
+        X = self._validate_data(X, reset=False)
+        _, log_resp = self._estimate_log_prob_resp(X)
+        return np.exp(log_resp)
+
+    def sample(self, n_samples=1):
+        """Generate random samples from the fitted Gaussian distribution.
+
+        Parameters
+        ----------
+        n_samples : int, default=1
+            Number of samples to generate.
+
+        Returns
+        -------
+        X : array, shape (n_samples, n_features)
+            Randomly generated sample.
+
+        y : array, shape (nsamples,)
+            Component labels.
+        """
+        check_is_fitted(self)
+
+        if n_samples < 1:
+            raise ValueError(
+                "Invalid value for 'n_samples': %d . The sampling requires at "
+                "least one sample." % (self.n_components)
+            )
+
+        _, n_features = self.means_.shape
+        rng = check_random_state(self.random_state)
+        n_samples_comp = rng.multinomial(n_samples, self.weights_)
+
+        if self.covariance_type == "full":
+            X = np.vstack(
+                [
+                    rng.multivariate_normal(mean, covariance, int(sample))
+                    for (mean, covariance, sample) in zip(
+                        self.means_, self.covariances_, n_samples_comp
+                    )
+                ]
+            )
+        elif self.covariance_type == "tied":
+            X = np.vstack(
+                [
+                    rng.multivariate_normal(mean, self.covariances_, int(sample))
+                    for (mean, sample) in zip(self.means_, n_samples_comp)
+                ]
             )
         else:
-            average_weight = np.sum(y_true, axis=0)
-        if np.isclose(average_weight.sum(), 0.0):
-            return 0
+            X = np.vstack(
+                [
+                    mean + rng.randn(sample, n_features) * np.sqrt(covariance)
+                    for (mean, covariance, sample) in zip(
+                        self.means_, self.covariances_, n_samples_comp
+                    )
+                ]
+            )
 
-    elif average == "samples":
-        # swap average_weight <-> score_weight
-        average_weight = score_weight
-        score_weight = None
-        not_average_axis = 0
-
-    if y_true.ndim == 1:
-        y_true = y_true.reshape((-1, 1))
-
-    if y_score.ndim == 1:
-        y_score = y_score.reshape((-1, 1))
-
-    n_classes = y_score.shape[not_average_axis]
-    score = np.zeros((n_classes,))
-    for c in range(n_classes):
-        y_true_c = y_true.take([c], axis=not_average_axis).ravel()
-        y_score_c = y_score.take([c], axis=not_average_axis).ravel()
-        score[c] = binary_metric(y_true_c, y_score_c, sample_weight=score_weight)
-
-    # Average the results
-    if average is not None:
-        if average_weight is not None:
-            # Scores with 0 weights are forced to be 0, preventing the average
-            # score from being affected by 0-weighted NaN elements.
-            average_weight = np.asarray(average_weight)
-            score[average_weight == 0] = 0
-        return np.average(score, weights=average_weight)
-    else:
-        return score
-
-
-def _average_multiclass_ovo_score(binary_metric, y_true, y_score, average="macro"):
-    """Average one-versus-one scores for multiclass classification.
-
-    Uses the binary metric for one-vs-one multiclass classification,
-    where the score is computed according to the Hand & Till (2001) algorithm.
-
-    Parameters
-    ----------
-    binary_metric : callable
-        The binary metric function to use that accepts the following as input:
-            y_true_target : array, shape = [n_samples_target]
-                Some sub-array of y_true for a pair of classes designated
-                positive and negative in the one-vs-one scheme.
-            y_score_target : array, shape = [n_samples_target]
-                Scores corresponding to the probability estimates
-                of a sample belonging to the designated positive class label
-
-    y_true : array-like of shape (n_samples,)
-        True multiclass labels.
-
-    y_score : array-like of shape (n_samples, n_classes)
-        Target scores corresponding to probability estimates of a sample
-        belonging to a particular class.
-
-    average : {'macro', 'weighted'}, default='macro'
-        Determines the type of averaging performed on the pairwise binary
-        metric scores:
-        ``'macro'``:
-            Calculate metrics for each label, and find their unweighted
-            mean. This does not take label imbalance into account. Classes
-            are assumed to be uniformly distributed.
-        ``'weighted'``:
-            Calculate metrics for each label, taking into account the
-            prevalence of the classes.
-
-    Returns
-    -------
-    score : float
-        Average of the pairwise binary metric scores.
-    """
-    check_consistent_length(y_true, y_score)
-
-    y_true_unique = np.unique(y_true)
-    n_classes = y_true_unique.shape[0]
-    n_pairs = n_classes * (n_classes - 1) // 2
-    pair_scores = np.empty(n_pairs)
-
-    is_weighted = average == "weighted"
-    prevalence = np.empty(n_pairs) if is_weighted else None
-
-    # Compute scores treating a as positive class and b as negative class,
-    # then b as positive class and a as negative class
-    for ix, (a, b) in enumerate(combinations(y_true_unique, 2)):
-        a_mask = y_true == a
-        b_mask = y_true == b
-        ab_mask = np.logical_or(a_mask, b_mask)
-
-        if is_weighted:
-            prevalence[ix] = np.average(ab_mask)
-
-        a_true = a_mask[ab_mask]
-        b_true = b_mask[ab_mask]
-
-        a_true_score = binary_metric(a_true, y_score[ab_mask, a])
-        b_true_score = binary_metric(b_true, y_score[ab_mask, b])
-        pair_scores[ix] = (a_true_score + b_true_score) / 2
-
-    return np.average(pair_scores, weights=prevalence)
-
-
-def _check_pos_label_consistency(pos_label, y_true):
-    """Check if `pos_label` need to be specified or not.
-
-    In binary classification, we fix `pos_label=1` if the labels are in the set
-    {-1, 1} or {0, 1}. Otherwise, we raise an error asking to specify the
-    `pos_label` parameters.
-
-    Parameters
-    ----------
-    pos_label : int, str or None
-        The positive label.
-    y_true : ndarray of shape (n_samples,)
-        The target vector.
-
-    Returns
-    -------
-    pos_label : int
-        If `pos_label` can be inferred, it will be returned.
-
-    Raises
-    ------
-    ValueError
-        In the case that `y_true` does not have label in {-1, 1} or {0, 1},
-        it will raise a `ValueError`.
-    """
-    # ensure binary classification if pos_label is not specified
-    # classes.dtype.kind in ('O', 'U', 'S') is required to avoid
-    # triggering a FutureWarning by calling np.array_equal(a, b)
-    # when elements in the two arrays are not comparable.
-    classes = np.unique(y_true)
-    if pos_label is None and (
-        classes.dtype.kind in "OUS"
-        or not (
-            np.array_equal(classes, [0, 1])
-            or np.array_equal(classes, [-1, 1])
-            or np.array_equal(classes, [0])
-            or np.array_equal(classes, [-1])
-            or np.array_equal(classes, [1])
+        y = np.concatenate(
+            [np.full(sample, j, dtype=int) for j, sample in enumerate(n_samples_comp)]
         )
-    ):
-        classes_repr = ", ".join(repr(c) for c in classes)
-        raise ValueError(
-            f"y_true takes value in {{{classes_repr}}} and pos_label is not "
-            "specified: either make y_true take value in {0, 1} or "
-            "{-1, 1} or pass pos_label explicitly."
-        )
-    elif pos_label is None:
-        pos_label = 1
 
-    return pos_label
+        return (X, y)
+
+    def _estimate_weighted_log_prob(self, X):
+        """Estimate the weighted log-probabilities, log P(X | Z) + log weights.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+
+        Returns
+        -------
+        weighted_log_prob : array, shape (n_samples, n_component)
+        """
+        return self._estimate_log_prob(X) + self._estimate_log_weights()
+
+    @abstractmethod
+    def _estimate_log_weights(self):
+        """Estimate log-weights in EM algorithm, E[ log pi ] in VB algorithm.
+
+        Returns
+        -------
+        log_weight : array, shape (n_components, )
+        """
+        pass
+
+    @abstractmethod
+    def _estimate_log_prob(self, X):
+        """Estimate the log-probabilities log P(X | Z).
+
+        Compute the log-probabilities per each component for each sample.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+
+        Returns
+        -------
+        log_prob : array, shape (n_samples, n_component)
+        """
+        pass
+
+    def _estimate_log_prob_resp(self, X):
+        """Estimate log probabilities and responsibilities for each sample.
+
+        Compute the log probabilities, weighted log probabilities per
+        component and responsibilities for each sample in X with respect to
+        the current state of the model.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+
+        Returns
+        -------
+        log_prob_norm : array, shape (n_samples,)
+            log p(X)
+
+        log_responsibilities : array, shape (n_samples, n_components)
+            logarithm of the responsibilities
+        """
+        weighted_log_prob = self._estimate_weighted_log_prob(X)
+        log_prob_norm = logsumexp(weighted_log_prob, axis=1)
+        with np.errstate(under="ignore"):
+            # ignore underflow
+            log_resp = weighted_log_prob - log_prob_norm[:, np.newaxis]
+        return log_prob_norm, log_resp
+
+    def _print_verbose_msg_init_beg(self, n_init):
+        """Print verbose message on initialization."""
+        if self.verbose == 1:
+            print("Initialization %d" % n_init)
+        elif self.verbose >= 2:
+            print("Initialization %d" % n_init)
+            self._init_prev_time = time()
+            self._iter_prev_time = self._init_prev_time
+
+    def _print_verbose_msg_iter_end(self, n_iter, diff_ll):
+        """Print verbose message on initialization."""
+        if n_iter % self.verbose_interval == 0:
+            if self.verbose == 1:
+                print("  Iteration %d" % n_iter)
+            elif self.verbose >= 2:
+                cur_time = time()
+                print(
+                    "  Iteration %d\t time lapse %.5fs\t ll change %.5f"
+                    % (n_iter, cur_time - self._iter_prev_time, diff_ll)
+                )
+                self._iter_prev_time = cur_time
+
+    def _print_verbose_msg_init_end(self, ll):
+        """Print verbose message on the end of iteration."""
+        if self.verbose == 1:
+            print("Initialization converged: %s" % self.converged_)
+        elif self.verbose >= 2:
+            print(
+                "Initialization converged: %s\t time lapse %.5fs\t ll %.5f"
+                % (self.converged_, time() - self._init_prev_time, ll)
+            )
