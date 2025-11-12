@@ -1,77 +1,45 @@
+from datetime import datetime
+
 import numpy as np
 
-from pandas.core.dtypes.common import is_float_dtype
-
 from pandas import (
-    DataFrame,
-    isna,
+    DatetimeIndex,
+    Series,
 )
 import pandas._testing as tm
 
 
-class TestSetValue:
-    def test_set_value(self, float_frame):
-        for idx in float_frame.index:
-            for col in float_frame.columns:
-                float_frame._set_value(idx, col, 1)
-                assert float_frame[col][idx] == 1
+def test_series_set_value():
+    # GH#1561
 
-    def test_set_value_resize(self, float_frame, using_infer_string):
-        res = float_frame._set_value("foobar", "B", 0)
-        assert res is None
-        assert float_frame.index[-1] == "foobar"
-        assert float_frame._get_value("foobar", "B") == 0
+    dates = [datetime(2001, 1, 1), datetime(2001, 1, 2)]
+    index = DatetimeIndex(dates)
 
-        float_frame.loc["foobar", "qux"] = 0
-        assert float_frame._get_value("foobar", "qux") == 0
+    s = Series(dtype=object)
+    s._set_value(dates[0], 1.0)
+    s._set_value(dates[1], np.nan)
 
-        res = float_frame.copy()
-        res._set_value("foobar", "baz", "sam")
-        if using_infer_string:
-            assert res["baz"].dtype == "str"
-        else:
-            assert res["baz"].dtype == np.object_
-        res = float_frame.copy()
-        res._set_value("foobar", "baz", True)
-        assert res["baz"].dtype == np.object_
+    expected = Series([1.0, np.nan], index=index)
 
-        res = float_frame.copy()
-        res._set_value("foobar", "baz", 5)
-        assert is_float_dtype(res["baz"])
-        assert isna(res["baz"].drop(["foobar"])).all()
+    tm.assert_series_equal(s, expected)
 
-        with tm.assert_produces_warning(
-            FutureWarning, match="Setting an item of incompatible dtype"
-        ):
-            res._set_value("foobar", "baz", "sam")
-        assert res.loc["foobar", "baz"] == "sam"
 
-    def test_set_value_with_index_dtype_change(self):
-        df_orig = DataFrame(
-            np.random.default_rng(2).standard_normal((3, 3)),
-            index=range(3),
-            columns=list("ABC"),
-        )
+def test_set_value_dt64(datetime_series):
+    idx = datetime_series.index[10]
+    res = datetime_series._set_value(idx, 0)
+    assert res is None
+    assert datetime_series[idx] == 0
 
-        # this is actually ambiguous as the 2 is interpreted as a positional
-        # so column is not created
-        df = df_orig.copy()
-        df._set_value("C", 2, 1.0)
-        assert list(df.index) == list(df_orig.index) + ["C"]
-        # assert list(df.columns) == list(df_orig.columns) + [2]
 
-        df = df_orig.copy()
-        df.loc["C", 2] = 1.0
-        assert list(df.index) == list(df_orig.index) + ["C"]
-        # assert list(df.columns) == list(df_orig.columns) + [2]
+def test_set_value_str_index(string_series):
+    # equiv
+    ser = string_series.copy()
+    res = ser._set_value("foobar", 0)
+    assert res is None
+    assert ser.index[-1] == "foobar"
+    assert ser["foobar"] == 0
 
-        # create both new
-        df = df_orig.copy()
-        df._set_value("C", "D", 1.0)
-        assert list(df.index) == list(df_orig.index) + ["C"]
-        assert list(df.columns) == list(df_orig.columns) + ["D"]
-
-        df = df_orig.copy()
-        df.loc["C", "D"] = 1.0
-        assert list(df.index) == list(df_orig.index) + ["C"]
-        assert list(df.columns) == list(df_orig.columns) + ["D"]
+    ser2 = string_series.copy()
+    ser2.loc["foobar"] = 0
+    assert ser2.index[-1] == "foobar"
+    assert ser2["foobar"] == 0

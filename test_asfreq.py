@@ -1,263 +1,828 @@
-from datetime import datetime
-
-import numpy as np
 import pytest
 
-from pandas._libs.tslibs.offsets import MonthEnd
+from pandas._libs.tslibs.period import INVALID_FREQ_ERR_MSG
+from pandas.errors import OutOfBoundsDatetime
 
 from pandas import (
-    DataFrame,
-    DatetimeIndex,
-    Series,
-    date_range,
-    period_range,
-    to_datetime,
+    Period,
+    Timestamp,
+    offsets,
 )
 import pandas._testing as tm
 
-from pandas.tseries import offsets
+bday_msg = "Period with BDay freq is deprecated"
 
 
-class TestAsFreq:
-    @pytest.fixture(params=["s", "ms", "us", "ns"])
-    def unit(self, request):
-        return request.param
+class TestFreqConversion:
+    """Test frequency conversion of date objects"""
 
-    def test_asfreq2(self, frame_or_series):
-        ts = frame_or_series(
-            [0.0, 1.0, 2.0],
-            index=DatetimeIndex(
-                [
-                    datetime(2009, 10, 30),
-                    datetime(2009, 11, 30),
-                    datetime(2009, 12, 31),
-                ],
-                dtype="M8[ns]",
-                freq="BME",
-            ),
+    @pytest.mark.filterwarnings("ignore:Period with BDay:FutureWarning")
+    @pytest.mark.parametrize("freq", ["Y", "Q", "M", "W", "B", "D"])
+    def test_asfreq_near_zero(self, freq):
+        # GH#19643, GH#19650
+        per = Period("0001-01-01", freq=freq)
+        tup1 = (per.year, per.hour, per.day)
+
+        prev = per - 1
+        assert prev.ordinal == per.ordinal - 1
+        tup2 = (prev.year, prev.month, prev.day)
+        assert tup2 < tup1
+
+    def test_asfreq_near_zero_weekly(self):
+        # GH#19834
+        per1 = Period("0001-01-01", "D") + 6
+        per2 = Period("0001-01-01", "D") - 6
+        week1 = per1.asfreq("W")
+        week2 = per2.asfreq("W")
+        assert week1 != week2
+        assert week1.asfreq("D", "E") >= per1
+        assert week2.asfreq("D", "S") <= per2
+
+    def test_to_timestamp_out_of_bounds(self):
+        # GH#19643, used to incorrectly give Timestamp in 1754
+        with tm.assert_produces_warning(FutureWarning, match=bday_msg):
+            per = Period("0001-01-01", freq="B")
+        msg = "Out of bounds nanosecond timestamp"
+        with pytest.raises(OutOfBoundsDatetime, match=msg):
+            with tm.assert_produces_warning(FutureWarning, match=bday_msg):
+                per.to_timestamp()
+
+    def test_asfreq_corner(self):
+        val = Period(freq="Y", year=2007)
+        result1 = val.asfreq("5min")
+        result2 = val.asfreq("min")
+        expected = Period("2007-12-31 23:59", freq="min")
+        assert result1.ordinal == expected.ordinal
+        assert result1.freqstr == "5min"
+        assert result2.ordinal == expected.ordinal
+        assert result2.freqstr == "min"
+
+    def test_conv_annual(self):
+        # frequency conversion tests: from Annual Frequency
+
+        ival_A = Period(freq="Y", year=2007)
+
+        ival_AJAN = Period(freq="Y-JAN", year=2007)
+        ival_AJUN = Period(freq="Y-JUN", year=2007)
+        ival_ANOV = Period(freq="Y-NOV", year=2007)
+
+        ival_A_to_Q_start = Period(freq="Q", year=2007, quarter=1)
+        ival_A_to_Q_end = Period(freq="Q", year=2007, quarter=4)
+        ival_A_to_M_start = Period(freq="M", year=2007, month=1)
+        ival_A_to_M_end = Period(freq="M", year=2007, month=12)
+        ival_A_to_W_start = Period(freq="W", year=2007, month=1, day=1)
+        ival_A_to_W_end = Period(freq="W", year=2007, month=12, day=31)
+        with tm.assert_produces_warning(FutureWarning, match=bday_msg):
+            ival_A_to_B_start = Period(freq="B", year=2007, month=1, day=1)
+            ival_A_to_B_end = Period(freq="B", year=2007, month=12, day=31)
+        ival_A_to_D_start = Period(freq="D", year=2007, month=1, day=1)
+        ival_A_to_D_end = Period(freq="D", year=2007, month=12, day=31)
+        ival_A_to_H_start = Period(freq="h", year=2007, month=1, day=1, hour=0)
+        ival_A_to_H_end = Period(freq="h", year=2007, month=12, day=31, hour=23)
+        ival_A_to_T_start = Period(
+            freq="Min", year=2007, month=1, day=1, hour=0, minute=0
+        )
+        ival_A_to_T_end = Period(
+            freq="Min", year=2007, month=12, day=31, hour=23, minute=59
+        )
+        ival_A_to_S_start = Period(
+            freq="s", year=2007, month=1, day=1, hour=0, minute=0, second=0
+        )
+        ival_A_to_S_end = Period(
+            freq="s", year=2007, month=12, day=31, hour=23, minute=59, second=59
         )
 
-        daily_ts = ts.asfreq("B")
-        monthly_ts = daily_ts.asfreq("BME")
-        tm.assert_equal(monthly_ts, ts)
+        ival_AJAN_to_D_end = Period(freq="D", year=2007, month=1, day=31)
+        ival_AJAN_to_D_start = Period(freq="D", year=2006, month=2, day=1)
+        ival_AJUN_to_D_end = Period(freq="D", year=2007, month=6, day=30)
+        ival_AJUN_to_D_start = Period(freq="D", year=2006, month=7, day=1)
+        ival_ANOV_to_D_end = Period(freq="D", year=2007, month=11, day=30)
+        ival_ANOV_to_D_start = Period(freq="D", year=2006, month=12, day=1)
 
-        daily_ts = ts.asfreq("B", method="pad")
-        monthly_ts = daily_ts.asfreq("BME")
-        tm.assert_equal(monthly_ts, ts)
+        assert ival_A.asfreq("Q", "s") == ival_A_to_Q_start
+        assert ival_A.asfreq("Q", "e") == ival_A_to_Q_end
+        assert ival_A.asfreq("M", "s") == ival_A_to_M_start
+        assert ival_A.asfreq("M", "E") == ival_A_to_M_end
+        assert ival_A.asfreq("W", "s") == ival_A_to_W_start
+        assert ival_A.asfreq("W", "E") == ival_A_to_W_end
+        with tm.assert_produces_warning(FutureWarning, match=bday_msg):
+            assert ival_A.asfreq("B", "s") == ival_A_to_B_start
+            assert ival_A.asfreq("B", "E") == ival_A_to_B_end
+        assert ival_A.asfreq("D", "s") == ival_A_to_D_start
+        assert ival_A.asfreq("D", "E") == ival_A_to_D_end
+        msg = "'H' is deprecated and will be removed in a future version."
+        with tm.assert_produces_warning(FutureWarning, match=msg):
+            assert ival_A.asfreq("H", "s") == ival_A_to_H_start
+            assert ival_A.asfreq("H", "E") == ival_A_to_H_end
+        assert ival_A.asfreq("min", "s") == ival_A_to_T_start
+        assert ival_A.asfreq("min", "E") == ival_A_to_T_end
+        msg = "'T' is deprecated and will be removed in a future version."
+        with tm.assert_produces_warning(FutureWarning, match=msg):
+            assert ival_A.asfreq("T", "s") == ival_A_to_T_start
+            assert ival_A.asfreq("T", "E") == ival_A_to_T_end
+        msg = "'S' is deprecated and will be removed in a future version."
+        with tm.assert_produces_warning(FutureWarning, match=msg):
+            assert ival_A.asfreq("S", "S") == ival_A_to_S_start
+            assert ival_A.asfreq("S", "E") == ival_A_to_S_end
 
-        daily_ts = ts.asfreq(offsets.BDay())
-        monthly_ts = daily_ts.asfreq(offsets.BMonthEnd())
-        tm.assert_equal(monthly_ts, ts)
+        assert ival_AJAN.asfreq("D", "s") == ival_AJAN_to_D_start
+        assert ival_AJAN.asfreq("D", "E") == ival_AJAN_to_D_end
 
-        result = ts[:0].asfreq("ME")
-        assert len(result) == 0
-        assert result is not ts
+        assert ival_AJUN.asfreq("D", "s") == ival_AJUN_to_D_start
+        assert ival_AJUN.asfreq("D", "E") == ival_AJUN_to_D_end
 
-        if frame_or_series is Series:
-            daily_ts = ts.asfreq("D", fill_value=-1)
-            result = daily_ts.value_counts().sort_index()
-            expected = Series(
-                [60, 1, 1, 1], index=[-1.0, 2.0, 1.0, 0.0], name="count"
-            ).sort_index()
-            tm.assert_series_equal(result, expected)
+        assert ival_ANOV.asfreq("D", "s") == ival_ANOV_to_D_start
+        assert ival_ANOV.asfreq("D", "E") == ival_ANOV_to_D_end
 
-    def test_asfreq_datetimeindex_empty(self, frame_or_series):
-        # GH#14320
-        index = DatetimeIndex(["2016-09-29 11:00"])
-        expected = frame_or_series(index=index, dtype=object).asfreq("h")
-        result = frame_or_series([3], index=index.copy()).asfreq("h")
-        tm.assert_index_equal(expected.index, result.index)
+        assert ival_A.asfreq("Y") == ival_A
 
-    @pytest.mark.parametrize("tz", ["US/Eastern", "dateutil/US/Eastern"])
-    def test_tz_aware_asfreq_smoke(self, tz, frame_or_series):
-        dr = date_range("2011-12-01", "2012-07-20", freq="D", tz=tz)
+    def test_conv_quarterly(self):
+        # frequency conversion tests: from Quarterly Frequency
 
-        obj = frame_or_series(
-            np.random.default_rng(2).standard_normal(len(dr)), index=dr
+        ival_Q = Period(freq="Q", year=2007, quarter=1)
+        ival_Q_end_of_year = Period(freq="Q", year=2007, quarter=4)
+
+        ival_QEJAN = Period(freq="Q-JAN", year=2007, quarter=1)
+        ival_QEJUN = Period(freq="Q-JUN", year=2007, quarter=1)
+
+        ival_Q_to_A = Period(freq="Y", year=2007)
+        ival_Q_to_M_start = Period(freq="M", year=2007, month=1)
+        ival_Q_to_M_end = Period(freq="M", year=2007, month=3)
+        ival_Q_to_W_start = Period(freq="W", year=2007, month=1, day=1)
+        ival_Q_to_W_end = Period(freq="W", year=2007, month=3, day=31)
+        with tm.assert_produces_warning(FutureWarning, match=bday_msg):
+            ival_Q_to_B_start = Period(freq="B", year=2007, month=1, day=1)
+            ival_Q_to_B_end = Period(freq="B", year=2007, month=3, day=30)
+        ival_Q_to_D_start = Period(freq="D", year=2007, month=1, day=1)
+        ival_Q_to_D_end = Period(freq="D", year=2007, month=3, day=31)
+        ival_Q_to_H_start = Period(freq="h", year=2007, month=1, day=1, hour=0)
+        ival_Q_to_H_end = Period(freq="h", year=2007, month=3, day=31, hour=23)
+        ival_Q_to_T_start = Period(
+            freq="Min", year=2007, month=1, day=1, hour=0, minute=0
+        )
+        ival_Q_to_T_end = Period(
+            freq="Min", year=2007, month=3, day=31, hour=23, minute=59
+        )
+        ival_Q_to_S_start = Period(
+            freq="s", year=2007, month=1, day=1, hour=0, minute=0, second=0
+        )
+        ival_Q_to_S_end = Period(
+            freq="s", year=2007, month=3, day=31, hour=23, minute=59, second=59
         )
 
-        # it works!
-        obj.asfreq("min")
+        ival_QEJAN_to_D_start = Period(freq="D", year=2006, month=2, day=1)
+        ival_QEJAN_to_D_end = Period(freq="D", year=2006, month=4, day=30)
 
-    def test_asfreq_normalize(self, frame_or_series):
-        rng = date_range("1/1/2000 09:30", periods=20)
-        norm = date_range("1/1/2000", periods=20)
+        ival_QEJUN_to_D_start = Period(freq="D", year=2006, month=7, day=1)
+        ival_QEJUN_to_D_end = Period(freq="D", year=2006, month=9, day=30)
 
-        vals = np.random.default_rng(2).standard_normal((20, 3))
+        assert ival_Q.asfreq("Y") == ival_Q_to_A
+        assert ival_Q_end_of_year.asfreq("Y") == ival_Q_to_A
 
-        obj = DataFrame(vals, index=rng)
-        expected = DataFrame(vals, index=norm)
-        if frame_or_series is Series:
-            obj = obj[0]
-            expected = expected[0]
+        assert ival_Q.asfreq("M", "s") == ival_Q_to_M_start
+        assert ival_Q.asfreq("M", "E") == ival_Q_to_M_end
+        assert ival_Q.asfreq("W", "s") == ival_Q_to_W_start
+        assert ival_Q.asfreq("W", "E") == ival_Q_to_W_end
+        with tm.assert_produces_warning(FutureWarning, match=bday_msg):
+            assert ival_Q.asfreq("B", "s") == ival_Q_to_B_start
+            assert ival_Q.asfreq("B", "E") == ival_Q_to_B_end
+        assert ival_Q.asfreq("D", "s") == ival_Q_to_D_start
+        assert ival_Q.asfreq("D", "E") == ival_Q_to_D_end
+        assert ival_Q.asfreq("h", "s") == ival_Q_to_H_start
+        assert ival_Q.asfreq("h", "E") == ival_Q_to_H_end
+        assert ival_Q.asfreq("Min", "s") == ival_Q_to_T_start
+        assert ival_Q.asfreq("Min", "E") == ival_Q_to_T_end
+        assert ival_Q.asfreq("s", "s") == ival_Q_to_S_start
+        assert ival_Q.asfreq("s", "E") == ival_Q_to_S_end
 
-        result = obj.asfreq("D", normalize=True)
-        tm.assert_equal(result, expected)
+        assert ival_QEJAN.asfreq("D", "s") == ival_QEJAN_to_D_start
+        assert ival_QEJAN.asfreq("D", "E") == ival_QEJAN_to_D_end
+        assert ival_QEJUN.asfreq("D", "s") == ival_QEJUN_to_D_start
+        assert ival_QEJUN.asfreq("D", "E") == ival_QEJUN_to_D_end
 
-    def test_asfreq_keep_index_name(self, frame_or_series):
-        # GH#9854
-        index_name = "bar"
-        index = date_range("20130101", periods=20, name=index_name)
-        obj = DataFrame(list(range(20)), columns=["foo"], index=index)
-        obj = tm.get_obj(obj, frame_or_series)
+        assert ival_Q.asfreq("Q") == ival_Q
 
-        assert index_name == obj.index.name
-        assert index_name == obj.asfreq("10D").index.name
+    def test_conv_monthly(self):
+        # frequency conversion tests: from Monthly Frequency
 
-    def test_asfreq_ts(self, frame_or_series):
-        index = period_range(freq="Y", start="1/1/2001", end="12/31/2010")
-        obj = DataFrame(
-            np.random.default_rng(2).standard_normal((len(index), 3)), index=index
+        ival_M = Period(freq="M", year=2007, month=1)
+        ival_M_end_of_year = Period(freq="M", year=2007, month=12)
+        ival_M_end_of_quarter = Period(freq="M", year=2007, month=3)
+        ival_M_to_A = Period(freq="Y", year=2007)
+        ival_M_to_Q = Period(freq="Q", year=2007, quarter=1)
+        ival_M_to_W_start = Period(freq="W", year=2007, month=1, day=1)
+        ival_M_to_W_end = Period(freq="W", year=2007, month=1, day=31)
+        with tm.assert_produces_warning(FutureWarning, match=bday_msg):
+            ival_M_to_B_start = Period(freq="B", year=2007, month=1, day=1)
+            ival_M_to_B_end = Period(freq="B", year=2007, month=1, day=31)
+        ival_M_to_D_start = Period(freq="D", year=2007, month=1, day=1)
+        ival_M_to_D_end = Period(freq="D", year=2007, month=1, day=31)
+        ival_M_to_H_start = Period(freq="h", year=2007, month=1, day=1, hour=0)
+        ival_M_to_H_end = Period(freq="h", year=2007, month=1, day=31, hour=23)
+        ival_M_to_T_start = Period(
+            freq="Min", year=2007, month=1, day=1, hour=0, minute=0
         )
-        obj = tm.get_obj(obj, frame_or_series)
-
-        result = obj.asfreq("D", how="end")
-        exp_index = index.asfreq("D", how="end")
-        assert len(result) == len(obj)
-        tm.assert_index_equal(result.index, exp_index)
-
-        result = obj.asfreq("D", how="start")
-        exp_index = index.asfreq("D", how="start")
-        assert len(result) == len(obj)
-        tm.assert_index_equal(result.index, exp_index)
-
-    def test_asfreq_resample_set_correct_freq(self, frame_or_series):
-        # GH#5613
-        # we test if .asfreq() and .resample() set the correct value for .freq
-        dti = to_datetime(["2012-01-01", "2012-01-02", "2012-01-03"])
-        obj = DataFrame({"col": [1, 2, 3]}, index=dti)
-        obj = tm.get_obj(obj, frame_or_series)
-
-        # testing the settings before calling .asfreq() and .resample()
-        assert obj.index.freq is None
-        assert obj.index.inferred_freq == "D"
-
-        # does .asfreq() set .freq correctly?
-        assert obj.asfreq("D").index.freq == "D"
-
-        # does .resample() set .freq correctly?
-        assert obj.resample("D").asfreq().index.freq == "D"
-
-    def test_asfreq_empty(self, datetime_frame):
-        # test does not blow up on length-0 DataFrame
-        zero_length = datetime_frame.reindex([])
-        result = zero_length.asfreq("BME")
-        assert result is not zero_length
-
-    def test_asfreq(self, datetime_frame):
-        offset_monthly = datetime_frame.asfreq(offsets.BMonthEnd())
-        rule_monthly = datetime_frame.asfreq("BME")
-
-        tm.assert_frame_equal(offset_monthly, rule_monthly)
-
-        rule_monthly.asfreq("B", method="pad")
-        # TODO: actually check that this worked.
-
-        # don't forget!
-        rule_monthly.asfreq("B", method="pad")
-
-    def test_asfreq_datetimeindex(self):
-        df = DataFrame(
-            {"A": [1, 2, 3]},
-            index=[datetime(2011, 11, 1), datetime(2011, 11, 2), datetime(2011, 11, 3)],
+        ival_M_to_T_end = Period(
+            freq="Min", year=2007, month=1, day=31, hour=23, minute=59
         )
-        df = df.asfreq("B")
-        assert isinstance(df.index, DatetimeIndex)
-
-        ts = df["A"].asfreq("B")
-        assert isinstance(ts.index, DatetimeIndex)
-
-    def test_asfreq_fillvalue(self):
-        # test for fill value during upsampling, related to issue 3715
-
-        # setup
-        rng = date_range("1/1/2016", periods=10, freq="2s")
-        # Explicit cast to 'float' to avoid implicit cast when setting None
-        ts = Series(np.arange(len(rng)), index=rng, dtype="float")
-        df = DataFrame({"one": ts})
-
-        # insert pre-existing missing value
-        df.loc["2016-01-01 00:00:08", "one"] = None
-
-        actual_df = df.asfreq(freq="1s", fill_value=9.0)
-        expected_df = df.asfreq(freq="1s").fillna(9.0)
-        expected_df.loc["2016-01-01 00:00:08", "one"] = None
-        tm.assert_frame_equal(expected_df, actual_df)
-
-        expected_series = ts.asfreq(freq="1s").fillna(9.0)
-        actual_series = ts.asfreq(freq="1s", fill_value=9.0)
-        tm.assert_series_equal(expected_series, actual_series)
-
-    def test_asfreq_with_date_object_index(self, frame_or_series):
-        rng = date_range("1/1/2000", periods=20)
-        ts = frame_or_series(np.random.default_rng(2).standard_normal(20), index=rng)
-
-        ts2 = ts.copy()
-        ts2.index = [x.date() for x in ts2.index]
-
-        result = ts2.asfreq("4h", method="ffill")
-        expected = ts.asfreq("4h", method="ffill")
-        tm.assert_equal(result, expected)
-
-    def test_asfreq_with_unsorted_index(self, frame_or_series):
-        # GH#39805
-        # Test that rows are not dropped when the datetime index is out of order
-        index = to_datetime(["2021-01-04", "2021-01-02", "2021-01-03", "2021-01-01"])
-        result = frame_or_series(range(4), index=index)
-
-        expected = result.reindex(sorted(index))
-        expected.index = expected.index._with_freq("infer")
-
-        result = result.asfreq("D")
-        tm.assert_equal(result, expected)
-
-    def test_asfreq_after_normalize(self, unit):
-        # https://github.com/pandas-dev/pandas/issues/50727
-        result = DatetimeIndex(
-            date_range("2000", periods=2).as_unit(unit).normalize(), freq="D"
+        ival_M_to_S_start = Period(
+            freq="s", year=2007, month=1, day=1, hour=0, minute=0, second=0
         )
-        expected = DatetimeIndex(["2000-01-01", "2000-01-02"], freq="D").as_unit(unit)
-        tm.assert_index_equal(result, expected)
+        ival_M_to_S_end = Period(
+            freq="s", year=2007, month=1, day=31, hour=23, minute=59, second=59
+        )
 
-    @pytest.mark.parametrize(
-        "freq, freq_half",
-        [
-            ("2ME", "ME"),
-            (MonthEnd(2), MonthEnd(1)),
-        ],
-    )
-    def test_asfreq_2ME(self, freq, freq_half):
-        index = date_range("1/1/2000", periods=6, freq=freq_half)
-        df = DataFrame({"s": Series([0.0, 1.0, 2.0, 3.0, 4.0, 5.0], index=index)})
-        expected = df.asfreq(freq=freq)
+        assert ival_M.asfreq("Y") == ival_M_to_A
+        assert ival_M_end_of_year.asfreq("Y") == ival_M_to_A
+        assert ival_M.asfreq("Q") == ival_M_to_Q
+        assert ival_M_end_of_quarter.asfreq("Q") == ival_M_to_Q
 
-        index = date_range("1/1/2000", periods=3, freq=freq)
-        result = DataFrame({"s": Series([0.0, 2.0, 4.0], index=index)})
-        tm.assert_frame_equal(result, expected)
+        assert ival_M.asfreq("W", "s") == ival_M_to_W_start
+        assert ival_M.asfreq("W", "E") == ival_M_to_W_end
+        with tm.assert_produces_warning(FutureWarning, match=bday_msg):
+            assert ival_M.asfreq("B", "s") == ival_M_to_B_start
+            assert ival_M.asfreq("B", "E") == ival_M_to_B_end
+        assert ival_M.asfreq("D", "s") == ival_M_to_D_start
+        assert ival_M.asfreq("D", "E") == ival_M_to_D_end
+        assert ival_M.asfreq("h", "s") == ival_M_to_H_start
+        assert ival_M.asfreq("h", "E") == ival_M_to_H_end
+        assert ival_M.asfreq("Min", "s") == ival_M_to_T_start
+        assert ival_M.asfreq("Min", "E") == ival_M_to_T_end
+        assert ival_M.asfreq("s", "s") == ival_M_to_S_start
+        assert ival_M.asfreq("s", "E") == ival_M_to_S_end
 
-    @pytest.mark.parametrize(
-        "freq, freq_depr",
-        [
-            ("2ME", "2M"),
-            ("2QE", "2Q"),
-            ("2QE-SEP", "2Q-SEP"),
-            ("1BQE", "1BQ"),
-            ("2BQE-SEP", "2BQ-SEP"),
-            ("1YE", "1Y"),
-            ("2YE-MAR", "2Y-MAR"),
-            ("1YE", "1A"),
-            ("2YE-MAR", "2A-MAR"),
-            ("2BYE-MAR", "2BA-MAR"),
-        ],
-    )
-    def test_asfreq_frequency_M_Q_Y_A_deprecated(self, freq, freq_depr):
-        # GH#9586, #55978
-        depr_msg = f"'{freq_depr[1:]}' is deprecated and will be removed "
-        f"in a future version, please use '{freq[1:]}' instead."
+        assert ival_M.asfreq("M") == ival_M
 
-        index = date_range("1/1/2000", periods=4, freq=f"{freq[1:]}")
-        df = DataFrame({"s": Series([0.0, 1.0, 2.0, 3.0], index=index)})
-        expected = df.asfreq(freq=freq)
-        with tm.assert_produces_warning(FutureWarning, match=depr_msg):
-            result = df.asfreq(freq=freq_depr)
-        tm.assert_frame_equal(result, expected)
+    def test_conv_weekly(self):
+        # frequency conversion tests: from Weekly Frequency
+        ival_W = Period(freq="W", year=2007, month=1, day=1)
+
+        ival_WSUN = Period(freq="W", year=2007, month=1, day=7)
+        ival_WSAT = Period(freq="W-SAT", year=2007, month=1, day=6)
+        ival_WFRI = Period(freq="W-FRI", year=2007, month=1, day=5)
+        ival_WTHU = Period(freq="W-THU", year=2007, month=1, day=4)
+        ival_WWED = Period(freq="W-WED", year=2007, month=1, day=3)
+        ival_WTUE = Period(freq="W-TUE", year=2007, month=1, day=2)
+        ival_WMON = Period(freq="W-MON", year=2007, month=1, day=1)
+
+        ival_WSUN_to_D_start = Period(freq="D", year=2007, month=1, day=1)
+        ival_WSUN_to_D_end = Period(freq="D", year=2007, month=1, day=7)
+        ival_WSAT_to_D_start = Period(freq="D", year=2006, month=12, day=31)
+        ival_WSAT_to_D_end = Period(freq="D", year=2007, month=1, day=6)
+        ival_WFRI_to_D_start = Period(freq="D", year=2006, month=12, day=30)
+        ival_WFRI_to_D_end = Period(freq="D", year=2007, month=1, day=5)
+        ival_WTHU_to_D_start = Period(freq="D", year=2006, month=12, day=29)
+        ival_WTHU_to_D_end = Period(freq="D", year=2007, month=1, day=4)
+        ival_WWED_to_D_start = Period(freq="D", year=2006, month=12, day=28)
+        ival_WWED_to_D_end = Period(freq="D", year=2007, month=1, day=3)
+        ival_WTUE_to_D_start = Period(freq="D", year=2006, month=12, day=27)
+        ival_WTUE_to_D_end = Period(freq="D", year=2007, month=1, day=2)
+        ival_WMON_to_D_start = Period(freq="D", year=2006, month=12, day=26)
+        ival_WMON_to_D_end = Period(freq="D", year=2007, month=1, day=1)
+
+        ival_W_end_of_year = Period(freq="W", year=2007, month=12, day=31)
+        ival_W_end_of_quarter = Period(freq="W", year=2007, month=3, day=31)
+        ival_W_end_of_month = Period(freq="W", year=2007, month=1, day=31)
+        ival_W_to_A = Period(freq="Y", year=2007)
+        ival_W_to_Q = Period(freq="Q", year=2007, quarter=1)
+        ival_W_to_M = Period(freq="M", year=2007, month=1)
+
+        if Period(freq="D", year=2007, month=12, day=31).weekday == 6:
+            ival_W_to_A_end_of_year = Period(freq="Y", year=2007)
+        else:
+            ival_W_to_A_end_of_year = Period(freq="Y", year=2008)
+
+        if Period(freq="D", year=2007, month=3, day=31).weekday == 6:
+            ival_W_to_Q_end_of_quarter = Period(freq="Q", year=2007, quarter=1)
+        else:
+            ival_W_to_Q_end_of_quarter = Period(freq="Q", year=2007, quarter=2)
+
+        if Period(freq="D", year=2007, month=1, day=31).weekday == 6:
+            ival_W_to_M_end_of_month = Period(freq="M", year=2007, month=1)
+        else:
+            ival_W_to_M_end_of_month = Period(freq="M", year=2007, month=2)
+
+        with tm.assert_produces_warning(FutureWarning, match=bday_msg):
+            ival_W_to_B_start = Period(freq="B", year=2007, month=1, day=1)
+            ival_W_to_B_end = Period(freq="B", year=2007, month=1, day=5)
+        ival_W_to_D_start = Period(freq="D", year=2007, month=1, day=1)
+        ival_W_to_D_end = Period(freq="D", year=2007, month=1, day=7)
+        ival_W_to_H_start = Period(freq="h", year=2007, month=1, day=1, hour=0)
+        ival_W_to_H_end = Period(freq="h", year=2007, month=1, day=7, hour=23)
+        ival_W_to_T_start = Period(
+            freq="Min", year=2007, month=1, day=1, hour=0, minute=0
+        )
+        ival_W_to_T_end = Period(
+            freq="Min", year=2007, month=1, day=7, hour=23, minute=59
+        )
+        ival_W_to_S_start = Period(
+            freq="s", year=2007, month=1, day=1, hour=0, minute=0, second=0
+        )
+        ival_W_to_S_end = Period(
+            freq="s", year=2007, month=1, day=7, hour=23, minute=59, second=59
+        )
+
+        assert ival_W.asfreq("Y") == ival_W_to_A
+        assert ival_W_end_of_year.asfreq("Y") == ival_W_to_A_end_of_year
+
+        assert ival_W.asfreq("Q") == ival_W_to_Q
+        assert ival_W_end_of_quarter.asfreq("Q") == ival_W_to_Q_end_of_quarter
+
+        assert ival_W.asfreq("M") == ival_W_to_M
+        assert ival_W_end_of_month.asfreq("M") == ival_W_to_M_end_of_month
+
+        with tm.assert_produces_warning(FutureWarning, match=bday_msg):
+            assert ival_W.asfreq("B", "s") == ival_W_to_B_start
+            assert ival_W.asfreq("B", "E") == ival_W_to_B_end
+
+        assert ival_W.asfreq("D", "s") == ival_W_to_D_start
+        assert ival_W.asfreq("D", "E") == ival_W_to_D_end
+
+        assert ival_WSUN.asfreq("D", "s") == ival_WSUN_to_D_start
+        assert ival_WSUN.asfreq("D", "E") == ival_WSUN_to_D_end
+        assert ival_WSAT.asfreq("D", "s") == ival_WSAT_to_D_start
+        assert ival_WSAT.asfreq("D", "E") == ival_WSAT_to_D_end
+        assert ival_WFRI.asfreq("D", "s") == ival_WFRI_to_D_start
+        assert ival_WFRI.asfreq("D", "E") == ival_WFRI_to_D_end
+        assert ival_WTHU.asfreq("D", "s") == ival_WTHU_to_D_start
+        assert ival_WTHU.asfreq("D", "E") == ival_WTHU_to_D_end
+        assert ival_WWED.asfreq("D", "s") == ival_WWED_to_D_start
+        assert ival_WWED.asfreq("D", "E") == ival_WWED_to_D_end
+        assert ival_WTUE.asfreq("D", "s") == ival_WTUE_to_D_start
+        assert ival_WTUE.asfreq("D", "E") == ival_WTUE_to_D_end
+        assert ival_WMON.asfreq("D", "s") == ival_WMON_to_D_start
+        assert ival_WMON.asfreq("D", "E") == ival_WMON_to_D_end
+
+        assert ival_W.asfreq("h", "s") == ival_W_to_H_start
+        assert ival_W.asfreq("h", "E") == ival_W_to_H_end
+        assert ival_W.asfreq("Min", "s") == ival_W_to_T_start
+        assert ival_W.asfreq("Min", "E") == ival_W_to_T_end
+        assert ival_W.asfreq("s", "s") == ival_W_to_S_start
+        assert ival_W.asfreq("s", "E") == ival_W_to_S_end
+
+        assert ival_W.asfreq("W") == ival_W
+
+        msg = INVALID_FREQ_ERR_MSG
+        with pytest.raises(ValueError, match=msg):
+            ival_W.asfreq("WK")
+
+    def test_conv_weekly_legacy(self):
+        # frequency conversion tests: from Weekly Frequency
+        msg = INVALID_FREQ_ERR_MSG
+        with pytest.raises(ValueError, match=msg):
+            Period(freq="WK", year=2007, month=1, day=1)
+
+        with pytest.raises(ValueError, match=msg):
+            Period(freq="WK-SAT", year=2007, month=1, day=6)
+        with pytest.raises(ValueError, match=msg):
+            Period(freq="WK-FRI", year=2007, month=1, day=5)
+        with pytest.raises(ValueError, match=msg):
+            Period(freq="WK-THU", year=2007, month=1, day=4)
+        with pytest.raises(ValueError, match=msg):
+            Period(freq="WK-WED", year=2007, month=1, day=3)
+        with pytest.raises(ValueError, match=msg):
+            Period(freq="WK-TUE", year=2007, month=1, day=2)
+        with pytest.raises(ValueError, match=msg):
+            Period(freq="WK-MON", year=2007, month=1, day=1)
+
+    def test_conv_business(self):
+        # frequency conversion tests: from Business Frequency"
+
+        with tm.assert_produces_warning(FutureWarning, match=bday_msg):
+            ival_B = Period(freq="B", year=2007, month=1, day=1)
+            ival_B_end_of_year = Period(freq="B", year=2007, month=12, day=31)
+            ival_B_end_of_quarter = Period(freq="B", year=2007, month=3, day=30)
+            ival_B_end_of_month = Period(freq="B", year=2007, month=1, day=31)
+            ival_B_end_of_week = Period(freq="B", year=2007, month=1, day=5)
+
+        ival_B_to_A = Period(freq="Y", year=2007)
+        ival_B_to_Q = Period(freq="Q", year=2007, quarter=1)
+        ival_B_to_M = Period(freq="M", year=2007, month=1)
+        ival_B_to_W = Period(freq="W", year=2007, month=1, day=7)
+        ival_B_to_D = Period(freq="D", year=2007, month=1, day=1)
+        ival_B_to_H_start = Period(freq="h", year=2007, month=1, day=1, hour=0)
+        ival_B_to_H_end = Period(freq="h", year=2007, month=1, day=1, hour=23)
+        ival_B_to_T_start = Period(
+            freq="Min", year=2007, month=1, day=1, hour=0, minute=0
+        )
+        ival_B_to_T_end = Period(
+            freq="Min", year=2007, month=1, day=1, hour=23, minute=59
+        )
+        ival_B_to_S_start = Period(
+            freq="s", year=2007, month=1, day=1, hour=0, minute=0, second=0
+        )
+        ival_B_to_S_end = Period(
+            freq="s", year=2007, month=1, day=1, hour=23, minute=59, second=59
+        )
+
+        assert ival_B.asfreq("Y") == ival_B_to_A
+        assert ival_B_end_of_year.asfreq("Y") == ival_B_to_A
+        assert ival_B.asfreq("Q") == ival_B_to_Q
+        assert ival_B_end_of_quarter.asfreq("Q") == ival_B_to_Q
+        assert ival_B.asfreq("M") == ival_B_to_M
+        assert ival_B_end_of_month.asfreq("M") == ival_B_to_M
+        assert ival_B.asfreq("W") == ival_B_to_W
+        assert ival_B_end_of_week.asfreq("W") == ival_B_to_W
+
+        assert ival_B.asfreq("D") == ival_B_to_D
+
+        assert ival_B.asfreq("h", "s") == ival_B_to_H_start
+        assert ival_B.asfreq("h", "E") == ival_B_to_H_end
+        assert ival_B.asfreq("Min", "s") == ival_B_to_T_start
+        assert ival_B.asfreq("Min", "E") == ival_B_to_T_end
+        assert ival_B.asfreq("s", "s") == ival_B_to_S_start
+        assert ival_B.asfreq("s", "E") == ival_B_to_S_end
+
+        with tm.assert_produces_warning(FutureWarning, match=bday_msg):
+            assert ival_B.asfreq("B") == ival_B
+
+    def test_conv_daily(self):
+        # frequency conversion tests: from Business Frequency"
+
+        ival_D = Period(freq="D", year=2007, month=1, day=1)
+        ival_D_end_of_year = Period(freq="D", year=2007, month=12, day=31)
+        ival_D_end_of_quarter = Period(freq="D", year=2007, month=3, day=31)
+        ival_D_end_of_month = Period(freq="D", year=2007, month=1, day=31)
+        ival_D_end_of_week = Period(freq="D", year=2007, month=1, day=7)
+
+        ival_D_friday = Period(freq="D", year=2007, month=1, day=5)
+        ival_D_saturday = Period(freq="D", year=2007, month=1, day=6)
+        ival_D_sunday = Period(freq="D", year=2007, month=1, day=7)
+
+        with tm.assert_produces_warning(FutureWarning, match=bday_msg):
+            ival_B_friday = Period(freq="B", year=2007, month=1, day=5)
+            ival_B_monday = Period(freq="B", year=2007, month=1, day=8)
+
+        ival_D_to_A = Period(freq="Y", year=2007)
+
+        ival_Deoq_to_AJAN = Period(freq="Y-JAN", year=2008)
+        ival_Deoq_to_AJUN = Period(freq="Y-JUN", year=2007)
+        ival_Deoq_to_ADEC = Period(freq="Y-DEC", year=2007)
+
+        ival_D_to_QEJAN = Period(freq="Q-JAN", year=2007, quarter=4)
+        ival_D_to_QEJUN = Period(freq="Q-JUN", year=2007, quarter=3)
+        ival_D_to_QEDEC = Period(freq="Q-DEC", year=2007, quarter=1)
+
+        ival_D_to_M = Period(freq="M", year=2007, month=1)
+        ival_D_to_W = Period(freq="W", year=2007, month=1, day=7)
+
+        ival_D_to_H_start = Period(freq="h", year=2007, month=1, day=1, hour=0)
+        ival_D_to_H_end = Period(freq="h", year=2007, month=1, day=1, hour=23)
+        ival_D_to_T_start = Period(
+            freq="Min", year=2007, month=1, day=1, hour=0, minute=0
+        )
+        ival_D_to_T_end = Period(
+            freq="Min", year=2007, month=1, day=1, hour=23, minute=59
+        )
+        ival_D_to_S_start = Period(
+            freq="s", year=2007, month=1, day=1, hour=0, minute=0, second=0
+        )
+        ival_D_to_S_end = Period(
+            freq="s", year=2007, month=1, day=1, hour=23, minute=59, second=59
+        )
+
+        assert ival_D.asfreq("Y") == ival_D_to_A
+
+        assert ival_D_end_of_quarter.asfreq("Y-JAN") == ival_Deoq_to_AJAN
+        assert ival_D_end_of_quarter.asfreq("Y-JUN") == ival_Deoq_to_AJUN
+        assert ival_D_end_of_quarter.asfreq("Y-DEC") == ival_Deoq_to_ADEC
+
+        assert ival_D_end_of_year.asfreq("Y") == ival_D_to_A
+        assert ival_D_end_of_quarter.asfreq("Q") == ival_D_to_QEDEC
+        assert ival_D.asfreq("Q-JAN") == ival_D_to_QEJAN
+        assert ival_D.asfreq("Q-JUN") == ival_D_to_QEJUN
+        assert ival_D.asfreq("Q-DEC") == ival_D_to_QEDEC
+        assert ival_D.asfreq("M") == ival_D_to_M
+        assert ival_D_end_of_month.asfreq("M") == ival_D_to_M
+        assert ival_D.asfreq("W") == ival_D_to_W
+        assert ival_D_end_of_week.asfreq("W") == ival_D_to_W
+
+        with tm.assert_produces_warning(FutureWarning, match=bday_msg):
+            assert ival_D_friday.asfreq("B") == ival_B_friday
+            assert ival_D_saturday.asfreq("B", "s") == ival_B_friday
+            assert ival_D_saturday.asfreq("B", "E") == ival_B_monday
+            assert ival_D_sunday.asfreq("B", "s") == ival_B_friday
+            assert ival_D_sunday.asfreq("B", "E") == ival_B_monday
+
+        assert ival_D.asfreq("h", "s") == ival_D_to_H_start
+        assert ival_D.asfreq("h", "E") == ival_D_to_H_end
+        assert ival_D.asfreq("Min", "s") == ival_D_to_T_start
+        assert ival_D.asfreq("Min", "E") == ival_D_to_T_end
+        assert ival_D.asfreq("s", "s") == ival_D_to_S_start
+        assert ival_D.asfreq("s", "E") == ival_D_to_S_end
+
+        assert ival_D.asfreq("D") == ival_D
+
+    def test_conv_hourly(self):
+        # frequency conversion tests: from Hourly Frequency"
+
+        ival_H = Period(freq="h", year=2007, month=1, day=1, hour=0)
+        ival_H_end_of_year = Period(freq="h", year=2007, month=12, day=31, hour=23)
+        ival_H_end_of_quarter = Period(freq="h", year=2007, month=3, day=31, hour=23)
+        ival_H_end_of_month = Period(freq="h", year=2007, month=1, day=31, hour=23)
+        ival_H_end_of_week = Period(freq="h", year=2007, month=1, day=7, hour=23)
+        ival_H_end_of_day = Period(freq="h", year=2007, month=1, day=1, hour=23)
+        ival_H_end_of_bus = Period(freq="h", year=2007, month=1, day=1, hour=23)
+
+        ival_H_to_A = Period(freq="Y", year=2007)
+        ival_H_to_Q = Period(freq="Q", year=2007, quarter=1)
+        ival_H_to_M = Period(freq="M", year=2007, month=1)
+        ival_H_to_W = Period(freq="W", year=2007, month=1, day=7)
+        ival_H_to_D = Period(freq="D", year=2007, month=1, day=1)
+        with tm.assert_produces_warning(FutureWarning, match=bday_msg):
+            ival_H_to_B = Period(freq="B", year=2007, month=1, day=1)
+
+        ival_H_to_T_start = Period(
+            freq="Min", year=2007, month=1, day=1, hour=0, minute=0
+        )
+        ival_H_to_T_end = Period(
+            freq="Min", year=2007, month=1, day=1, hour=0, minute=59
+        )
+        ival_H_to_S_start = Period(
+            freq="s", year=2007, month=1, day=1, hour=0, minute=0, second=0
+        )
+        ival_H_to_S_end = Period(
+            freq="s", year=2007, month=1, day=1, hour=0, minute=59, second=59
+        )
+
+        assert ival_H.asfreq("Y") == ival_H_to_A
+        assert ival_H_end_of_year.asfreq("Y") == ival_H_to_A
+        assert ival_H.asfreq("Q") == ival_H_to_Q
+        assert ival_H_end_of_quarter.asfreq("Q") == ival_H_to_Q
+        assert ival_H.asfreq("M") == ival_H_to_M
+        assert ival_H_end_of_month.asfreq("M") == ival_H_to_M
+        assert ival_H.asfreq("W") == ival_H_to_W
+        assert ival_H_end_of_week.asfreq("W") == ival_H_to_W
+        assert ival_H.asfreq("D") == ival_H_to_D
+        assert ival_H_end_of_day.asfreq("D") == ival_H_to_D
+        with tm.assert_produces_warning(FutureWarning, match=bday_msg):
+            assert ival_H.asfreq("B") == ival_H_to_B
+            assert ival_H_end_of_bus.asfreq("B") == ival_H_to_B
+
+        assert ival_H.asfreq("Min", "s") == ival_H_to_T_start
+        assert ival_H.asfreq("Min", "E") == ival_H_to_T_end
+        assert ival_H.asfreq("s", "s") == ival_H_to_S_start
+        assert ival_H.asfreq("s", "E") == ival_H_to_S_end
+
+        assert ival_H.asfreq("h") == ival_H
+
+    def test_conv_minutely(self):
+        # frequency conversion tests: from Minutely Frequency"
+
+        ival_T = Period(freq="Min", year=2007, month=1, day=1, hour=0, minute=0)
+        ival_T_end_of_year = Period(
+            freq="Min", year=2007, month=12, day=31, hour=23, minute=59
+        )
+        ival_T_end_of_quarter = Period(
+            freq="Min", year=2007, month=3, day=31, hour=23, minute=59
+        )
+        ival_T_end_of_month = Period(
+            freq="Min", year=2007, month=1, day=31, hour=23, minute=59
+        )
+        ival_T_end_of_week = Period(
+            freq="Min", year=2007, month=1, day=7, hour=23, minute=59
+        )
+        ival_T_end_of_day = Period(
+            freq="Min", year=2007, month=1, day=1, hour=23, minute=59
+        )
+        ival_T_end_of_bus = Period(
+            freq="Min", year=2007, month=1, day=1, hour=23, minute=59
+        )
+        ival_T_end_of_hour = Period(
+            freq="Min", year=2007, month=1, day=1, hour=0, minute=59
+        )
+
+        ival_T_to_A = Period(freq="Y", year=2007)
+        ival_T_to_Q = Period(freq="Q", year=2007, quarter=1)
+        ival_T_to_M = Period(freq="M", year=2007, month=1)
+        ival_T_to_W = Period(freq="W", year=2007, month=1, day=7)
+        ival_T_to_D = Period(freq="D", year=2007, month=1, day=1)
+        with tm.assert_produces_warning(FutureWarning, match=bday_msg):
+            ival_T_to_B = Period(freq="B", year=2007, month=1, day=1)
+        ival_T_to_H = Period(freq="h", year=2007, month=1, day=1, hour=0)
+
+        ival_T_to_S_start = Period(
+            freq="s", year=2007, month=1, day=1, hour=0, minute=0, second=0
+        )
+        ival_T_to_S_end = Period(
+            freq="s", year=2007, month=1, day=1, hour=0, minute=0, second=59
+        )
+
+        assert ival_T.asfreq("Y") == ival_T_to_A
+        assert ival_T_end_of_year.asfreq("Y") == ival_T_to_A
+        assert ival_T.asfreq("Q") == ival_T_to_Q
+        assert ival_T_end_of_quarter.asfreq("Q") == ival_T_to_Q
+        assert ival_T.asfreq("M") == ival_T_to_M
+        assert ival_T_end_of_month.asfreq("M") == ival_T_to_M
+        assert ival_T.asfreq("W") == ival_T_to_W
+        assert ival_T_end_of_week.asfreq("W") == ival_T_to_W
+        assert ival_T.asfreq("D") == ival_T_to_D
+        assert ival_T_end_of_day.asfreq("D") == ival_T_to_D
+        with tm.assert_produces_warning(FutureWarning, match=bday_msg):
+            assert ival_T.asfreq("B") == ival_T_to_B
+            assert ival_T_end_of_bus.asfreq("B") == ival_T_to_B
+        assert ival_T.asfreq("h") == ival_T_to_H
+        assert ival_T_end_of_hour.asfreq("h") == ival_T_to_H
+
+        assert ival_T.asfreq("s", "s") == ival_T_to_S_start
+        assert ival_T.asfreq("s", "E") == ival_T_to_S_end
+
+        assert ival_T.asfreq("Min") == ival_T
+
+    def test_conv_secondly(self):
+        # frequency conversion tests: from Secondly Frequency"
+
+        ival_S = Period(freq="s", year=2007, month=1, day=1, hour=0, minute=0, second=0)
+        ival_S_end_of_year = Period(
+            freq="s", year=2007, month=12, day=31, hour=23, minute=59, second=59
+        )
+        ival_S_end_of_quarter = Period(
+            freq="s", year=2007, month=3, day=31, hour=23, minute=59, second=59
+        )
+        ival_S_end_of_month = Period(
+            freq="s", year=2007, month=1, day=31, hour=23, minute=59, second=59
+        )
+        ival_S_end_of_week = Period(
+            freq="s", year=2007, month=1, day=7, hour=23, minute=59, second=59
+        )
+        ival_S_end_of_day = Period(
+            freq="s", year=2007, month=1, day=1, hour=23, minute=59, second=59
+        )
+        ival_S_end_of_bus = Period(
+            freq="s", year=2007, month=1, day=1, hour=23, minute=59, second=59
+        )
+        ival_S_end_of_hour = Period(
+            freq="s", year=2007, month=1, day=1, hour=0, minute=59, second=59
+        )
+        ival_S_end_of_minute = Period(
+            freq="s", year=2007, month=1, day=1, hour=0, minute=0, second=59
+        )
+
+        ival_S_to_A = Period(freq="Y", year=2007)
+        ival_S_to_Q = Period(freq="Q", year=2007, quarter=1)
+        ival_S_to_M = Period(freq="M", year=2007, month=1)
+        ival_S_to_W = Period(freq="W", year=2007, month=1, day=7)
+        ival_S_to_D = Period(freq="D", year=2007, month=1, day=1)
+        with tm.assert_produces_warning(FutureWarning, match=bday_msg):
+            ival_S_to_B = Period(freq="B", year=2007, month=1, day=1)
+        ival_S_to_H = Period(freq="h", year=2007, month=1, day=1, hour=0)
+        ival_S_to_T = Period(freq="Min", year=2007, month=1, day=1, hour=0, minute=0)
+
+        assert ival_S.asfreq("Y") == ival_S_to_A
+        assert ival_S_end_of_year.asfreq("Y") == ival_S_to_A
+        assert ival_S.asfreq("Q") == ival_S_to_Q
+        assert ival_S_end_of_quarter.asfreq("Q") == ival_S_to_Q
+        assert ival_S.asfreq("M") == ival_S_to_M
+        assert ival_S_end_of_month.asfreq("M") == ival_S_to_M
+        assert ival_S.asfreq("W") == ival_S_to_W
+        assert ival_S_end_of_week.asfreq("W") == ival_S_to_W
+        assert ival_S.asfreq("D") == ival_S_to_D
+        assert ival_S_end_of_day.asfreq("D") == ival_S_to_D
+        with tm.assert_produces_warning(FutureWarning, match=bday_msg):
+            assert ival_S.asfreq("B") == ival_S_to_B
+            assert ival_S_end_of_bus.asfreq("B") == ival_S_to_B
+        assert ival_S.asfreq("h") == ival_S_to_H
+        assert ival_S_end_of_hour.asfreq("h") == ival_S_to_H
+        assert ival_S.asfreq("Min") == ival_S_to_T
+        assert ival_S_end_of_minute.asfreq("Min") == ival_S_to_T
+
+        assert ival_S.asfreq("s") == ival_S
+
+    def test_conv_microsecond(self):
+        # GH#31475 Avoid floating point errors dropping the start_time to
+        #  before the beginning of the Period
+        per = Period("2020-01-30 15:57:27.576166", freq="us")
+        assert per.ordinal == 1580399847576166
+
+        start = per.start_time
+        expected = Timestamp("2020-01-30 15:57:27.576166")
+        assert start == expected
+        assert start._value == per.ordinal * 1000
+
+        per2 = Period("2300-01-01", "us")
+        msg = "2300-01-01"
+        with pytest.raises(OutOfBoundsDatetime, match=msg):
+            per2.start_time
+        with pytest.raises(OutOfBoundsDatetime, match=msg):
+            per2.end_time
+
+    def test_asfreq_mult(self):
+        # normal freq to mult freq
+        p = Period(freq="Y", year=2007)
+        # ordinal will not change
+        for freq in ["3Y", offsets.YearEnd(3)]:
+            result = p.asfreq(freq)
+            expected = Period("2007", freq="3Y")
+
+            assert result == expected
+            assert result.ordinal == expected.ordinal
+            assert result.freq == expected.freq
+        # ordinal will not change
+        for freq in ["3Y", offsets.YearEnd(3)]:
+            result = p.asfreq(freq, how="S")
+            expected = Period("2007", freq="3Y")
+
+            assert result == expected
+            assert result.ordinal == expected.ordinal
+            assert result.freq == expected.freq
+
+        # mult freq to normal freq
+        p = Period(freq="3Y", year=2007)
+        # ordinal will change because how=E is the default
+        for freq in ["Y", offsets.YearEnd()]:
+            result = p.asfreq(freq)
+            expected = Period("2009", freq="Y")
+
+            assert result == expected
+            assert result.ordinal == expected.ordinal
+            assert result.freq == expected.freq
+        # ordinal will not change
+        for freq in ["Y", offsets.YearEnd()]:
+            result = p.asfreq(freq, how="s")
+            expected = Period("2007", freq="Y")
+
+            assert result == expected
+            assert result.ordinal == expected.ordinal
+            assert result.freq == expected.freq
+
+        p = Period(freq="Y", year=2007)
+        for freq in ["2M", offsets.MonthEnd(2)]:
+            result = p.asfreq(freq)
+            expected = Period("2007-12", freq="2M")
+
+            assert result == expected
+            assert result.ordinal == expected.ordinal
+            assert result.freq == expected.freq
+        for freq in ["2M", offsets.MonthEnd(2)]:
+            result = p.asfreq(freq, how="s")
+            expected = Period("2007-01", freq="2M")
+
+            assert result == expected
+            assert result.ordinal == expected.ordinal
+            assert result.freq == expected.freq
+
+        p = Period(freq="3Y", year=2007)
+        for freq in ["2M", offsets.MonthEnd(2)]:
+            result = p.asfreq(freq)
+            expected = Period("2009-12", freq="2M")
+
+            assert result == expected
+            assert result.ordinal == expected.ordinal
+            assert result.freq == expected.freq
+        for freq in ["2M", offsets.MonthEnd(2)]:
+            result = p.asfreq(freq, how="s")
+            expected = Period("2007-01", freq="2M")
+
+            assert result == expected
+            assert result.ordinal == expected.ordinal
+            assert result.freq == expected.freq
+
+    def test_asfreq_combined(self):
+        # normal freq to combined freq
+        p = Period("2007", freq="h")
+
+        # ordinal will not change
+        expected = Period("2007", freq="25h")
+        for freq, how in zip(["1D1h", "1h1D"], ["E", "S"]):
+            result = p.asfreq(freq, how=how)
+            assert result == expected
+            assert result.ordinal == expected.ordinal
+            assert result.freq == expected.freq
+
+        # combined freq to normal freq
+        p1 = Period(freq="1D1h", year=2007)
+        p2 = Period(freq="1h1D", year=2007)
+
+        # ordinal will change because how=E is the default
+        result1 = p1.asfreq("h")
+        result2 = p2.asfreq("h")
+        expected = Period("2007-01-02", freq="h")
+        assert result1 == expected
+        assert result1.ordinal == expected.ordinal
+        assert result1.freq == expected.freq
+        assert result2 == expected
+        assert result2.ordinal == expected.ordinal
+        assert result2.freq == expected.freq
+
+        # ordinal will not change
+        result1 = p1.asfreq("h", how="S")
+        result2 = p2.asfreq("h", how="S")
+        expected = Period("2007-01-01", freq="h")
+        assert result1 == expected
+        assert result1.ordinal == expected.ordinal
+        assert result1.freq == expected.freq
+        assert result2 == expected
+        assert result2.ordinal == expected.ordinal
+        assert result2.freq == expected.freq
+
+    def test_asfreq_MS(self):
+        initial = Period("2013")
+
+        assert initial.asfreq(freq="M", how="S") == Period("2013-01", "M")
+
+        msg = "MS is not supported as period frequency"
+        with pytest.raises(ValueError, match=msg):
+            initial.asfreq(freq="MS", how="S")
+
+        with pytest.raises(ValueError, match=msg):
+            Period("2013-01", "MS")

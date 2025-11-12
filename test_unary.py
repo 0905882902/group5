@@ -1,79 +1,50 @@
-import operator
-
-import numpy as np
 import pytest
 
-import pandas as pd
+from pandas import Series
 import pandas._testing as tm
-from pandas.core.arrays import SparseArray
 
 
-@pytest.mark.filterwarnings("ignore:invalid value encountered in cast:RuntimeWarning")
-@pytest.mark.parametrize("fill_value", [0, np.nan])
-@pytest.mark.parametrize("op", [operator.pos, operator.neg])
-def test_unary_op(op, fill_value):
-    arr = np.array([0, 1, np.nan, 2])
-    sparray = SparseArray(arr, fill_value=fill_value)
-    result = op(sparray)
-    expected = SparseArray(op(arr), fill_value=op(fill_value))
-    tm.assert_sp_array_equal(result, expected)
+class TestSeriesUnaryOps:
+    # __neg__, __pos__, __invert__
 
+    def test_neg(self):
+        ser = Series(range(5), dtype="float64", name="series")
+        tm.assert_series_equal(-ser, -1 * ser)
 
-@pytest.mark.parametrize("fill_value", [True, False])
-def test_invert(fill_value):
-    arr = np.array([True, False, False, True])
-    sparray = SparseArray(arr, fill_value=fill_value)
-    result = ~sparray
-    expected = SparseArray(~arr, fill_value=not fill_value)
-    tm.assert_sp_array_equal(result, expected)
+    def test_invert(self):
+        ser = Series(range(5), dtype="float64", name="series")
+        tm.assert_series_equal(-(ser < 0), ~(ser < 0))
 
-    result = ~pd.Series(sparray)
-    expected = pd.Series(expected)
-    tm.assert_series_equal(result, expected)
-
-    result = ~pd.DataFrame({"A": sparray})
-    expected = pd.DataFrame({"A": expected})
-    tm.assert_frame_equal(result, expected)
-
-
-class TestUnaryMethods:
-    @pytest.mark.filterwarnings(
-        "ignore:invalid value encountered in cast:RuntimeWarning"
+    @pytest.mark.parametrize(
+        "source, neg_target, abs_target",
+        [
+            ([1, 2, 3], [-1, -2, -3], [1, 2, 3]),
+            ([1, 2, None], [-1, -2, None], [1, 2, None]),
+        ],
     )
-    def test_neg_operator(self):
-        arr = SparseArray([-1, -2, np.nan, 3], fill_value=np.nan, dtype=np.int8)
-        res = -arr
-        exp = SparseArray([1, 2, np.nan, -3], fill_value=np.nan, dtype=np.int8)
-        tm.assert_sp_array_equal(exp, res)
+    def test_all_numeric_unary_operators(
+        self, any_numeric_ea_dtype, source, neg_target, abs_target
+    ):
+        # GH38794
+        dtype = any_numeric_ea_dtype
+        ser = Series(source, dtype=dtype)
+        neg_result, pos_result, abs_result = -ser, +ser, abs(ser)
+        if dtype.startswith("U"):
+            neg_target = -Series(source, dtype=dtype)
+        else:
+            neg_target = Series(neg_target, dtype=dtype)
 
-        arr = SparseArray([-1, -2, 1, 3], fill_value=-1, dtype=np.int8)
-        res = -arr
-        exp = SparseArray([1, 2, -1, -3], fill_value=1, dtype=np.int8)
-        tm.assert_sp_array_equal(exp, res)
+        abs_target = Series(abs_target, dtype=dtype)
 
-    @pytest.mark.filterwarnings(
-        "ignore:invalid value encountered in cast:RuntimeWarning"
-    )
-    def test_abs_operator(self):
-        arr = SparseArray([-1, -2, np.nan, 3], fill_value=np.nan, dtype=np.int8)
-        res = abs(arr)
-        exp = SparseArray([1, 2, np.nan, 3], fill_value=np.nan, dtype=np.int8)
-        tm.assert_sp_array_equal(exp, res)
+        tm.assert_series_equal(neg_result, neg_target)
+        tm.assert_series_equal(pos_result, ser)
+        tm.assert_series_equal(abs_result, abs_target)
 
-        arr = SparseArray([-1, -2, 1, 3], fill_value=-1, dtype=np.int8)
-        res = abs(arr)
-        exp = SparseArray([1, 2, 1, 3], fill_value=1, dtype=np.int8)
-        tm.assert_sp_array_equal(exp, res)
-
-    def test_invert_operator(self):
-        arr = SparseArray([False, True, False, True], fill_value=False, dtype=np.bool_)
-        exp = SparseArray(
-            np.invert([False, True, False, True]), fill_value=True, dtype=np.bool_
-        )
-        res = ~arr
-        tm.assert_sp_array_equal(exp, res)
-
-        arr = SparseArray([0, 1, 0, 2, 3, 0], fill_value=0, dtype=np.int32)
-        res = ~arr
-        exp = SparseArray([-1, -2, -1, -3, -4, -1], fill_value=-1, dtype=np.int32)
-        tm.assert_sp_array_equal(exp, res)
+    @pytest.mark.parametrize("op", ["__neg__", "__abs__"])
+    def test_unary_float_op_mask(self, float_ea_dtype, op):
+        dtype = float_ea_dtype
+        ser = Series([1.1, 2.2, 3.3], dtype=dtype)
+        result = getattr(ser, op)()
+        target = result.copy(deep=True)
+        ser[0] = None
+        tm.assert_series_equal(result, target)

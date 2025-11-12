@@ -1,106 +1,146 @@
+from datetime import datetime
+
 import numpy as np
+import pytest
 
-from pandas.compat import WARNING_CHECK_DISABLED
-
+import pandas as pd
 from pandas import (
-    DataFrame,
-    option_context,
+    Series,
+    Timestamp,
+    isna,
+    notna,
 )
 import pandas._testing as tm
-from pandas.tests.copy_view.util import get_array
 
 
-def test_clip_inplace_reference(using_copy_on_write, warn_copy_on_write):
-    df = DataFrame({"a": [1.5, 2, 3]})
-    df_copy = df.copy()
-    arr_a = get_array(df, "a")
-    view = df[:]
-    if warn_copy_on_write:
-        with tm.assert_cow_warning():
-            df.clip(lower=2, inplace=True)
-    else:
-        df.clip(lower=2, inplace=True)
+class TestSeriesClip:
+    def test_clip(self, datetime_series):
+        val = datetime_series.median()
 
-    if using_copy_on_write:
-        assert not np.shares_memory(get_array(df, "a"), arr_a)
-        assert df._mgr._has_no_reference(0)
-        assert view._mgr._has_no_reference(0)
-        tm.assert_frame_equal(df_copy, view)
-    else:
-        assert np.shares_memory(get_array(df, "a"), arr_a)
+        assert datetime_series.clip(lower=val).min() == val
+        assert datetime_series.clip(upper=val).max() == val
 
+        result = datetime_series.clip(-0.5, 0.5)
+        expected = np.clip(datetime_series, -0.5, 0.5)
+        tm.assert_series_equal(result, expected)
+        assert isinstance(expected, Series)
 
-def test_clip_inplace_reference_no_op(using_copy_on_write):
-    df = DataFrame({"a": [1.5, 2, 3]})
-    df_copy = df.copy()
-    arr_a = get_array(df, "a")
-    view = df[:]
-    df.clip(lower=0, inplace=True)
+    def test_clip_types_and_nulls(self):
+        sers = [
+            Series([np.nan, 1.0, 2.0, 3.0]),
+            Series([None, "a", "b", "c"]),
+            Series(pd.to_datetime([np.nan, 1, 2, 3], unit="D")),
+        ]
 
-    assert np.shares_memory(get_array(df, "a"), arr_a)
+        for s in sers:
+            thresh = s[2]
+            lower = s.clip(lower=thresh)
+            upper = s.clip(upper=thresh)
+            assert lower[notna(lower)].min() == thresh
+            assert upper[notna(upper)].max() == thresh
+            assert list(isna(s)) == list(isna(lower))
+            assert list(isna(s)) == list(isna(upper))
 
-    if using_copy_on_write:
-        assert not df._mgr._has_no_reference(0)
-        assert not view._mgr._has_no_reference(0)
-        tm.assert_frame_equal(df_copy, view)
+    def test_series_clipping_with_na_values(self, any_numeric_ea_dtype, nulls_fixture):
+        # Ensure that clipping method can handle NA values with out failing
+        # GH#40581
 
+        if nulls_fixture is pd.NaT:
+            # constructor will raise, see
+            #  test_constructor_mismatched_null_nullable_dtype
+            pytest.skip("See test_constructor_mismatched_null_nullable_dtype")
 
-def test_clip_inplace(using_copy_on_write):
-    df = DataFrame({"a": [1.5, 2, 3]})
-    arr_a = get_array(df, "a")
-    df.clip(lower=2, inplace=True)
+        ser = Series([nulls_fixture, 1.0, 3.0], dtype=any_numeric_ea_dtype)
+        s_clipped_upper = ser.clip(upper=2.0)
+        s_clipped_lower = ser.clip(lower=2.0)
 
-    assert np.shares_memory(get_array(df, "a"), arr_a)
+        expected_upper = Series([nulls_fixture, 1.0, 2.0], dtype=any_numeric_ea_dtype)
+        expected_lower = Series([nulls_fixture, 2.0, 3.0], dtype=any_numeric_ea_dtype)
 
-    if using_copy_on_write:
-        assert df._mgr._has_no_reference(0)
+        tm.assert_series_equal(s_clipped_upper, expected_upper)
+        tm.assert_series_equal(s_clipped_lower, expected_lower)
 
+    def test_clip_with_na_args(self):
+        """Should process np.nan argument as None"""
+        # GH#17276
+        s = Series([1, 2, 3])
 
-def test_clip(using_copy_on_write):
-    df = DataFrame({"a": [1.5, 2, 3]})
-    df_orig = df.copy()
-    df2 = df.clip(lower=2)
+        tm.assert_series_equal(s.clip(np.nan), Series([1, 2, 3]))
+        tm.assert_series_equal(s.clip(upper=np.nan, lower=np.nan), Series([1, 2, 3]))
 
-    assert not np.shares_memory(get_array(df2, "a"), get_array(df, "a"))
+        # GH#19992
+        msg = "Downcasting behavior in Series and DataFrame methods 'where'"
+        # TODO: avoid this warning here?  seems like we should never be upcasting
+        #  in the first place?
+        with tm.assert_produces_warning(FutureWarning, match=msg):
+            res = s.clip(lower=[0, 4, np.nan])
+        tm.assert_series_equal(res, Series([1, 4, 3]))
+        with tm.assert_produces_warning(FutureWarning, match=msg):
+            res = s.clip(upper=[1, np.nan, 1])
+        tm.assert_series_equal(res, Series([1, 2, 1]))
 
-    if using_copy_on_write:
-        assert df._mgr._has_no_reference(0)
-    tm.assert_frame_equal(df_orig, df)
+        # GH#40420
+        s = Series([1, 2, 3])
+        result = s.clip(0, [np.nan, np.nan, np.nan])
+        tm.assert_series_equal(s, result)
 
+    def test_clip_against_series(self):
+        # GH#6966
 
-def test_clip_no_op(using_copy_on_write):
-    df = DataFrame({"a": [1.5, 2, 3]})
-    df2 = df.clip(lower=0)
+        s = Series([1.0, 1.0, 4.0])
 
-    if using_copy_on_write:
-        assert not df._mgr._has_no_reference(0)
-        assert np.shares_memory(get_array(df2, "a"), get_array(df, "a"))
-    else:
-        assert not np.shares_memory(get_array(df2, "a"), get_array(df, "a"))
+        lower = Series([1.0, 2.0, 3.0])
+        upper = Series([1.5, 2.5, 3.5])
 
+        tm.assert_series_equal(s.clip(lower, upper), Series([1.0, 2.0, 3.5]))
+        tm.assert_series_equal(s.clip(1.5, upper), Series([1.5, 1.5, 3.5]))
 
-def test_clip_chained_inplace(using_copy_on_write):
-    df = DataFrame({"a": [1, 4, 2], "b": 1})
-    df_orig = df.copy()
-    if using_copy_on_write:
-        with tm.raises_chained_assignment_error():
-            df["a"].clip(1, 2, inplace=True)
-        tm.assert_frame_equal(df, df_orig)
+    @pytest.mark.parametrize("inplace", [True, False])
+    @pytest.mark.parametrize("upper", [[1, 2, 3], np.asarray([1, 2, 3])])
+    def test_clip_against_list_like(self, inplace, upper):
+        # GH#15390
+        original = Series([5, 6, 7])
+        result = original.clip(upper=upper, inplace=inplace)
+        expected = Series([1, 2, 3])
 
-        with tm.raises_chained_assignment_error():
-            df[["a"]].clip(1, 2, inplace=True)
-        tm.assert_frame_equal(df, df_orig)
-    else:
-        with tm.assert_produces_warning(
-            FutureWarning if not WARNING_CHECK_DISABLED else None,
-            match="inplace method",
-        ):
-            df["a"].clip(1, 2, inplace=True)
+        if inplace:
+            result = original
+        tm.assert_series_equal(result, expected, check_exact=True)
 
-        with tm.assert_produces_warning(None):
-            with option_context("mode.chained_assignment", None):
-                df[["a"]].clip(1, 2, inplace=True)
+    def test_clip_with_datetimes(self):
+        # GH#11838
+        # naive and tz-aware datetimes
 
-        with tm.assert_produces_warning(None):
-            with option_context("mode.chained_assignment", None):
-                df[df["a"] > 1].clip(1, 2, inplace=True)
+        t = Timestamp("2015-12-01 09:30:30")
+        s = Series([Timestamp("2015-12-01 09:30:00"), Timestamp("2015-12-01 09:31:00")])
+        result = s.clip(upper=t)
+        expected = Series(
+            [Timestamp("2015-12-01 09:30:00"), Timestamp("2015-12-01 09:30:30")]
+        )
+        tm.assert_series_equal(result, expected)
+
+        t = Timestamp("2015-12-01 09:30:30", tz="US/Eastern")
+        s = Series(
+            [
+                Timestamp("2015-12-01 09:30:00", tz="US/Eastern"),
+                Timestamp("2015-12-01 09:31:00", tz="US/Eastern"),
+            ]
+        )
+        result = s.clip(upper=t)
+        expected = Series(
+            [
+                Timestamp("2015-12-01 09:30:00", tz="US/Eastern"),
+                Timestamp("2015-12-01 09:30:30", tz="US/Eastern"),
+            ]
+        )
+        tm.assert_series_equal(result, expected)
+
+    @pytest.mark.parametrize("dtype", [object, "M8[us]"])
+    def test_clip_with_timestamps_and_oob_datetimes(self, dtype):
+        # GH-42794
+        ser = Series([datetime(1, 1, 1), datetime(9999, 9, 9)], dtype=dtype)
+
+        result = ser.clip(lower=Timestamp.min, upper=Timestamp.max)
+        expected = Series([Timestamp.min, Timestamp.max], dtype=dtype)
+
+        tm.assert_series_equal(result, expected)

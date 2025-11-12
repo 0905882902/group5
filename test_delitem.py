@@ -1,60 +1,69 @@
-import re
-
-import numpy as np
 import pytest
 
 from pandas import (
-    DataFrame,
-    MultiIndex,
+    Index,
+    Series,
+    date_range,
 )
+import pandas._testing as tm
 
 
-class TestDataFrameDelItem:
-    def test_delitem(self, float_frame):
-        del float_frame["A"]
-        assert "A" not in float_frame
+class TestSeriesDelItem:
+    def test_delitem(self):
+        # GH#5542
+        # should delete the item inplace
+        s = Series(range(5))
+        del s[0]
 
-    def test_delitem_multiindex(self):
-        midx = MultiIndex.from_product([["A", "B"], [1, 2]])
-        df = DataFrame(np.random.default_rng(2).standard_normal((4, 4)), columns=midx)
-        assert len(df.columns) == 4
-        assert ("A",) in df.columns
-        assert "A" in df.columns
+        expected = Series(range(1, 5), index=range(1, 5))
+        tm.assert_series_equal(s, expected)
 
-        result = df["A"]
-        assert isinstance(result, DataFrame)
-        del df["A"]
+        del s[1]
+        expected = Series(range(2, 5), index=range(2, 5))
+        tm.assert_series_equal(s, expected)
 
-        assert len(df.columns) == 2
+        # only 1 left, del, add, del
+        s = Series(1)
+        del s[0]
+        tm.assert_series_equal(s, Series(dtype="int64", index=Index([], dtype="int64")))
+        s[0] = 1
+        tm.assert_series_equal(s, Series(1))
+        del s[0]
+        tm.assert_series_equal(s, Series(dtype="int64", index=Index([], dtype="int64")))
 
-        # A still in the levels, BUT get a KeyError if trying
-        # to delete
-        assert ("A",) not in df.columns
-        with pytest.raises(KeyError, match=re.escape("('A',)")):
-            del df[("A",)]
+    def test_delitem_object_index(self):
+        # Index(dtype=object)
+        s = Series(1, index=Index(["a"], dtype="str"))
+        del s["a"]
+        tm.assert_series_equal(s, Series(dtype="int64", index=Index([], dtype="str")))
+        s["a"] = 1
+        tm.assert_series_equal(s, Series(1, index=Index(["a"], dtype="str")))
+        del s["a"]
+        tm.assert_series_equal(s, Series(dtype="int64", index=Index([], dtype="str")))
 
-        # behavior of dropped/deleted MultiIndex levels changed from
-        # GH 2770 to GH 19027: MultiIndex no longer '.__contains__'
-        # levels which are dropped/deleted
-        assert "A" not in df.columns
-        with pytest.raises(KeyError, match=re.escape("('A',)")):
-            del df["A"]
+    def test_delitem_missing_key(self):
+        # empty
+        s = Series(dtype=object)
 
-    def test_delitem_corner(self, float_frame):
-        f = float_frame.copy()
-        del f["D"]
-        assert len(f.columns) == 3
-        with pytest.raises(KeyError, match=r"^'D'$"):
-            del f["D"]
-        del f["B"]
-        assert len(f.columns) == 2
+        with pytest.raises(KeyError, match=r"^0$"):
+            del s[0]
 
-    def test_delitem_col_still_multiindex(self):
-        arrays = [["a", "b", "c", "top"], ["", "", "", "OD"], ["", "", "", "wx"]]
+    def test_delitem_extension_dtype(self):
+        # GH#40386
+        # DatetimeTZDtype
+        dti = date_range("2016-01-01", periods=3, tz="US/Pacific")
+        ser = Series(dti)
 
-        tuples = sorted(zip(*arrays))
-        index = MultiIndex.from_tuples(tuples)
+        expected = ser[[0, 2]]
+        del ser[1]
+        assert ser.dtype == dti.dtype
+        tm.assert_series_equal(ser, expected)
 
-        df = DataFrame(np.random.default_rng(2).standard_normal((3, 4)), columns=index)
-        del df[("a", "", "")]
-        assert isinstance(df.columns, MultiIndex)
+        # PeriodDtype
+        pi = dti.tz_localize(None).to_period("D")
+        ser = Series(pi)
+
+        expected = ser[:2]
+        del ser[2]
+        assert ser.dtype == pi.dtype
+        tm.assert_series_equal(ser, expected)

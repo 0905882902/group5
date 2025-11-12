@@ -1,319 +1,212 @@
+"""
+Tests for Series cumulative operations.
+
+See also
+--------
+tests.frame.test_cumulative
+"""
+
+import re
+
 import numpy as np
 import pytest
 
-from pandas.errors import UnsupportedFunctionCall
-import pandas.util._test_decorators as td
-
 import pandas as pd
-from pandas import (
-    DataFrame,
-    Series,
-)
 import pandas._testing as tm
 
+methods = {
+    "cumsum": np.cumsum,
+    "cumprod": np.cumprod,
+    "cummin": np.minimum.accumulate,
+    "cummax": np.maximum.accumulate,
+}
 
-@pytest.fixture(
-    params=[np.int32, np.int64, np.float32, np.float64, "Int64", "Float64"],
-    ids=["np.int32", "np.int64", "np.float32", "np.float64", "Int64", "Float64"],
-)
-def dtypes_for_minmax(request):
-    """
-    Fixture of dtypes with min and max values used for testing
-    cummin and cummax
-    """
-    dtype = request.param
 
-    np_type = dtype
-    if dtype == "Int64":
-        np_type = np.int64
-    elif dtype == "Float64":
-        np_type = np.float64
+class TestSeriesCumulativeOps:
+    @pytest.mark.parametrize("func", [np.cumsum, np.cumprod])
+    def test_datetime_series(self, datetime_series, func):
+        tm.assert_numpy_array_equal(
+            func(datetime_series).values,
+            func(np.array(datetime_series)),
+            check_dtype=True,
+        )
 
-    min_val = (
-        np.iinfo(np_type).min
-        if np.dtype(np_type).kind == "i"
-        else np.finfo(np_type).min
+        # with missing values
+        ts = datetime_series.copy()
+        ts[::2] = np.nan
+
+        result = func(ts)[1::2]
+        expected = func(np.array(ts.dropna()))
+
+        tm.assert_numpy_array_equal(result.values, expected, check_dtype=False)
+
+    @pytest.mark.parametrize("method", ["cummin", "cummax"])
+    def test_cummin_cummax(self, datetime_series, method):
+        ufunc = methods[method]
+
+        result = getattr(datetime_series, method)().values
+        expected = ufunc(np.array(datetime_series))
+
+        tm.assert_numpy_array_equal(result, expected)
+        ts = datetime_series.copy()
+        ts[::2] = np.nan
+        result = getattr(ts, method)()[1::2]
+        expected = ufunc(ts.dropna())
+
+        result.index = result.index._with_freq(None)
+        tm.assert_series_equal(result, expected)
+
+    @pytest.mark.parametrize(
+        "ts",
+        [
+            pd.Timedelta(0),
+            pd.Timestamp("1999-12-31"),
+            pd.Timestamp("1999-12-31").tz_localize("US/Pacific"),
+        ],
     )
-    max_val = (
-        np.iinfo(np_type).max
-        if np.dtype(np_type).kind == "i"
-        else np.finfo(np_type).max
+    @pytest.mark.parametrize(
+        "method, skipna, exp_tdi",
+        [
+            ["cummax", True, ["NaT", "2 days", "NaT", "2 days", "NaT", "3 days"]],
+            ["cummin", True, ["NaT", "2 days", "NaT", "1 days", "NaT", "1 days"]],
+            [
+                "cummax",
+                False,
+                ["NaT", "NaT", "NaT", "NaT", "NaT", "NaT"],
+            ],
+            [
+                "cummin",
+                False,
+                ["NaT", "NaT", "NaT", "NaT", "NaT", "NaT"],
+            ],
+        ],
     )
+    def test_cummin_cummax_datetimelike(self, ts, method, skipna, exp_tdi):
+        # with ts==pd.Timedelta(0), we are testing td64; with naive Timestamp
+        #  we are testing datetime64[ns]; with Timestamp[US/Pacific]
+        #  we are testing dt64tz
+        tdi = pd.to_timedelta(["NaT", "2 days", "NaT", "1 days", "NaT", "3 days"])
+        ser = pd.Series(tdi + ts)
 
-    return (dtype, min_val, max_val)
+        exp_tdi = pd.to_timedelta(exp_tdi)
+        expected = pd.Series(exp_tdi + ts)
+        result = getattr(ser, method)(skipna=skipna)
+        tm.assert_series_equal(expected, result)
 
-
-def test_groupby_cumprod():
-    # GH 4095
-    df = DataFrame({"key": ["b"] * 10, "value": 2})
-
-    actual = df.groupby("key")["value"].cumprod()
-    expected = df.groupby("key", group_keys=False)["value"].apply(lambda x: x.cumprod())
-    expected.name = "value"
-    tm.assert_series_equal(actual, expected)
-
-    df = DataFrame({"key": ["b"] * 100, "value": 2})
-    df["value"] = df["value"].astype(float)
-    actual = df.groupby("key")["value"].cumprod()
-    expected = df.groupby("key", group_keys=False)["value"].apply(lambda x: x.cumprod())
-    expected.name = "value"
-    tm.assert_series_equal(actual, expected)
-
-
-@pytest.mark.skip_ubsan
-def test_groupby_cumprod_overflow():
-    # GH#37493 if we overflow we return garbage consistent with numpy
-    df = DataFrame({"key": ["b"] * 4, "value": 100_000})
-    actual = df.groupby("key")["value"].cumprod()
-    expected = Series(
-        [100_000, 10_000_000_000, 1_000_000_000_000_000, 7766279631452241920],
-        name="value",
+    @pytest.mark.parametrize(
+        "func, exp",
+        [
+            ("cummin", pd.Period("2012-1-1", freq="D")),
+            ("cummax", pd.Period("2012-1-2", freq="D")),
+        ],
     )
-    tm.assert_series_equal(actual, expected)
+    def test_cummin_cummax_period(self, func, exp):
+        # GH#28385
+        ser = pd.Series(
+            [pd.Period("2012-1-1", freq="D"), pd.NaT, pd.Period("2012-1-2", freq="D")]
+        )
+        result = getattr(ser, func)(skipna=False)
+        expected = pd.Series([pd.Period("2012-1-1", freq="D"), pd.NaT, pd.NaT])
+        tm.assert_series_equal(result, expected)
 
-    numpy_result = df.groupby("key", group_keys=False)["value"].apply(
-        lambda x: x.cumprod()
+        result = getattr(ser, func)(skipna=True)
+        expected = pd.Series([pd.Period("2012-1-1", freq="D"), pd.NaT, exp])
+        tm.assert_series_equal(result, expected)
+
+    @pytest.mark.parametrize(
+        "arg",
+        [
+            [False, False, False, True, True, False, False],
+            [False, False, False, False, False, False, False],
+        ],
     )
-    numpy_result.name = "value"
-    tm.assert_series_equal(actual, numpy_result)
-
-
-def test_groupby_cumprod_nan_influences_other_columns():
-    # GH#48064
-    df = DataFrame(
-        {
-            "a": 1,
-            "b": [1, np.nan, 2],
-            "c": [1, 2, 3.0],
-        }
+    @pytest.mark.parametrize(
+        "func", [lambda x: x, lambda x: ~x], ids=["identity", "inverse"]
     )
-    result = df.groupby("a").cumprod(numeric_only=True, skipna=False)
-    expected = DataFrame({"b": [1, np.nan, np.nan], "c": [1, 2, 6.0]})
-    tm.assert_frame_equal(result, expected)
+    @pytest.mark.parametrize("method", methods.keys())
+    def test_cummethods_bool(self, arg, func, method):
+        # GH#6270
+        # checking Series method vs the ufunc applied to the values
 
+        ser = func(pd.Series(arg))
+        ufunc = methods[method]
 
-def test_cummin(dtypes_for_minmax):
-    dtype = dtypes_for_minmax[0]
-    min_val = dtypes_for_minmax[1]
+        exp_vals = ufunc(ser.values)
+        expected = pd.Series(exp_vals)
 
-    # GH 15048
-    base_df = DataFrame({"A": [1, 1, 1, 1, 2, 2, 2, 2], "B": [3, 4, 3, 2, 2, 3, 2, 1]})
-    expected_mins = [3, 3, 3, 2, 2, 2, 2, 1]
+        result = getattr(ser, method)()
 
-    df = base_df.astype(dtype)
+        tm.assert_series_equal(result, expected)
 
-    expected = DataFrame({"B": expected_mins}).astype(dtype)
-    result = df.groupby("A").cummin()
-    tm.assert_frame_equal(result, expected)
-    result = df.groupby("A", group_keys=False).B.apply(lambda x: x.cummin()).to_frame()
-    tm.assert_frame_equal(result, expected)
-
-    # Test w/ min value for dtype
-    df.loc[[2, 6], "B"] = min_val
-    df.loc[[1, 5], "B"] = min_val + 1
-    expected.loc[[2, 3, 6, 7], "B"] = min_val
-    expected.loc[[1, 5], "B"] = min_val + 1  # should not be rounded to min_val
-    result = df.groupby("A").cummin()
-    tm.assert_frame_equal(result, expected, check_exact=True)
-    expected = (
-        df.groupby("A", group_keys=False).B.apply(lambda x: x.cummin()).to_frame()
+    @pytest.mark.parametrize(
+        "method, expected",
+        [
+            ["cumsum", pd.Series([0, 1, np.nan, 1], dtype=object)],
+            ["cumprod", pd.Series([False, 0, np.nan, 0])],
+            ["cummin", pd.Series([False, False, np.nan, False])],
+            ["cummax", pd.Series([False, True, np.nan, True])],
+        ],
     )
-    tm.assert_frame_equal(result, expected, check_exact=True)
+    def test_cummethods_bool_in_object_dtype(self, method, expected):
+        ser = pd.Series([False, True, np.nan, False])
+        result = getattr(ser, method)()
+        tm.assert_series_equal(result, expected)
 
-    # Test nan in some values
-    # Explicit cast to float to avoid implicit cast when setting nan
-    base_df = base_df.astype({"B": "float"})
-    base_df.loc[[0, 2, 4, 6], "B"] = np.nan
-    expected = DataFrame({"B": [np.nan, 4, np.nan, 2, np.nan, 3, np.nan, 1]})
-    result = base_df.groupby("A").cummin()
-    tm.assert_frame_equal(result, expected)
-    expected = (
-        base_df.groupby("A", group_keys=False).B.apply(lambda x: x.cummin()).to_frame()
+    def test_cumprod_timedelta(self):
+        # GH#48111
+        ser = pd.Series([pd.Timedelta(days=1), pd.Timedelta(days=3)])
+        with pytest.raises(TypeError, match="cumprod not supported for Timedelta"):
+            ser.cumprod()
+
+    @pytest.mark.parametrize(
+        "data, op, skipna, expected_data",
+        [
+            ([], "cumsum", True, []),
+            ([], "cumsum", False, []),
+            (["x", "z", "y"], "cumsum", True, ["x", "xz", "xzy"]),
+            (["x", "z", "y"], "cumsum", False, ["x", "xz", "xzy"]),
+            (["x", pd.NA, "y"], "cumsum", True, ["x", pd.NA, "xy"]),
+            (["x", pd.NA, "y"], "cumsum", False, ["x", pd.NA, pd.NA]),
+            ([pd.NA, "x", "y"], "cumsum", True, [pd.NA, "x", "xy"]),
+            ([pd.NA, "x", "y"], "cumsum", False, [pd.NA, pd.NA, pd.NA]),
+            ([pd.NA, pd.NA, pd.NA], "cumsum", True, [pd.NA, pd.NA, pd.NA]),
+            ([pd.NA, pd.NA, pd.NA], "cumsum", False, [pd.NA, pd.NA, pd.NA]),
+            ([], "cummin", True, []),
+            ([], "cummin", False, []),
+            (["y", "z", "x"], "cummin", True, ["y", "y", "x"]),
+            (["y", "z", "x"], "cummin", False, ["y", "y", "x"]),
+            (["y", pd.NA, "x"], "cummin", True, ["y", pd.NA, "x"]),
+            (["y", pd.NA, "x"], "cummin", False, ["y", pd.NA, pd.NA]),
+            ([pd.NA, "y", "x"], "cummin", True, [pd.NA, "y", "x"]),
+            ([pd.NA, "y", "x"], "cummin", False, [pd.NA, pd.NA, pd.NA]),
+            ([pd.NA, pd.NA, pd.NA], "cummin", True, [pd.NA, pd.NA, pd.NA]),
+            ([pd.NA, pd.NA, pd.NA], "cummin", False, [pd.NA, pd.NA, pd.NA]),
+            ([], "cummax", True, []),
+            ([], "cummax", False, []),
+            (["x", "z", "y"], "cummax", True, ["x", "z", "z"]),
+            (["x", "z", "y"], "cummax", False, ["x", "z", "z"]),
+            (["x", pd.NA, "y"], "cummax", True, ["x", pd.NA, "y"]),
+            (["x", pd.NA, "y"], "cummax", False, ["x", pd.NA, pd.NA]),
+            ([pd.NA, "x", "y"], "cummax", True, [pd.NA, "x", "y"]),
+            ([pd.NA, "x", "y"], "cummax", False, [pd.NA, pd.NA, pd.NA]),
+            ([pd.NA, pd.NA, pd.NA], "cummax", True, [pd.NA, pd.NA, pd.NA]),
+            ([pd.NA, pd.NA, pd.NA], "cummax", False, [pd.NA, pd.NA, pd.NA]),
+        ],
     )
-    tm.assert_frame_equal(result, expected)
+    def test_cum_methods_ea_strings(
+        self, string_dtype_no_object, data, op, skipna, expected_data
+    ):
+        # https://github.com/pandas-dev/pandas/pull/60633 - pyarrow
+        # https://github.com/pandas-dev/pandas/pull/60938 - Python
+        ser = pd.Series(data, dtype=string_dtype_no_object)
+        method = getattr(ser, op)
+        expected = pd.Series(expected_data, dtype=string_dtype_no_object)
+        result = method(skipna=skipna)
+        tm.assert_series_equal(result, expected)
 
-    # GH 15561
-    df = DataFrame({"a": [1], "b": pd.to_datetime(["2001"])})
-    expected = Series(pd.to_datetime("2001"), index=[0], name="b")
-
-    result = df.groupby("a")["b"].cummin()
-    tm.assert_series_equal(expected, result)
-
-    # GH 15635
-    df = DataFrame({"a": [1, 2, 1], "b": [1, 2, 2]})
-    result = df.groupby("a").b.cummin()
-    expected = Series([1, 2, 1], name="b")
-    tm.assert_series_equal(result, expected)
-
-
-@pytest.mark.parametrize("method", ["cummin", "cummax"])
-@pytest.mark.parametrize("dtype", ["UInt64", "Int64", "Float64", "float", "boolean"])
-def test_cummin_max_all_nan_column(method, dtype):
-    base_df = DataFrame({"A": [1, 1, 1, 1, 2, 2, 2, 2], "B": [np.nan] * 8})
-    base_df["B"] = base_df["B"].astype(dtype)
-    grouped = base_df.groupby("A")
-
-    expected = DataFrame({"B": [np.nan] * 8}, dtype=dtype)
-    result = getattr(grouped, method)()
-    tm.assert_frame_equal(expected, result)
-
-    result = getattr(grouped["B"], method)().to_frame()
-    tm.assert_frame_equal(expected, result)
-
-
-def test_cummax(dtypes_for_minmax):
-    dtype = dtypes_for_minmax[0]
-    max_val = dtypes_for_minmax[2]
-
-    # GH 15048
-    base_df = DataFrame({"A": [1, 1, 1, 1, 2, 2, 2, 2], "B": [3, 4, 3, 2, 2, 3, 2, 1]})
-    expected_maxs = [3, 4, 4, 4, 2, 3, 3, 3]
-
-    df = base_df.astype(dtype)
-
-    expected = DataFrame({"B": expected_maxs}).astype(dtype)
-    result = df.groupby("A").cummax()
-    tm.assert_frame_equal(result, expected)
-    result = df.groupby("A", group_keys=False).B.apply(lambda x: x.cummax()).to_frame()
-    tm.assert_frame_equal(result, expected)
-
-    # Test w/ max value for dtype
-    df.loc[[2, 6], "B"] = max_val
-    expected.loc[[2, 3, 6, 7], "B"] = max_val
-    result = df.groupby("A").cummax()
-    tm.assert_frame_equal(result, expected)
-    expected = (
-        df.groupby("A", group_keys=False).B.apply(lambda x: x.cummax()).to_frame()
-    )
-    tm.assert_frame_equal(result, expected)
-
-    # Test nan in some values
-    # Explicit cast to float to avoid implicit cast when setting nan
-    base_df = base_df.astype({"B": "float"})
-    base_df.loc[[0, 2, 4, 6], "B"] = np.nan
-    expected = DataFrame({"B": [np.nan, 4, np.nan, 4, np.nan, 3, np.nan, 3]})
-    result = base_df.groupby("A").cummax()
-    tm.assert_frame_equal(result, expected)
-    expected = (
-        base_df.groupby("A", group_keys=False).B.apply(lambda x: x.cummax()).to_frame()
-    )
-    tm.assert_frame_equal(result, expected)
-
-    # GH 15561
-    df = DataFrame({"a": [1], "b": pd.to_datetime(["2001"])})
-    expected = Series(pd.to_datetime("2001"), index=[0], name="b")
-
-    result = df.groupby("a")["b"].cummax()
-    tm.assert_series_equal(expected, result)
-
-    # GH 15635
-    df = DataFrame({"a": [1, 2, 1], "b": [2, 1, 1]})
-    result = df.groupby("a").b.cummax()
-    expected = Series([2, 1, 2], name="b")
-    tm.assert_series_equal(result, expected)
-
-
-def test_cummax_i8_at_implementation_bound():
-    # the minimum value used to be treated as NPY_NAT+1 instead of NPY_NAT
-    #  for int64 dtype GH#46382
-    ser = Series([pd.NaT._value + n for n in range(5)])
-    df = DataFrame({"A": 1, "B": ser, "C": ser._values.view("M8[ns]")})
-    gb = df.groupby("A")
-
-    res = gb.cummax()
-    exp = df[["B", "C"]]
-    tm.assert_frame_equal(res, exp)
-
-
-@pytest.mark.parametrize("method", ["cummin", "cummax"])
-@pytest.mark.parametrize("dtype", ["float", "Int64", "Float64"])
-@pytest.mark.parametrize(
-    "groups,expected_data",
-    [
-        ([1, 1, 1], [1, None, None]),
-        ([1, 2, 3], [1, None, 2]),
-        ([1, 3, 3], [1, None, None]),
-    ],
-)
-def test_cummin_max_skipna(method, dtype, groups, expected_data):
-    # GH-34047
-    df = DataFrame({"a": Series([1, None, 2], dtype=dtype)})
-    orig = df.copy()
-    gb = df.groupby(groups)["a"]
-
-    result = getattr(gb, method)(skipna=False)
-    expected = Series(expected_data, dtype=dtype, name="a")
-
-    # check we didn't accidentally alter df
-    tm.assert_frame_equal(df, orig)
-
-    tm.assert_series_equal(result, expected)
-
-
-@pytest.mark.parametrize("method", ["cummin", "cummax"])
-def test_cummin_max_skipna_multiple_cols(method):
-    # Ensure missing value in "a" doesn't cause "b" to be nan-filled
-    df = DataFrame({"a": [np.nan, 2.0, 2.0], "b": [2.0, 2.0, 2.0]})
-    gb = df.groupby([1, 1, 1])[["a", "b"]]
-
-    result = getattr(gb, method)(skipna=False)
-    expected = DataFrame({"a": [np.nan, np.nan, np.nan], "b": [2.0, 2.0, 2.0]})
-
-    tm.assert_frame_equal(result, expected)
-
-
-@pytest.mark.parametrize("func", ["cumprod", "cumsum"])
-def test_numpy_compat(func):
-    # see gh-12811
-    df = DataFrame({"A": [1, 2, 1], "B": [1, 2, 3]})
-    g = df.groupby("A")
-
-    msg = "numpy operations are not valid with groupby"
-
-    with pytest.raises(UnsupportedFunctionCall, match=msg):
-        getattr(g, func)(1, 2, 3)
-    with pytest.raises(UnsupportedFunctionCall, match=msg):
-        getattr(g, func)(foo=1)
-
-
-@td.skip_if_32bit
-@pytest.mark.parametrize("method", ["cummin", "cummax"])
-@pytest.mark.parametrize(
-    "dtype,val", [("UInt64", np.iinfo("uint64").max), ("Int64", 2**53 + 1)]
-)
-def test_nullable_int_not_cast_as_float(method, dtype, val):
-    data = [val, pd.NA]
-    df = DataFrame({"grp": [1, 1], "b": data}, dtype=dtype)
-    grouped = df.groupby("grp")
-
-    result = grouped.transform(method)
-    expected = DataFrame({"b": data}, dtype=dtype)
-
-    tm.assert_frame_equal(result, expected)
-
-
-def test_cython_api2():
-    # this takes the fast apply path
-
-    # cumsum (GH5614)
-    df = DataFrame([[1, 2, np.nan], [1, np.nan, 9], [3, 4, 9]], columns=["A", "B", "C"])
-    expected = DataFrame([[2, np.nan], [np.nan, 9], [4, 9]], columns=["B", "C"])
-    result = df.groupby("A").cumsum()
-    tm.assert_frame_equal(result, expected)
-
-    # GH 5755 - cumsum is a transformer and should ignore as_index
-    result = df.groupby("A", as_index=False).cumsum()
-    tm.assert_frame_equal(result, expected)
-
-    # GH 13994
-    msg = "DataFrameGroupBy.cumsum with axis=1 is deprecated"
-    with tm.assert_produces_warning(FutureWarning, match=msg):
-        result = df.groupby("A").cumsum(axis=1)
-    expected = df.cumsum(axis=1)
-    tm.assert_frame_equal(result, expected)
-
-    msg = "DataFrameGroupBy.cumprod with axis=1 is deprecated"
-    with tm.assert_produces_warning(FutureWarning, match=msg):
-        result = df.groupby("A").cumprod(axis=1)
-    expected = df.cumprod(axis=1)
-    tm.assert_frame_equal(result, expected)
+    def test_cumprod_pyarrow_strings(self, pyarrow_string_dtype, skipna):
+        # https://github.com/pandas-dev/pandas/pull/60633
+        ser = pd.Series(list("xyz"), dtype=pyarrow_string_dtype)
+        msg = re.escape(f"operation 'cumprod' not supported for dtype '{ser.dtype}'")
+        with pytest.raises(TypeError, match=msg):
+            ser.cumprod(skipna=skipna)

@@ -1,1675 +1,1158 @@
-# Arithmetic tests for DataFrame/Series/Index/Array classes that should
-# behave identically.
-# Specifically for Period dtype
-import operator
+from datetime import (
+    date,
+    datetime,
+    timedelta,
+)
+import re
 
 import numpy as np
 import pytest
 
-from pandas._libs.tslibs import (
-    IncompatibleFrequency,
-    Period,
-    Timestamp,
-    to_offset,
+from pandas._libs.tslibs import iNaT
+from pandas._libs.tslibs.ccalendar import (
+    DAYS,
+    MONTHS,
 )
-from pandas.errors import PerformanceWarning
+from pandas._libs.tslibs.np_datetime import OutOfBoundsDatetime
+from pandas._libs.tslibs.parsing import DateParseError
+from pandas._libs.tslibs.period import INVALID_FREQ_ERR_MSG
+from pandas.compat import PY314
 
-import pandas as pd
 from pandas import (
-    PeriodIndex,
-    Series,
+    NaT,
+    Period,
     Timedelta,
-    TimedeltaIndex,
-    period_range,
+    Timestamp,
+    offsets,
 )
 import pandas._testing as tm
-from pandas.core import ops
-from pandas.core.arrays import TimedeltaArray
-from pandas.tests.arithmetic.common import (
-    assert_invalid_addsub_type,
-    assert_invalid_comparison,
-    get_upcast_box,
-)
 
-_common_mismatch = [
-    pd.offsets.YearBegin(2),
-    pd.offsets.MonthBegin(1),
-    pd.offsets.Minute(),
-]
+bday_msg = "Period with BDay freq is deprecated"
 
 
-@pytest.fixture(
-    params=[
-        Timedelta(minutes=30).to_pytimedelta(),
-        np.timedelta64(30, "s"),
-        Timedelta(seconds=30),
-    ]
-    + _common_mismatch
-)
-def not_hourly(request):
-    """
-    Several timedelta-like and DateOffset instances that are _not_
-    compatible with Hourly frequencies.
-    """
-    return request.param
-
-
-@pytest.fixture(
-    params=[
-        np.timedelta64(365, "D"),
-        Timedelta(days=365).to_pytimedelta(),
-        Timedelta(days=365),
-    ]
-    + _common_mismatch
-)
-def mismatched_freq(request):
-    """
-    Several timedelta-like and DateOffset instances that are _not_
-    compatible with Monthly or Annual frequencies.
-    """
-    return request.param
-
-
-# ------------------------------------------------------------------
-# Comparisons
-
-
-class TestPeriodArrayLikeComparisons:
-    # Comparison tests for PeriodDtype vectors fully parametrized over
-    #  DataFrame/Series/PeriodIndex/PeriodArray.  Ideally all comparison
-    #  tests will eventually end up here.
-
-    @pytest.mark.parametrize("other", ["2017", Period("2017", freq="D")])
-    def test_eq_scalar(self, other, box_with_array):
-        idx = PeriodIndex(["2017", "2017", "2018"], freq="D")
-        idx = tm.box_expected(idx, box_with_array)
-        xbox = get_upcast_box(idx, other, True)
-
-        expected = np.array([True, True, False])
-        expected = tm.box_expected(expected, xbox)
-
-        result = idx == other
-
-        tm.assert_equal(result, expected)
-
-    def test_compare_zerodim(self, box_with_array):
-        # GH#26689 make sure we unbox zero-dimensional arrays
-
-        pi = period_range("2000", periods=4)
-        other = np.array(pi.to_numpy()[0])
-
-        pi = tm.box_expected(pi, box_with_array)
-        xbox = get_upcast_box(pi, other, True)
-
-        result = pi <= other
-        expected = np.array([True, False, False, False])
-        expected = tm.box_expected(expected, xbox)
-        tm.assert_equal(result, expected)
-
+class TestPeriodDisallowedFreqs:
     @pytest.mark.parametrize(
-        "scalar",
+        "freq, freq_msg",
         [
-            "foo",
-            Timestamp("2021-01-01"),
-            Timedelta(days=4),
-            9,
-            9.5,
-            2000,  # specifically don't consider 2000 to match Period("2000", "D")
-            False,
-            None,
+            (offsets.BYearBegin(), "BYearBegin"),
+            (offsets.YearBegin(2), "YearBegin"),
+            (offsets.QuarterBegin(startingMonth=12), "QuarterBegin"),
+            (offsets.BusinessMonthEnd(2), "BusinessMonthEnd"),
         ],
     )
-    def test_compare_invalid_scalar(self, box_with_array, scalar):
-        # GH#28980
-        # comparison with scalar that cannot be interpreted as a Period
-        pi = period_range("2000", periods=4)
-        parr = tm.box_expected(pi, box_with_array)
-        assert_invalid_comparison(parr, scalar, box_with_array)
-
-    @pytest.mark.parametrize(
-        "other",
-        [
-            pd.date_range("2000", periods=4).array,
-            pd.timedelta_range("1D", periods=4).array,
-            np.arange(4),
-            np.arange(4).astype(np.float64),
-            list(range(4)),
-            # match Period semantics by not treating integers as Periods
-            [2000, 2001, 2002, 2003],
-            np.arange(2000, 2004),
-            np.arange(2000, 2004).astype(object),
-            pd.Index([2000, 2001, 2002, 2003]),
-        ],
-    )
-    def test_compare_invalid_listlike(self, box_with_array, other):
-        pi = period_range("2000", periods=4)
-        parr = tm.box_expected(pi, box_with_array)
-        assert_invalid_comparison(parr, other, box_with_array)
-
-    @pytest.mark.parametrize("other_box", [list, np.array, lambda x: x.astype(object)])
-    def test_compare_object_dtype(self, box_with_array, other_box):
-        pi = period_range("2000", periods=5)
-        parr = tm.box_expected(pi, box_with_array)
-
-        other = other_box(pi)
-        xbox = get_upcast_box(parr, other, True)
-
-        expected = np.array([True, True, True, True, True])
-        expected = tm.box_expected(expected, xbox)
-
-        result = parr == other
-        tm.assert_equal(result, expected)
-        result = parr <= other
-        tm.assert_equal(result, expected)
-        result = parr >= other
-        tm.assert_equal(result, expected)
-
-        result = parr != other
-        tm.assert_equal(result, ~expected)
-        result = parr < other
-        tm.assert_equal(result, ~expected)
-        result = parr > other
-        tm.assert_equal(result, ~expected)
-
-        other = other_box(pi[::-1])
-
-        expected = np.array([False, False, True, False, False])
-        expected = tm.box_expected(expected, xbox)
-        result = parr == other
-        tm.assert_equal(result, expected)
-
-        expected = np.array([True, True, True, False, False])
-        expected = tm.box_expected(expected, xbox)
-        result = parr <= other
-        tm.assert_equal(result, expected)
-
-        expected = np.array([False, False, True, True, True])
-        expected = tm.box_expected(expected, xbox)
-        result = parr >= other
-        tm.assert_equal(result, expected)
-
-        expected = np.array([True, True, False, True, True])
-        expected = tm.box_expected(expected, xbox)
-        result = parr != other
-        tm.assert_equal(result, expected)
-
-        expected = np.array([True, True, False, False, False])
-        expected = tm.box_expected(expected, xbox)
-        result = parr < other
-        tm.assert_equal(result, expected)
-
-        expected = np.array([False, False, False, True, True])
-        expected = tm.box_expected(expected, xbox)
-        result = parr > other
-        tm.assert_equal(result, expected)
-
-
-class TestPeriodIndexComparisons:
-    # TODO: parameterize over boxes
-
-    def test_pi_cmp_period(self):
-        idx = period_range("2007-01", periods=20, freq="M")
-        per = idx[10]
-
-        result = idx < per
-        exp = idx.values < idx.values[10]
-        tm.assert_numpy_array_equal(result, exp)
-
-        # Tests Period.__richcmp__ against ndarray[object, ndim=2]
-        result = idx.values.reshape(10, 2) < per
-        tm.assert_numpy_array_equal(result, exp.reshape(10, 2))
-
-        # Tests Period.__richcmp__ against ndarray[object, ndim=0]
-        result = idx < np.array(per)
-        tm.assert_numpy_array_equal(result, exp)
-
-    # TODO: moved from test_datetime64; de-duplicate with version below
-    def test_parr_cmp_period_scalar2(self, box_with_array):
-        pi = period_range("2000-01-01", periods=10, freq="D")
-
-        val = pi[3]
-        expected = [x > val for x in pi]
-
-        ser = tm.box_expected(pi, box_with_array)
-        xbox = get_upcast_box(ser, val, True)
-
-        expected = tm.box_expected(expected, xbox)
-        result = ser > val
-        tm.assert_equal(result, expected)
-
-        val = pi[5]
-        result = ser > val
-        expected = [x > val for x in pi]
-        expected = tm.box_expected(expected, xbox)
-        tm.assert_equal(result, expected)
-
-    @pytest.mark.parametrize("freq", ["M", "2M", "3M"])
-    def test_parr_cmp_period_scalar(self, freq, box_with_array):
-        # GH#13200
-        base = PeriodIndex(["2011-01", "2011-02", "2011-03", "2011-04"], freq=freq)
-        base = tm.box_expected(base, box_with_array)
-        per = Period("2011-02", freq=freq)
-        xbox = get_upcast_box(base, per, True)
-
-        exp = np.array([False, True, False, False])
-        exp = tm.box_expected(exp, xbox)
-        tm.assert_equal(base == per, exp)
-        tm.assert_equal(per == base, exp)
-
-        exp = np.array([True, False, True, True])
-        exp = tm.box_expected(exp, xbox)
-        tm.assert_equal(base != per, exp)
-        tm.assert_equal(per != base, exp)
-
-        exp = np.array([False, False, True, True])
-        exp = tm.box_expected(exp, xbox)
-        tm.assert_equal(base > per, exp)
-        tm.assert_equal(per < base, exp)
-
-        exp = np.array([True, False, False, False])
-        exp = tm.box_expected(exp, xbox)
-        tm.assert_equal(base < per, exp)
-        tm.assert_equal(per > base, exp)
-
-        exp = np.array([False, True, True, True])
-        exp = tm.box_expected(exp, xbox)
-        tm.assert_equal(base >= per, exp)
-        tm.assert_equal(per <= base, exp)
-
-        exp = np.array([True, True, False, False])
-        exp = tm.box_expected(exp, xbox)
-        tm.assert_equal(base <= per, exp)
-        tm.assert_equal(per >= base, exp)
-
-    @pytest.mark.parametrize("freq", ["M", "2M", "3M"])
-    def test_parr_cmp_pi(self, freq, box_with_array):
-        # GH#13200
-        base = PeriodIndex(["2011-01", "2011-02", "2011-03", "2011-04"], freq=freq)
-        base = tm.box_expected(base, box_with_array)
-
-        # TODO: could also box idx?
-        idx = PeriodIndex(["2011-02", "2011-01", "2011-03", "2011-05"], freq=freq)
-
-        xbox = get_upcast_box(base, idx, True)
-
-        exp = np.array([False, False, True, False])
-        exp = tm.box_expected(exp, xbox)
-        tm.assert_equal(base == idx, exp)
-
-        exp = np.array([True, True, False, True])
-        exp = tm.box_expected(exp, xbox)
-        tm.assert_equal(base != idx, exp)
-
-        exp = np.array([False, True, False, False])
-        exp = tm.box_expected(exp, xbox)
-        tm.assert_equal(base > idx, exp)
-
-        exp = np.array([True, False, False, True])
-        exp = tm.box_expected(exp, xbox)
-        tm.assert_equal(base < idx, exp)
-
-        exp = np.array([False, True, True, False])
-        exp = tm.box_expected(exp, xbox)
-        tm.assert_equal(base >= idx, exp)
-
-        exp = np.array([True, False, True, True])
-        exp = tm.box_expected(exp, xbox)
-        tm.assert_equal(base <= idx, exp)
-
-    @pytest.mark.parametrize("freq", ["M", "2M", "3M"])
-    def test_parr_cmp_pi_mismatched_freq(self, freq, box_with_array):
-        # GH#13200
-        # different base freq
-        base = PeriodIndex(["2011-01", "2011-02", "2011-03", "2011-04"], freq=freq)
-        base = tm.box_expected(base, box_with_array)
-
-        msg = rf"Invalid comparison between dtype=period\[{freq}\] and Period"
-        with pytest.raises(TypeError, match=msg):
-            base <= Period("2011", freq="Y")
-
-        with pytest.raises(TypeError, match=msg):
-            Period("2011", freq="Y") >= base
-
-        # TODO: Could parametrize over boxes for idx?
-        idx = PeriodIndex(["2011", "2012", "2013", "2014"], freq="Y")
-        rev_msg = r"Invalid comparison between dtype=period\[Y-DEC\] and PeriodArray"
-        idx_msg = rev_msg if box_with_array in [tm.to_array, pd.array] else msg
-        with pytest.raises(TypeError, match=idx_msg):
-            base <= idx
-
-        # Different frequency
-        msg = rf"Invalid comparison between dtype=period\[{freq}\] and Period"
-        with pytest.raises(TypeError, match=msg):
-            base <= Period("2011", freq="4M")
-
-        with pytest.raises(TypeError, match=msg):
-            Period("2011", freq="4M") >= base
-
-        idx = PeriodIndex(["2011", "2012", "2013", "2014"], freq="4M")
-        rev_msg = r"Invalid comparison between dtype=period\[4M\] and PeriodArray"
-        idx_msg = rev_msg if box_with_array in [tm.to_array, pd.array] else msg
-        with pytest.raises(TypeError, match=idx_msg):
-            base <= idx
-
-    @pytest.mark.parametrize("freq", ["M", "2M", "3M"])
-    def test_pi_cmp_nat(self, freq):
-        idx1 = PeriodIndex(["2011-01", "2011-02", "NaT", "2011-05"], freq=freq)
-        per = idx1[1]
-
-        result = idx1 > per
-        exp = np.array([False, False, False, True])
-        tm.assert_numpy_array_equal(result, exp)
-        result = per < idx1
-        tm.assert_numpy_array_equal(result, exp)
-
-        result = idx1 == pd.NaT
-        exp = np.array([False, False, False, False])
-        tm.assert_numpy_array_equal(result, exp)
-        result = pd.NaT == idx1
-        tm.assert_numpy_array_equal(result, exp)
-
-        result = idx1 != pd.NaT
-        exp = np.array([True, True, True, True])
-        tm.assert_numpy_array_equal(result, exp)
-        result = pd.NaT != idx1
-        tm.assert_numpy_array_equal(result, exp)
-
-        idx2 = PeriodIndex(["2011-02", "2011-01", "2011-04", "NaT"], freq=freq)
-        result = idx1 < idx2
-        exp = np.array([True, False, False, False])
-        tm.assert_numpy_array_equal(result, exp)
-
-        result = idx1 == idx2
-        exp = np.array([False, False, False, False])
-        tm.assert_numpy_array_equal(result, exp)
-
-        result = idx1 != idx2
-        exp = np.array([True, True, True, True])
-        tm.assert_numpy_array_equal(result, exp)
-
-        result = idx1 == idx1
-        exp = np.array([True, True, False, True])
-        tm.assert_numpy_array_equal(result, exp)
-
-        result = idx1 != idx1
-        exp = np.array([False, False, True, False])
-        tm.assert_numpy_array_equal(result, exp)
-
-    @pytest.mark.parametrize("freq", ["M", "2M", "3M"])
-    def test_pi_cmp_nat_mismatched_freq_raises(self, freq):
-        idx1 = PeriodIndex(["2011-01", "2011-02", "NaT", "2011-05"], freq=freq)
-
-        diff = PeriodIndex(["2011-02", "2011-01", "2011-04", "NaT"], freq="4M")
-        msg = rf"Invalid comparison between dtype=period\[{freq}\] and PeriodArray"
-        with pytest.raises(TypeError, match=msg):
-            idx1 > diff
-
-        result = idx1 == diff
-        expected = np.array([False, False, False, False], dtype=bool)
-        tm.assert_numpy_array_equal(result, expected)
-
-    # TODO: De-duplicate with test_pi_cmp_nat
-    @pytest.mark.parametrize("dtype", [object, None])
-    def test_comp_nat(self, dtype):
-        left = PeriodIndex([Period("2011-01-01"), pd.NaT, Period("2011-01-03")])
-        right = PeriodIndex([pd.NaT, pd.NaT, Period("2011-01-03")])
-
-        if dtype is not None:
-            left = left.astype(dtype)
-            right = right.astype(dtype)
-
-        result = left == right
-        expected = np.array([False, False, True])
-        tm.assert_numpy_array_equal(result, expected)
-
-        result = left != right
-        expected = np.array([True, True, False])
-        tm.assert_numpy_array_equal(result, expected)
-
-        expected = np.array([False, False, False])
-        tm.assert_numpy_array_equal(left == pd.NaT, expected)
-        tm.assert_numpy_array_equal(pd.NaT == right, expected)
-
-        expected = np.array([True, True, True])
-        tm.assert_numpy_array_equal(left != pd.NaT, expected)
-        tm.assert_numpy_array_equal(pd.NaT != left, expected)
-
-        expected = np.array([False, False, False])
-        tm.assert_numpy_array_equal(left < pd.NaT, expected)
-        tm.assert_numpy_array_equal(pd.NaT > left, expected)
-
-
-class TestPeriodSeriesComparisons:
-    def test_cmp_series_period_series_mixed_freq(self):
-        # GH#13200
-        base = Series(
-            [
-                Period("2011", freq="Y"),
-                Period("2011-02", freq="M"),
-                Period("2013", freq="Y"),
-                Period("2011-04", freq="M"),
-            ]
+    def test_offsets_not_supported(self, freq, freq_msg):
+        # GH#55785
+        msg = re.escape(f"{freq} is not supported as period frequency")
+        with pytest.raises(ValueError, match=msg):
+            Period(year=2014, freq=freq)
+
+    def test_custom_business_day_freq_raises(self):
+        # GH#52534
+        msg = "C is not supported as period frequency"
+        with pytest.raises(ValueError, match=msg):
+            Period("2023-04-10", freq="C")
+        msg = f"{offsets.CustomBusinessDay().base} is not supported as period frequency"
+        with pytest.raises(ValueError, match=msg):
+            Period("2023-04-10", freq=offsets.CustomBusinessDay())
+
+    def test_invalid_frequency_error_message(self):
+        msg = "WOM-1MON is not supported as period frequency"
+        with pytest.raises(ValueError, match=msg):
+            Period("2012-01-02", freq="WOM-1MON")
+
+    def test_invalid_frequency_period_error_message(self):
+        msg = "for Period, please use 'M' instead of 'ME'"
+        with pytest.raises(ValueError, match=msg):
+            Period("2012-01-02", freq="ME")
+
+
+class TestPeriodConstruction:
+    def test_from_td64nat_raises(self):
+        # GH#44507
+        td = NaT.to_numpy("m8[ns]")
+
+        msg = "Value must be Period, string, integer, or datetime"
+        with pytest.raises(ValueError, match=msg):
+            Period(td)
+
+        with pytest.raises(ValueError, match=msg):
+            Period(td, freq="D")
+
+    def test_construction(self):
+        i1 = Period("1/1/2005", freq="M")
+        i2 = Period("Jan 2005")
+
+        assert i1 == i2
+
+        # GH#54105 - Period can be confusingly instantiated with lowercase freq
+        # TODO: raise in the future an error when passing lowercase freq
+        i1 = Period("2005", freq="Y")
+        i2 = Period("2005")
+
+        assert i1 == i2
+
+        i4 = Period("2005", freq="M")
+        assert i1 != i4
+
+        i1 = Period.now(freq="Q")
+        i2 = Period(datetime.now(), freq="Q")
+
+        assert i1 == i2
+
+        # Pass in freq as a keyword argument sometimes as a test for
+        # https://github.com/pandas-dev/pandas/issues/53369
+        i1 = Period.now(freq="D")
+        i2 = Period(datetime.now(), freq="D")
+        i3 = Period.now(offsets.Day())
+
+        assert i1 == i2
+        assert i1 == i3
+
+        i1 = Period("1982", freq="min")
+        msg = "'MIN' is deprecated and will be removed in a future version."
+        with tm.assert_produces_warning(FutureWarning, match=msg):
+            i2 = Period("1982", freq="MIN")
+        assert i1 == i2
+
+        i1 = Period(year=2005, month=3, day=1, freq="D")
+        i2 = Period("3/1/2005", freq="D")
+        assert i1 == i2
+
+        i3 = Period(year=2005, month=3, day=1, freq="d")
+        assert i1 == i3
+
+        i1 = Period("2007-01-01 09:00:00.001")
+        expected = Period(datetime(2007, 1, 1, 9, 0, 0, 1000), freq="ms")
+        assert i1 == expected
+
+        expected = Period("2007-01-01 09:00:00.001", freq="ms")
+        assert i1 == expected
+
+        i1 = Period("2007-01-01 09:00:00.00101")
+        expected = Period(datetime(2007, 1, 1, 9, 0, 0, 1010), freq="us")
+        assert i1 == expected
+
+        expected = Period("2007-01-01 09:00:00.00101", freq="us")
+        assert i1 == expected
+
+        msg = "Must supply freq for ordinal value"
+        with pytest.raises(ValueError, match=msg):
+            Period(ordinal=200701)
+
+        msg = "Invalid frequency: X"
+        with pytest.raises(ValueError, match=msg):
+            Period("2007-1-1", freq="X")
+
+    def test_tuple_freq_disallowed(self):
+        # GH#34703 tuple freq disallowed
+        with pytest.raises(TypeError, match="pass as a string instead"):
+            Period("1982", freq=("Min", 1))
+
+        with pytest.raises(TypeError, match="pass as a string instead"):
+            Period("2006-12-31", ("w", 1))
+
+    def test_construction_from_timestamp_nanos(self):
+        # GH#46811 don't drop nanos from Timestamp
+        ts = Timestamp("2022-04-20 09:23:24.123456789")
+        per = Period(ts, freq="ns")
+
+        # should losslessly round-trip, not lose the 789
+        rt = per.to_timestamp()
+        assert rt == ts
+
+        # same thing but from a datetime64 object
+        dt64 = ts.asm8
+        per2 = Period(dt64, freq="ns")
+        rt2 = per2.to_timestamp()
+        assert rt2.asm8 == dt64
+
+    def test_construction_bday(self):
+        # Biz day construction, roll forward if non-weekday
+        with tm.assert_produces_warning(FutureWarning, match=bday_msg):
+            i1 = Period("3/10/12", freq="B")
+            i2 = Period("3/10/12", freq="D")
+            assert i1 == i2.asfreq("B")
+            i2 = Period("3/11/12", freq="D")
+            assert i1 == i2.asfreq("B")
+            i2 = Period("3/12/12", freq="D")
+            assert i1 == i2.asfreq("B")
+
+            i3 = Period("3/10/12", freq="b")
+            assert i1 == i3
+
+            i1 = Period(year=2012, month=3, day=10, freq="B")
+            i2 = Period("3/12/12", freq="B")
+            assert i1 == i2
+
+    def test_construction_quarter(self):
+        i1 = Period(year=2005, quarter=1, freq="Q")
+        i2 = Period("1/1/2005", freq="Q")
+        assert i1 == i2
+
+        i1 = Period(year=2005, quarter=3, freq="Q")
+        i2 = Period("9/1/2005", freq="Q")
+        assert i1 == i2
+
+        i1 = Period("2005Q1")
+        i2 = Period(year=2005, quarter=1, freq="Q")
+        i3 = Period("2005q1")
+        assert i1 == i2
+        assert i1 == i3
+
+        i1 = Period("05Q1")
+        assert i1 == i2
+        lower = Period("05q1")
+        assert i1 == lower
+
+        i1 = Period("1Q2005")
+        assert i1 == i2
+        lower = Period("1q2005")
+        assert i1 == lower
+
+        i1 = Period("1Q05")
+        assert i1 == i2
+        lower = Period("1q05")
+        assert i1 == lower
+
+        i1 = Period("4Q1984")
+        assert i1.year == 1984
+        lower = Period("4q1984")
+        assert i1 == lower
+
+    def test_construction_month(self):
+        expected = Period("2007-01", freq="M")
+        i1 = Period("200701", freq="M")
+        assert i1 == expected
+
+        i1 = Period("200701", freq="M")
+        assert i1 == expected
+
+        i1 = Period(200701, freq="M")
+        assert i1 == expected
+
+        i1 = Period(ordinal=200701, freq="M")
+        assert i1.year == 18695
+
+        i1 = Period(datetime(2007, 1, 1), freq="M")
+        i2 = Period("200701", freq="M")
+        assert i1 == i2
+
+        i1 = Period(date(2007, 1, 1), freq="M")
+        i2 = Period(datetime(2007, 1, 1), freq="M")
+        i3 = Period(np.datetime64("2007-01-01"), freq="M")
+        i4 = Period("2007-01-01 00:00:00", freq="M")
+        i5 = Period("2007-01-01 00:00:00.000", freq="M")
+        assert i1 == i2
+        assert i1 == i3
+        assert i1 == i4
+        assert i1 == i5
+
+    def test_period_constructor_offsets(self):
+        assert Period("1/1/2005", freq=offsets.MonthEnd()) == Period(
+            "1/1/2005", freq="M"
         )
-
-        ser = Series(
-            [
-                Period("2012", freq="Y"),
-                Period("2011-01", freq="M"),
-                Period("2013", freq="Y"),
-                Period("2011-05", freq="M"),
-            ]
-        )
-
-        exp = Series([False, False, True, False])
-        tm.assert_series_equal(base == ser, exp)
-
-        exp = Series([True, True, False, True])
-        tm.assert_series_equal(base != ser, exp)
-
-        exp = Series([False, True, False, False])
-        tm.assert_series_equal(base > ser, exp)
-
-        exp = Series([True, False, False, True])
-        tm.assert_series_equal(base < ser, exp)
-
-        exp = Series([False, True, True, False])
-        tm.assert_series_equal(base >= ser, exp)
-
-        exp = Series([True, False, True, True])
-        tm.assert_series_equal(base <= ser, exp)
-
-
-class TestPeriodIndexSeriesComparisonConsistency:
-    """Test PeriodIndex and Period Series Ops consistency"""
-
-    # TODO: needs parametrization+de-duplication
-
-    def _check(self, values, func, expected):
-        # Test PeriodIndex and Period Series Ops consistency
-
-        idx = PeriodIndex(values)
-        result = func(idx)
-
-        # check that we don't pass an unwanted type to tm.assert_equal
-        assert isinstance(expected, (pd.Index, np.ndarray))
-        tm.assert_equal(result, expected)
-
-        s = Series(values)
-        result = func(s)
-
-        exp = Series(expected, name=values.name)
-        tm.assert_series_equal(result, exp)
-
-    def test_pi_comp_period(self):
-        idx = PeriodIndex(
-            ["2011-01", "2011-02", "2011-03", "2011-04"], freq="M", name="idx"
-        )
-        per = idx[2]
-
-        f = lambda x: x == per
-        exp = np.array([False, False, True, False], dtype=np.bool_)
-        self._check(idx, f, exp)
-        f = lambda x: per == x
-        self._check(idx, f, exp)
-
-        f = lambda x: x != per
-        exp = np.array([True, True, False, True], dtype=np.bool_)
-        self._check(idx, f, exp)
-        f = lambda x: per != x
-        self._check(idx, f, exp)
-
-        f = lambda x: per >= x
-        exp = np.array([True, True, True, False], dtype=np.bool_)
-        self._check(idx, f, exp)
-
-        f = lambda x: x > per
-        exp = np.array([False, False, False, True], dtype=np.bool_)
-        self._check(idx, f, exp)
-
-        f = lambda x: per >= x
-        exp = np.array([True, True, True, False], dtype=np.bool_)
-        self._check(idx, f, exp)
-
-    def test_pi_comp_period_nat(self):
-        idx = PeriodIndex(
-            ["2011-01", "NaT", "2011-03", "2011-04"], freq="M", name="idx"
-        )
-        per = idx[2]
-
-        f = lambda x: x == per
-        exp = np.array([False, False, True, False], dtype=np.bool_)
-        self._check(idx, f, exp)
-        f = lambda x: per == x
-        self._check(idx, f, exp)
-
-        f = lambda x: x == pd.NaT
-        exp = np.array([False, False, False, False], dtype=np.bool_)
-        self._check(idx, f, exp)
-        f = lambda x: pd.NaT == x
-        self._check(idx, f, exp)
-
-        f = lambda x: x != per
-        exp = np.array([True, True, False, True], dtype=np.bool_)
-        self._check(idx, f, exp)
-        f = lambda x: per != x
-        self._check(idx, f, exp)
-
-        f = lambda x: x != pd.NaT
-        exp = np.array([True, True, True, True], dtype=np.bool_)
-        self._check(idx, f, exp)
-        f = lambda x: pd.NaT != x
-        self._check(idx, f, exp)
-
-        f = lambda x: per >= x
-        exp = np.array([True, False, True, False], dtype=np.bool_)
-        self._check(idx, f, exp)
-
-        f = lambda x: x < per
-        exp = np.array([True, False, False, False], dtype=np.bool_)
-        self._check(idx, f, exp)
-
-        f = lambda x: x > pd.NaT
-        exp = np.array([False, False, False, False], dtype=np.bool_)
-        self._check(idx, f, exp)
-
-        f = lambda x: pd.NaT >= x
-        exp = np.array([False, False, False, False], dtype=np.bool_)
-        self._check(idx, f, exp)
-
-
-# ------------------------------------------------------------------
-# Arithmetic
-
-
-class TestPeriodFrameArithmetic:
-    def test_ops_frame_period(self):
-        # GH#13043
-        df = pd.DataFrame(
-            {
-                "A": [Period("2015-01", freq="M"), Period("2015-02", freq="M")],
-                "B": [Period("2014-01", freq="M"), Period("2014-02", freq="M")],
-            }
-        )
-        assert df["A"].dtype == "Period[M]"
-        assert df["B"].dtype == "Period[M]"
-
-        p = Period("2015-03", freq="M")
-        off = p.freq
-        # dtype will be object because of original dtype
-        exp = pd.DataFrame(
-            {
-                "A": np.array([2 * off, 1 * off], dtype=object),
-                "B": np.array([14 * off, 13 * off], dtype=object),
-            }
-        )
-        tm.assert_frame_equal(p - df, exp)
-        tm.assert_frame_equal(df - p, -1 * exp)
-
-        df2 = pd.DataFrame(
-            {
-                "A": [Period("2015-05", freq="M"), Period("2015-06", freq="M")],
-                "B": [Period("2015-05", freq="M"), Period("2015-06", freq="M")],
-            }
-        )
-        assert df2["A"].dtype == "Period[M]"
-        assert df2["B"].dtype == "Period[M]"
-
-        exp = pd.DataFrame(
-            {
-                "A": np.array([4 * off, 4 * off], dtype=object),
-                "B": np.array([16 * off, 16 * off], dtype=object),
-            }
-        )
-        tm.assert_frame_equal(df2 - df, exp)
-        tm.assert_frame_equal(df - df2, -1 * exp)
-
-
-class TestPeriodIndexArithmetic:
-    # ---------------------------------------------------------------
-    # __add__/__sub__ with PeriodIndex
-    # PeriodIndex + other is defined for integers and timedelta-like others
-    # PeriodIndex - other is defined for integers, timedelta-like others,
-    #   and PeriodIndex (with matching freq)
-
-    def test_parr_add_iadd_parr_raises(self, box_with_array):
-        rng = period_range("1/1/2000", freq="D", periods=5)
-        other = period_range("1/6/2000", freq="D", periods=5)
-        # TODO: parametrize over boxes for other?
-
-        rng = tm.box_expected(rng, box_with_array)
-        # An earlier implementation of PeriodIndex addition performed
-        # a set operation (union).  This has since been changed to
-        # raise a TypeError. See GH#14164 and GH#13077 for historical
-        # reference.
-        msg = r"unsupported operand type\(s\) for \+: .* and .*"
-        with pytest.raises(TypeError, match=msg):
-            rng + other
-
-        with pytest.raises(TypeError, match=msg):
-            rng += other
-
-    def test_pi_sub_isub_pi(self):
-        # GH#20049
-        # For historical reference see GH#14164, GH#13077.
-        # PeriodIndex subtraction originally performed set difference,
-        # then changed to raise TypeError before being implemented in GH#20049
-        rng = period_range("1/1/2000", freq="D", periods=5)
-        other = period_range("1/6/2000", freq="D", periods=5)
-
-        off = rng.freq
-        expected = pd.Index([-5 * off] * 5)
-        result = rng - other
-        tm.assert_index_equal(result, expected)
-
-        rng -= other
-        tm.assert_index_equal(rng, expected)
-
-    def test_pi_sub_pi_with_nat(self):
-        rng = period_range("1/1/2000", freq="D", periods=5)
-        other = rng[1:].insert(0, pd.NaT)
-        assert other[1:].equals(rng[1:])
-
-        result = rng - other
-        off = rng.freq
-        expected = pd.Index([pd.NaT, 0 * off, 0 * off, 0 * off, 0 * off])
-        tm.assert_index_equal(result, expected)
-
-    def test_parr_sub_pi_mismatched_freq(self, box_with_array, box_with_array2):
-        rng = period_range("1/1/2000", freq="D", periods=5)
-        other = period_range("1/6/2000", freq="h", periods=5)
-
-        rng = tm.box_expected(rng, box_with_array)
-        other = tm.box_expected(other, box_with_array2)
-        msg = r"Input has different freq=[hD] from PeriodArray\(freq=[Dh]\)"
-        with pytest.raises(IncompatibleFrequency, match=msg):
-            rng - other
-
-    @pytest.mark.parametrize("n", [1, 2, 3, 4])
-    def test_sub_n_gt_1_ticks(self, tick_classes, n):
-        # GH 23878
-        p1_d = "19910905"
-        p2_d = "19920406"
-        p1 = PeriodIndex([p1_d], freq=tick_classes(n))
-        p2 = PeriodIndex([p2_d], freq=tick_classes(n))
-
-        expected = PeriodIndex([p2_d], freq=p2.freq.base) - PeriodIndex(
-            [p1_d], freq=p1.freq.base
-        )
-
-        tm.assert_index_equal((p2 - p1), expected)
-
-    @pytest.mark.parametrize("n", [1, 2, 3, 4])
-    @pytest.mark.parametrize(
-        "offset, kwd_name",
-        [
-            (pd.offsets.YearEnd, "month"),
-            (pd.offsets.QuarterEnd, "startingMonth"),
-            (pd.offsets.MonthEnd, None),
-            (pd.offsets.Week, "weekday"),
-        ],
-    )
-    def test_sub_n_gt_1_offsets(self, offset, kwd_name, n):
-        # GH 23878
-        kwds = {kwd_name: 3} if kwd_name is not None else {}
-        p1_d = "19910905"
-        p2_d = "19920406"
-        freq = offset(n, normalize=False, **kwds)
-        p1 = PeriodIndex([p1_d], freq=freq)
-        p2 = PeriodIndex([p2_d], freq=freq)
-
-        result = p2 - p1
-        expected = PeriodIndex([p2_d], freq=freq.base) - PeriodIndex(
-            [p1_d], freq=freq.base
-        )
-
-        tm.assert_index_equal(result, expected)
-
-    # -------------------------------------------------------------
-    # Invalid Operations
-
-    @pytest.mark.parametrize(
-        "other",
-        [
-            # datetime scalars
-            Timestamp("2016-01-01"),
-            Timestamp("2016-01-01").to_pydatetime(),
-            Timestamp("2016-01-01").to_datetime64(),
-            # datetime-like arrays
-            pd.date_range("2016-01-01", periods=3, freq="h"),
-            pd.date_range("2016-01-01", periods=3, tz="Europe/Brussels"),
-            pd.date_range("2016-01-01", periods=3, freq="s")._data,
-            pd.date_range("2016-01-01", periods=3, tz="Asia/Tokyo")._data,
-            # Miscellaneous invalid types
-            3.14,
-            np.array([2.0, 3.0, 4.0]),
-        ],
-    )
-    def test_parr_add_sub_invalid(self, other, box_with_array):
-        # GH#23215
-        rng = period_range("1/1/2000", freq="D", periods=3)
-        rng = tm.box_expected(rng, box_with_array)
-
-        msg = "|".join(
-            [
-                r"(:?cannot add PeriodArray and .*)",
-                r"(:?cannot subtract .* from (:?a\s)?.*)",
-                r"(:?unsupported operand type\(s\) for \+: .* and .*)",
-                r"unsupported operand type\(s\) for [+-]: .* and .*",
-            ]
-        )
-        assert_invalid_addsub_type(rng, other, msg)
-        with pytest.raises(TypeError, match=msg):
-            rng + other
-        with pytest.raises(TypeError, match=msg):
-            other + rng
-        with pytest.raises(TypeError, match=msg):
-            rng - other
-        with pytest.raises(TypeError, match=msg):
-            other - rng
-
-    # -----------------------------------------------------------------
-    # __add__/__sub__ with ndarray[datetime64] and ndarray[timedelta64]
-
-    def test_pi_add_sub_td64_array_non_tick_raises(self):
-        rng = period_range("1/1/2000", freq="Q", periods=3)
-        tdi = TimedeltaIndex(["-1 Day", "-1 Day", "-1 Day"])
-        tdarr = tdi.values
-
-        msg = r"Cannot add or subtract timedelta64\[ns\] dtype from period\[Q-DEC\]"
-        with pytest.raises(TypeError, match=msg):
-            rng + tdarr
-        with pytest.raises(TypeError, match=msg):
-            tdarr + rng
-
-        with pytest.raises(TypeError, match=msg):
-            rng - tdarr
-        msg = r"cannot subtract PeriodArray from TimedeltaArray"
-        with pytest.raises(TypeError, match=msg):
-            tdarr - rng
-
-    def test_pi_add_sub_td64_array_tick(self):
-        # PeriodIndex + Timedelta-like is allowed only with
-        #   tick-like frequencies
-        rng = period_range("1/1/2000", freq="90D", periods=3)
-        tdi = TimedeltaIndex(["-1 Day", "-1 Day", "-1 Day"])
-        tdarr = tdi.values
-
-        expected = period_range("12/31/1999", freq="90D", periods=3)
-        result = rng + tdi
-        tm.assert_index_equal(result, expected)
-        result = rng + tdarr
-        tm.assert_index_equal(result, expected)
-        result = tdi + rng
-        tm.assert_index_equal(result, expected)
-        result = tdarr + rng
-        tm.assert_index_equal(result, expected)
-
-        expected = period_range("1/2/2000", freq="90D", periods=3)
-
-        result = rng - tdi
-        tm.assert_index_equal(result, expected)
-        result = rng - tdarr
-        tm.assert_index_equal(result, expected)
-
-        msg = r"cannot subtract .* from .*"
-        with pytest.raises(TypeError, match=msg):
-            tdarr - rng
-
-        with pytest.raises(TypeError, match=msg):
-            tdi - rng
-
-    @pytest.mark.parametrize("pi_freq", ["D", "W", "Q", "h"])
-    @pytest.mark.parametrize("tdi_freq", [None, "h"])
-    def test_parr_sub_td64array(self, box_with_array, tdi_freq, pi_freq):
-        box = box_with_array
-        xbox = box if box not in [pd.array, tm.to_array] else pd.Index
-
-        tdi = TimedeltaIndex(["1 hours", "2 hours"], freq=tdi_freq)
-        dti = Timestamp("2018-03-07 17:16:40") + tdi
-        pi = dti.to_period(pi_freq)
-
-        # TODO: parametrize over box for pi?
-        td64obj = tm.box_expected(tdi, box)
-
-        if pi_freq == "h":
-            result = pi - td64obj
-            expected = (pi.to_timestamp("s") - tdi).to_period(pi_freq)
-            expected = tm.box_expected(expected, xbox)
-            tm.assert_equal(result, expected)
-
-            # Subtract from scalar
-            result = pi[0] - td64obj
-            expected = (pi[0].to_timestamp("s") - tdi).to_period(pi_freq)
-            expected = tm.box_expected(expected, box)
-            tm.assert_equal(result, expected)
-
-        elif pi_freq == "D":
-            # Tick, but non-compatible
-            msg = (
-                "Cannot add/subtract timedelta-like from PeriodArray that is "
-                "not an integer multiple of the PeriodArray's freq."
+        assert Period("2005", freq=offsets.YearEnd()) == Period("2005", freq="Y")
+        assert Period("2005", freq=offsets.MonthEnd()) == Period("2005", freq="M")
+        with tm.assert_produces_warning(FutureWarning, match=bday_msg):
+            assert Period("3/10/12", freq=offsets.BusinessDay()) == Period(
+                "3/10/12", freq="B"
             )
-            with pytest.raises(IncompatibleFrequency, match=msg):
-                pi - td64obj
+        assert Period("3/10/12", freq=offsets.Day()) == Period("3/10/12", freq="D")
 
-            with pytest.raises(IncompatibleFrequency, match=msg):
-                pi[0] - td64obj
+        assert Period(
+            year=2005, quarter=1, freq=offsets.QuarterEnd(startingMonth=12)
+        ) == Period(year=2005, quarter=1, freq="Q")
+        assert Period(
+            year=2005, quarter=2, freq=offsets.QuarterEnd(startingMonth=12)
+        ) == Period(year=2005, quarter=2, freq="Q")
 
+        assert Period(year=2005, month=3, day=1, freq=offsets.Day()) == Period(
+            year=2005, month=3, day=1, freq="D"
+        )
+        with tm.assert_produces_warning(FutureWarning, match=bday_msg):
+            assert Period(year=2012, month=3, day=10, freq=offsets.BDay()) == Period(
+                year=2012, month=3, day=10, freq="B"
+            )
+
+        expected = Period("2005-03-01", freq="3D")
+        assert Period(year=2005, month=3, day=1, freq=offsets.Day(3)) == expected
+        assert Period(year=2005, month=3, day=1, freq="3D") == expected
+
+        with tm.assert_produces_warning(FutureWarning, match=bday_msg):
+            assert Period(year=2012, month=3, day=10, freq=offsets.BDay(3)) == Period(
+                year=2012, month=3, day=10, freq="3B"
+            )
+
+        assert Period(200701, freq=offsets.MonthEnd()) == Period(200701, freq="M")
+
+        i1 = Period(ordinal=200701, freq=offsets.MonthEnd())
+        i2 = Period(ordinal=200701, freq="M")
+        assert i1 == i2
+        assert i1.year == 18695
+        assert i2.year == 18695
+
+        i1 = Period(datetime(2007, 1, 1), freq="M")
+        i2 = Period("200701", freq="M")
+        assert i1 == i2
+
+        i1 = Period(date(2007, 1, 1), freq="M")
+        i2 = Period(datetime(2007, 1, 1), freq="M")
+        i3 = Period(np.datetime64("2007-01-01"), freq="M")
+        i4 = Period("2007-01-01 00:00:00", freq="M")
+        i5 = Period("2007-01-01 00:00:00.000", freq="M")
+        assert i1 == i2
+        assert i1 == i3
+        assert i1 == i4
+        assert i1 == i5
+
+        i1 = Period("2007-01-01 09:00:00.001")
+        expected = Period(datetime(2007, 1, 1, 9, 0, 0, 1000), freq="ms")
+        assert i1 == expected
+
+        expected = Period("2007-01-01 09:00:00.001", freq="ms")
+        assert i1 == expected
+
+        i1 = Period("2007-01-01 09:00:00.00101")
+        expected = Period(datetime(2007, 1, 1, 9, 0, 0, 1010), freq="us")
+        assert i1 == expected
+
+        expected = Period("2007-01-01 09:00:00.00101", freq="us")
+        assert i1 == expected
+
+    def test_invalid_arguments(self):
+        msg = "Must supply freq for datetime value"
+        with pytest.raises(ValueError, match=msg):
+            Period(datetime.now())
+        with pytest.raises(ValueError, match=msg):
+            Period(datetime.now().date())
+
+        msg = "Value must be Period, string, integer, or datetime"
+        with pytest.raises(ValueError, match=msg):
+            Period(1.6, freq="D")
+        msg = "Ordinal must be an integer"
+        with pytest.raises(ValueError, match=msg):
+            Period(ordinal=1.6, freq="D")
+        msg = "Only value or ordinal but not both should be given but not both"
+        with pytest.raises(ValueError, match=msg):
+            Period(ordinal=2, value=1, freq="D")
+
+        msg = "If value is None, freq cannot be None"
+        with pytest.raises(ValueError, match=msg):
+            Period(month=1)
+
+        msg = '^Given date string "-2000" not likely a datetime$'
+        with pytest.raises(ValueError, match=msg):
+            Period("-2000", "Y")
+        if PY314:
+            msg = "day 0 must be in range 1..31 for month 1 in year 1: 0"
         else:
-            # With non-Tick freq, we could not add timedelta64 array regardless
-            #  of what its resolution is
-            msg = "Cannot add or subtract timedelta64"
-            with pytest.raises(TypeError, match=msg):
-                pi - td64obj
-            with pytest.raises(TypeError, match=msg):
-                pi[0] - td64obj
-
-    # -----------------------------------------------------------------
-    # operations with array/Index of DateOffset objects
-
-    @pytest.mark.parametrize("box", [np.array, pd.Index])
-    def test_pi_add_offset_array(self, box):
-        # GH#18849
-        pi = PeriodIndex([Period("2015Q1"), Period("2016Q2")])
-        offs = box(
-            [
-                pd.offsets.QuarterEnd(n=1, startingMonth=12),
-                pd.offsets.QuarterEnd(n=-2, startingMonth=12),
-            ]
-        )
-        expected = PeriodIndex([Period("2015Q2"), Period("2015Q4")]).astype(object)
-
-        with tm.assert_produces_warning(PerformanceWarning):
-            res = pi + offs
-        tm.assert_index_equal(res, expected)
-
-        with tm.assert_produces_warning(PerformanceWarning):
-            res2 = offs + pi
-        tm.assert_index_equal(res2, expected)
-
-        unanchored = np.array([pd.offsets.Hour(n=1), pd.offsets.Minute(n=-2)])
-        # addition/subtraction ops with incompatible offsets should issue
-        # a PerformanceWarning and _then_ raise a TypeError.
-        msg = r"Input cannot be converted to Period\(freq=Q-DEC\)"
-        with pytest.raises(IncompatibleFrequency, match=msg):
-            with tm.assert_produces_warning(PerformanceWarning):
-                pi + unanchored
-        with pytest.raises(IncompatibleFrequency, match=msg):
-            with tm.assert_produces_warning(PerformanceWarning):
-                unanchored + pi
-
-    @pytest.mark.parametrize("box", [np.array, pd.Index])
-    def test_pi_sub_offset_array(self, box):
-        # GH#18824
-        pi = PeriodIndex([Period("2015Q1"), Period("2016Q2")])
-        other = box(
-            [
-                pd.offsets.QuarterEnd(n=1, startingMonth=12),
-                pd.offsets.QuarterEnd(n=-2, startingMonth=12),
-            ]
-        )
-
-        expected = PeriodIndex([pi[n] - other[n] for n in range(len(pi))])
-        expected = expected.astype(object)
-
-        with tm.assert_produces_warning(PerformanceWarning):
-            res = pi - other
-        tm.assert_index_equal(res, expected)
-
-        anchored = box([pd.offsets.MonthEnd(), pd.offsets.Day(n=2)])
-
-        # addition/subtraction ops with anchored offsets should issue
-        # a PerformanceWarning and _then_ raise a TypeError.
-        msg = r"Input has different freq=-1M from Period\(freq=Q-DEC\)"
-        with pytest.raises(IncompatibleFrequency, match=msg):
-            with tm.assert_produces_warning(PerformanceWarning):
-                pi - anchored
-        with pytest.raises(IncompatibleFrequency, match=msg):
-            with tm.assert_produces_warning(PerformanceWarning):
-                anchored - pi
-
-    def test_pi_add_iadd_int(self, one):
-        # Variants of `one` for #19012
-        rng = period_range("2000-01-01 09:00", freq="h", periods=10)
-        result = rng + one
-        expected = period_range("2000-01-01 10:00", freq="h", periods=10)
-        tm.assert_index_equal(result, expected)
-        rng += one
-        tm.assert_index_equal(rng, expected)
-
-    def test_pi_sub_isub_int(self, one):
-        """
-        PeriodIndex.__sub__ and __isub__ with several representations of
-        the integer 1, e.g. int, np.int64, np.uint8, ...
-        """
-        rng = period_range("2000-01-01 09:00", freq="h", periods=10)
-        result = rng - one
-        expected = period_range("2000-01-01 08:00", freq="h", periods=10)
-        tm.assert_index_equal(result, expected)
-        rng -= one
-        tm.assert_index_equal(rng, expected)
-
-    @pytest.mark.parametrize("five", [5, np.array(5, dtype=np.int64)])
-    def test_pi_sub_intlike(self, five):
-        rng = period_range("2007-01", periods=50)
-
-        result = rng - five
-        exp = rng + (-five)
-        tm.assert_index_equal(result, exp)
-
-    def test_pi_add_sub_int_array_freqn_gt1(self):
-        # GH#47209 test adding array of ints when freq.n > 1 matches
-        #  scalar behavior
-        pi = period_range("2016-01-01", periods=10, freq="2D")
-        arr = np.arange(10)
-        result = pi + arr
-        expected = pd.Index([x + y for x, y in zip(pi, arr)])
-        tm.assert_index_equal(result, expected)
-
-        result = pi - arr
-        expected = pd.Index([x - y for x, y in zip(pi, arr)])
-        tm.assert_index_equal(result, expected)
-
-    def test_pi_sub_isub_offset(self):
-        # offset
-        # DateOffset
-        rng = period_range("2014", "2024", freq="Y")
-        result = rng - pd.offsets.YearEnd(5)
-        expected = period_range("2009", "2019", freq="Y")
-        tm.assert_index_equal(result, expected)
-        rng -= pd.offsets.YearEnd(5)
-        tm.assert_index_equal(rng, expected)
-
-        rng = period_range("2014-01", "2016-12", freq="M")
-        result = rng - pd.offsets.MonthEnd(5)
-        expected = period_range("2013-08", "2016-07", freq="M")
-        tm.assert_index_equal(result, expected)
-
-        rng -= pd.offsets.MonthEnd(5)
-        tm.assert_index_equal(rng, expected)
-
-    @pytest.mark.parametrize("transpose", [True, False])
-    def test_pi_add_offset_n_gt1(self, box_with_array, transpose):
-        # GH#23215
-        # add offset to PeriodIndex with freq.n > 1
-
-        per = Period("2016-01", freq="2M")
-        pi = PeriodIndex([per])
-
-        expected = PeriodIndex(["2016-03"], freq="2M")
-
-        pi = tm.box_expected(pi, box_with_array, transpose=transpose)
-        expected = tm.box_expected(expected, box_with_array, transpose=transpose)
-
-        result = pi + per.freq
-        tm.assert_equal(result, expected)
-
-        result = per.freq + pi
-        tm.assert_equal(result, expected)
-
-    def test_pi_add_offset_n_gt1_not_divisible(self, box_with_array):
-        # GH#23215
-        # PeriodIndex with freq.n > 1 add offset with offset.n % freq.n != 0
-        pi = PeriodIndex(["2016-01"], freq="2M")
-        expected = PeriodIndex(["2016-04"], freq="2M")
-
-        pi = tm.box_expected(pi, box_with_array)
-        expected = tm.box_expected(expected, box_with_array)
-
-        result = pi + to_offset("3ME")
-        tm.assert_equal(result, expected)
-
-        result = to_offset("3ME") + pi
-        tm.assert_equal(result, expected)
-
-    # ---------------------------------------------------------------
-    # __add__/__sub__ with integer arrays
-
-    @pytest.mark.parametrize("int_holder", [np.array, pd.Index])
-    @pytest.mark.parametrize("op", [operator.add, ops.radd])
-    def test_pi_add_intarray(self, int_holder, op):
-        # GH#19959
-        pi = PeriodIndex([Period("2015Q1"), Period("NaT")])
-        other = int_holder([4, -1])
-
-        result = op(pi, other)
-        expected = PeriodIndex([Period("2016Q1"), Period("NaT")])
-        tm.assert_index_equal(result, expected)
-
-    @pytest.mark.parametrize("int_holder", [np.array, pd.Index])
-    def test_pi_sub_intarray(self, int_holder):
-        # GH#19959
-        pi = PeriodIndex([Period("2015Q1"), Period("NaT")])
-        other = int_holder([4, -1])
-
-        result = pi - other
-        expected = PeriodIndex([Period("2014Q1"), Period("NaT")])
-        tm.assert_index_equal(result, expected)
-
-        msg = r"bad operand type for unary -: 'PeriodArray'"
-        with pytest.raises(TypeError, match=msg):
-            other - pi
-
-    # ---------------------------------------------------------------
-    # Timedelta-like (timedelta, timedelta64, Timedelta, Tick)
-    # TODO: Some of these are misnomers because of non-Tick DateOffsets
-
-    def test_parr_add_timedeltalike_minute_gt1(self, three_days, box_with_array):
-        # GH#23031 adding a time-delta-like offset to a PeriodArray that has
-        # minute frequency with n != 1.  A more general case is tested below
-        # in test_pi_add_timedeltalike_tick_gt1, but here we write out the
-        # expected result more explicitly.
-        other = three_days
-        rng = period_range("2014-05-01", periods=3, freq="2D")
-        rng = tm.box_expected(rng, box_with_array)
-
-        expected = PeriodIndex(["2014-05-04", "2014-05-06", "2014-05-08"], freq="2D")
-        expected = tm.box_expected(expected, box_with_array)
-
-        result = rng + other
-        tm.assert_equal(result, expected)
-
-        result = other + rng
-        tm.assert_equal(result, expected)
-
-        # subtraction
-        expected = PeriodIndex(["2014-04-28", "2014-04-30", "2014-05-02"], freq="2D")
-        expected = tm.box_expected(expected, box_with_array)
-        result = rng - other
-        tm.assert_equal(result, expected)
-
-        msg = "|".join(
-            [
-                r"bad operand type for unary -: 'PeriodArray'",
-                r"cannot subtract PeriodArray from timedelta64\[[hD]\]",
-            ]
-        )
-        with pytest.raises(TypeError, match=msg):
-            other - rng
-
-    @pytest.mark.parametrize("freqstr", ["5ns", "5us", "5ms", "5s", "5min", "5h", "5d"])
-    def test_parr_add_timedeltalike_tick_gt1(self, three_days, freqstr, box_with_array):
-        # GH#23031 adding a time-delta-like offset to a PeriodArray that has
-        # tick-like frequency with n != 1
-        other = three_days
-        rng = period_range("2014-05-01", periods=6, freq=freqstr)
-        first = rng[0]
-        rng = tm.box_expected(rng, box_with_array)
-
-        expected = period_range(first + other, periods=6, freq=freqstr)
-        expected = tm.box_expected(expected, box_with_array)
-
-        result = rng + other
-        tm.assert_equal(result, expected)
-
-        result = other + rng
-        tm.assert_equal(result, expected)
-
-        # subtraction
-        expected = period_range(first - other, periods=6, freq=freqstr)
-        expected = tm.box_expected(expected, box_with_array)
-        result = rng - other
-        tm.assert_equal(result, expected)
-        msg = "|".join(
-            [
-                r"bad operand type for unary -: 'PeriodArray'",
-                r"cannot subtract PeriodArray from timedelta64\[[hD]\]",
-            ]
-        )
-        with pytest.raises(TypeError, match=msg):
-            other - rng
-
-    def test_pi_add_iadd_timedeltalike_daily(self, three_days):
-        # Tick
-        other = three_days
-        rng = period_range("2014-05-01", "2014-05-15", freq="D")
-        expected = period_range("2014-05-04", "2014-05-18", freq="D")
-
-        result = rng + other
-        tm.assert_index_equal(result, expected)
-
-        rng += other
-        tm.assert_index_equal(rng, expected)
-
-    def test_pi_sub_isub_timedeltalike_daily(self, three_days):
-        # Tick-like 3 Days
-        other = three_days
-        rng = period_range("2014-05-01", "2014-05-15", freq="D")
-        expected = period_range("2014-04-28", "2014-05-12", freq="D")
-
-        result = rng - other
-        tm.assert_index_equal(result, expected)
-
-        rng -= other
-        tm.assert_index_equal(rng, expected)
-
-    def test_parr_add_sub_timedeltalike_freq_mismatch_daily(
-        self, not_daily, box_with_array
-    ):
-        other = not_daily
-        rng = period_range("2014-05-01", "2014-05-15", freq="D")
-        rng = tm.box_expected(rng, box_with_array)
-
-        msg = "|".join(
-            [
-                # non-timedelta-like DateOffset
-                "Input has different freq(=.+)? from Period.*?\\(freq=D\\)",
-                # timedelta/td64/Timedelta but not a multiple of 24H
-                "Cannot add/subtract timedelta-like from PeriodArray that is "
-                "not an integer multiple of the PeriodArray's freq.",
-            ]
-        )
-        with pytest.raises(IncompatibleFrequency, match=msg):
-            rng + other
-        with pytest.raises(IncompatibleFrequency, match=msg):
-            rng += other
-        with pytest.raises(IncompatibleFrequency, match=msg):
-            rng - other
-        with pytest.raises(IncompatibleFrequency, match=msg):
-            rng -= other
-
-    def test_pi_add_iadd_timedeltalike_hourly(self, two_hours):
-        other = two_hours
-        rng = period_range("2014-01-01 10:00", "2014-01-05 10:00", freq="h")
-        expected = period_range("2014-01-01 12:00", "2014-01-05 12:00", freq="h")
-
-        result = rng + other
-        tm.assert_index_equal(result, expected)
-
-        rng += other
-        tm.assert_index_equal(rng, expected)
-
-    def test_parr_add_timedeltalike_mismatched_freq_hourly(
-        self, not_hourly, box_with_array
-    ):
-        other = not_hourly
-        rng = period_range("2014-01-01 10:00", "2014-01-05 10:00", freq="h")
-        rng = tm.box_expected(rng, box_with_array)
-        msg = "|".join(
-            [
-                # non-timedelta-like DateOffset
-                "Input has different freq(=.+)? from Period.*?\\(freq=h\\)",
-                # timedelta/td64/Timedelta but not a multiple of 24H
-                "Cannot add/subtract timedelta-like from PeriodArray that is "
-                "not an integer multiple of the PeriodArray's freq.",
-            ]
-        )
-
-        with pytest.raises(IncompatibleFrequency, match=msg):
-            rng + other
-
-        with pytest.raises(IncompatibleFrequency, match=msg):
-            rng += other
-
-    def test_pi_sub_isub_timedeltalike_hourly(self, two_hours):
-        other = two_hours
-        rng = period_range("2014-01-01 10:00", "2014-01-05 10:00", freq="h")
-        expected = period_range("2014-01-01 08:00", "2014-01-05 08:00", freq="h")
-
-        result = rng - other
-        tm.assert_index_equal(result, expected)
-
-        rng -= other
-        tm.assert_index_equal(rng, expected)
-
-    def test_add_iadd_timedeltalike_annual(self):
-        # offset
-        # DateOffset
-        rng = period_range("2014", "2024", freq="Y")
-        result = rng + pd.offsets.YearEnd(5)
-        expected = period_range("2019", "2029", freq="Y")
-        tm.assert_index_equal(result, expected)
-        rng += pd.offsets.YearEnd(5)
-        tm.assert_index_equal(rng, expected)
-
-    def test_pi_add_sub_timedeltalike_freq_mismatch_annual(self, mismatched_freq):
-        other = mismatched_freq
-        rng = period_range("2014", "2024", freq="Y")
-        msg = "Input has different freq(=.+)? from Period.*?\\(freq=Y-DEC\\)"
-        with pytest.raises(IncompatibleFrequency, match=msg):
-            rng + other
-        with pytest.raises(IncompatibleFrequency, match=msg):
-            rng += other
-        with pytest.raises(IncompatibleFrequency, match=msg):
-            rng - other
-        with pytest.raises(IncompatibleFrequency, match=msg):
-            rng -= other
-
-    def test_pi_add_iadd_timedeltalike_M(self):
-        rng = period_range("2014-01", "2016-12", freq="M")
-        expected = period_range("2014-06", "2017-05", freq="M")
-
-        result = rng + pd.offsets.MonthEnd(5)
-        tm.assert_index_equal(result, expected)
-
-        rng += pd.offsets.MonthEnd(5)
-        tm.assert_index_equal(rng, expected)
-
-    def test_pi_add_sub_timedeltalike_freq_mismatch_monthly(self, mismatched_freq):
-        other = mismatched_freq
-        rng = period_range("2014-01", "2016-12", freq="M")
-        msg = "Input has different freq(=.+)? from Period.*?\\(freq=M\\)"
-        with pytest.raises(IncompatibleFrequency, match=msg):
-            rng + other
-        with pytest.raises(IncompatibleFrequency, match=msg):
-            rng += other
-        with pytest.raises(IncompatibleFrequency, match=msg):
-            rng - other
-        with pytest.raises(IncompatibleFrequency, match=msg):
-            rng -= other
-
-    @pytest.mark.parametrize("transpose", [True, False])
-    def test_parr_add_sub_td64_nat(self, box_with_array, transpose):
-        # GH#23320 special handling for timedelta64("NaT")
-        pi = period_range("1994-04-01", periods=9, freq="19D")
-        other = np.timedelta64("NaT")
-        expected = PeriodIndex(["NaT"] * 9, freq="19D")
-
-        obj = tm.box_expected(pi, box_with_array, transpose=transpose)
-        expected = tm.box_expected(expected, box_with_array, transpose=transpose)
-
-        result = obj + other
-        tm.assert_equal(result, expected)
-        result = other + obj
-        tm.assert_equal(result, expected)
-        result = obj - other
-        tm.assert_equal(result, expected)
-        msg = r"cannot subtract .* from .*"
-        with pytest.raises(TypeError, match=msg):
-            other - obj
-
+            msg = "day is out of range for month"
+        with pytest.raises(DateParseError, match=msg):
+            Period("0", "Y")
+        msg = "Unknown datetime string format, unable to parse"
+        with pytest.raises(DateParseError, match=msg):
+            Period("1/1/-2000", "Y")
+
+    def test_constructor_corner(self):
+        expected = Period("2007-01", freq="2M")
+        assert Period(year=2007, month=1, freq="2M") == expected
+
+        assert Period(None) is NaT
+
+        p = Period("2007-01-01", freq="D")
+
+        result = Period(p, freq="Y")
+        exp = Period("2007", freq="Y")
+        assert result == exp
+
+    def test_constructor_infer_freq(self):
+        p = Period("2007-01-01")
+        assert p.freq == "D"
+
+        p = Period("2007-01-01 07")
+        assert p.freq == "h"
+
+        p = Period("2007-01-01 07:10")
+        assert p.freq == "min"
+
+        p = Period("2007-01-01 07:10:15")
+        assert p.freq == "s"
+
+        p = Period("2007-01-01 07:10:15.123")
+        assert p.freq == "ms"
+
+        # We see that there are 6 digits after the decimal, so get microsecond
+        #  even though they are all zeros.
+        p = Period("2007-01-01 07:10:15.123000")
+        assert p.freq == "us"
+
+        p = Period("2007-01-01 07:10:15.123400")
+        assert p.freq == "us"
+
+    def test_multiples(self):
+        result1 = Period("1989", freq="2Y")
+        result2 = Period("1989", freq="Y")
+        assert result1.ordinal == result2.ordinal
+        assert result1.freqstr == "2Y-DEC"
+        assert result2.freqstr == "Y-DEC"
+        assert result1.freq == offsets.YearEnd(2)
+        assert result2.freq == offsets.YearEnd()
+
+        assert (result1 + 1).ordinal == result1.ordinal + 2
+        assert (1 + result1).ordinal == result1.ordinal + 2
+        assert (result1 - 1).ordinal == result2.ordinal - 2
+        assert (-1 + result1).ordinal == result2.ordinal - 2
+
+    @pytest.mark.parametrize("month", MONTHS)
+    def test_period_cons_quarterly(self, month):
+        # bugs in scikits.timeseries
+        freq = f"Q-{month}"
+        exp = Period("1989Q3", freq=freq)
+        assert "1989Q3" in str(exp)
+        stamp = exp.to_timestamp("D", how="end")
+        p = Period(stamp, freq=freq)
+        assert p == exp
+
+        stamp = exp.to_timestamp("3D", how="end")
+        p = Period(stamp, freq=freq)
+        assert p == exp
+
+    @pytest.mark.parametrize("month", MONTHS)
+    def test_period_cons_annual(self, month):
+        # bugs in scikits.timeseries
+        freq = f"Y-{month}"
+        exp = Period("1989", freq=freq)
+        stamp = exp.to_timestamp("D", how="end") + timedelta(days=30)
+        p = Period(stamp, freq=freq)
+
+        assert p == exp + 1
+        assert isinstance(p, Period)
+
+    @pytest.mark.parametrize("day", DAYS)
+    @pytest.mark.parametrize("num", range(10, 17))
+    def test_period_cons_weekly(self, num, day):
+        daystr = f"2011-02-{num}"
+        freq = f"W-{day}"
+
+        result = Period(daystr, freq=freq)
+        expected = Period(daystr, freq="D").asfreq(freq)
+        assert result == expected
+        assert isinstance(result, Period)
+
+    def test_parse_week_str_roundstrip(self):
+        # GH#50803
+        per = Period("2017-01-23/2017-01-29")
+        assert per.freq.freqstr == "W-SUN"
+
+        per = Period("2017-01-24/2017-01-30")
+        assert per.freq.freqstr == "W-MON"
+
+        msg = "Could not parse as weekly-freq Period"
+        with pytest.raises(ValueError, match=msg):
+            # not 6 days apart
+            Period("2016-01-23/2017-01-29")
+
+    def test_period_from_ordinal(self):
+        p = Period("2011-01", freq="M")
+        res = Period._from_ordinal(p.ordinal, freq=p.freq)
+        assert p == res
+        assert isinstance(res, Period)
+
+    @pytest.mark.parametrize("freq", ["Y", "M", "D", "h"])
+    def test_construct_from_nat_string_and_freq(self, freq):
+        per = Period("NaT", freq=freq)
+        assert per is NaT
+
+        per = Period("NaT", freq="2" + freq)
+        assert per is NaT
+
+        per = Period("NaT", freq="3" + freq)
+        assert per is NaT
+
+    def test_period_cons_nat(self):
+        p = Period("nat", freq="W-SUN")
+        assert p is NaT
+
+        p = Period(iNaT, freq="D")
+        assert p is NaT
+
+        p = Period(iNaT, freq="3D")
+        assert p is NaT
+
+        p = Period(iNaT, freq="1D1h")
+        assert p is NaT
+
+        p = Period("NaT")
+        assert p is NaT
+
+        p = Period(iNaT)
+        assert p is NaT
+
+    def test_period_cons_mult(self):
+        p1 = Period("2011-01", freq="3M")
+        p2 = Period("2011-01", freq="M")
+        assert p1.ordinal == p2.ordinal
+
+        assert p1.freq == offsets.MonthEnd(3)
+        assert p1.freqstr == "3M"
+
+        assert p2.freq == offsets.MonthEnd()
+        assert p2.freqstr == "M"
+
+        result = p1 + 1
+        assert result.ordinal == (p2 + 3).ordinal
+
+        assert result.freq == p1.freq
+        assert result.freqstr == "3M"
+
+        result = p1 - 1
+        assert result.ordinal == (p2 - 3).ordinal
+        assert result.freq == p1.freq
+        assert result.freqstr == "3M"
+
+        msg = "Frequency must be positive, because it represents span: -3M"
+        with pytest.raises(ValueError, match=msg):
+            Period("2011-01", freq="-3M")
+
+        msg = "Frequency must be positive, because it represents span: 0M"
+        with pytest.raises(ValueError, match=msg):
+            Period("2011-01", freq="0M")
+
+    def test_period_cons_combined(self):
+        p = [
+            (
+                Period("2011-01", freq="1D1h"),
+                Period("2011-01", freq="1h1D"),
+                Period("2011-01", freq="h"),
+            ),
+            (
+                Period(ordinal=1, freq="1D1h"),
+                Period(ordinal=1, freq="1h1D"),
+                Period(ordinal=1, freq="h"),
+            ),
+        ]
+
+        for p1, p2, p3 in p:
+            assert p1.ordinal == p3.ordinal
+            assert p2.ordinal == p3.ordinal
+
+            assert p1.freq == offsets.Hour(25)
+            assert p1.freqstr == "25h"
+
+            assert p2.freq == offsets.Hour(25)
+            assert p2.freqstr == "25h"
+
+            assert p3.freq == offsets.Hour()
+            assert p3.freqstr == "h"
+
+            result = p1 + 1
+            assert result.ordinal == (p3 + 25).ordinal
+            assert result.freq == p1.freq
+            assert result.freqstr == "25h"
+
+            result = p2 + 1
+            assert result.ordinal == (p3 + 25).ordinal
+            assert result.freq == p2.freq
+            assert result.freqstr == "25h"
+
+            result = p1 - 1
+            assert result.ordinal == (p3 - 25).ordinal
+            assert result.freq == p1.freq
+            assert result.freqstr == "25h"
+
+            result = p2 - 1
+            assert result.ordinal == (p3 - 25).ordinal
+            assert result.freq == p2.freq
+            assert result.freqstr == "25h"
+
+        msg = "Frequency must be positive, because it represents span: -25h"
+        with pytest.raises(ValueError, match=msg):
+            Period("2011-01", freq="-1D1h")
+        with pytest.raises(ValueError, match=msg):
+            Period("2011-01", freq="-1h1D")
+        with pytest.raises(ValueError, match=msg):
+            Period(ordinal=1, freq="-1D1h")
+        with pytest.raises(ValueError, match=msg):
+            Period(ordinal=1, freq="-1h1D")
+
+        msg = "Frequency must be positive, because it represents span: 0D"
+        with pytest.raises(ValueError, match=msg):
+            Period("2011-01", freq="0D0h")
+        with pytest.raises(ValueError, match=msg):
+            Period(ordinal=1, freq="0D0h")
+
+        # You can only combine together day and intraday offsets
+        msg = "Invalid frequency: 1W1D"
+        with pytest.raises(ValueError, match=msg):
+            Period("2011-01", freq="1W1D")
+        msg = "Invalid frequency: 1D1W"
+        with pytest.raises(ValueError, match=msg):
+            Period("2011-01", freq="1D1W")
+
+    @pytest.mark.parametrize("day", ["1970/01/01 ", "2020-12-31 ", "1981/09/13 "])
+    @pytest.mark.parametrize("hour", ["00:00:00", "00:00:01", "23:59:59", "12:00:59"])
     @pytest.mark.parametrize(
-        "other",
+        "sec_float, expected",
         [
-            np.array(["NaT"] * 9, dtype="m8[ns]"),
-            TimedeltaArray._from_sequence(["NaT"] * 9, dtype="m8[ns]"),
+            (".000000001", 1),
+            (".000000999", 999),
+            (".123456789", 789),
+            (".999999999", 999),
+            (".999999000", 0),
+            # Test femtoseconds, attoseconds, picoseconds are dropped like Timestamp
+            (".999999001123", 1),
+            (".999999001123456", 1),
+            (".999999001123456789", 1),
         ],
     )
-    def test_parr_add_sub_tdt64_nat_array(self, box_with_array, other):
-        pi = period_range("1994-04-01", periods=9, freq="19D")
-        expected = PeriodIndex(["NaT"] * 9, freq="19D")
+    def test_period_constructor_nanosecond(self, day, hour, sec_float, expected):
+        # GH 34621
 
-        obj = tm.box_expected(pi, box_with_array)
-        expected = tm.box_expected(expected, box_with_array)
+        assert Period(day + hour + sec_float).start_time.nanosecond == expected
 
-        result = obj + other
-        tm.assert_equal(result, expected)
-        result = other + obj
-        tm.assert_equal(result, expected)
-        result = obj - other
-        tm.assert_equal(result, expected)
-        msg = r"cannot subtract .* from .*"
-        with pytest.raises(TypeError, match=msg):
-            other - obj
-
-        # some but not *all* NaT
-        other = other.copy()
-        other[0] = np.timedelta64(0, "ns")
-        expected = PeriodIndex([pi[0]] + ["NaT"] * 8, freq="19D")
-        expected = tm.box_expected(expected, box_with_array)
-
-        result = obj + other
-        tm.assert_equal(result, expected)
-        result = other + obj
-        tm.assert_equal(result, expected)
-        result = obj - other
-        tm.assert_equal(result, expected)
-        with pytest.raises(TypeError, match=msg):
-            other - obj
-
-    # ---------------------------------------------------------------
-    # Unsorted
-
-    def test_parr_add_sub_index(self):
-        # Check that PeriodArray defers to Index on arithmetic ops
-        pi = period_range("2000-12-31", periods=3)
-        parr = pi.array
-
-        result = parr - pi
-        expected = pi - pi
-        tm.assert_index_equal(result, expected)
-
-    def test_parr_add_sub_object_array(self):
-        pi = period_range("2000-12-31", periods=3, freq="D")
-        parr = pi.array
-
-        other = np.array([Timedelta(days=1), pd.offsets.Day(2), 3])
-
-        with tm.assert_produces_warning(PerformanceWarning):
-            result = parr + other
-
-        expected = PeriodIndex(
-            ["2001-01-01", "2001-01-03", "2001-01-05"], freq="D"
-        )._data.astype(object)
-        tm.assert_equal(result, expected)
-
-        with tm.assert_produces_warning(PerformanceWarning):
-            result = parr - other
-
-        expected = PeriodIndex(["2000-12-30"] * 3, freq="D")._data.astype(object)
-        tm.assert_equal(result, expected)
-
-    def test_period_add_timestamp_raises(self, box_with_array):
-        # GH#17983
-        ts = Timestamp("2017")
-        per = Period("2017", freq="M")
-
-        arr = pd.Index([per], dtype="Period[M]")
-        arr = tm.box_expected(arr, box_with_array)
-
-        msg = "cannot add PeriodArray and Timestamp"
-        with pytest.raises(TypeError, match=msg):
-            arr + ts
-        with pytest.raises(TypeError, match=msg):
-            ts + arr
-        msg = "cannot add PeriodArray and DatetimeArray"
-        with pytest.raises(TypeError, match=msg):
-            arr + Series([ts])
-        with pytest.raises(TypeError, match=msg):
-            Series([ts]) + arr
-        with pytest.raises(TypeError, match=msg):
-            arr + pd.Index([ts])
-        with pytest.raises(TypeError, match=msg):
-            pd.Index([ts]) + arr
-
-        if box_with_array is pd.DataFrame:
-            msg = "cannot add PeriodArray and DatetimeArray"
-        else:
-            msg = r"unsupported operand type\(s\) for \+: 'Period' and 'DatetimeArray"
-        with pytest.raises(TypeError, match=msg):
-            arr + pd.DataFrame([ts])
-        if box_with_array is pd.DataFrame:
-            msg = "cannot add PeriodArray and DatetimeArray"
-        else:
-            msg = r"unsupported operand type\(s\) for \+: 'DatetimeArray' and 'Period'"
-        with pytest.raises(TypeError, match=msg):
-            pd.DataFrame([ts]) + arr
+    @pytest.mark.parametrize("hour", range(24))
+    def test_period_large_ordinal(self, hour):
+        # Issue #36430
+        # Integer overflow for Period over the maximum timestamp
+        p = Period(ordinal=2562048 + hour, freq="1h")
+        assert p.hour == hour
 
 
-class TestPeriodSeriesArithmetic:
-    def test_parr_add_timedeltalike_scalar(self, three_days, box_with_array):
-        # GH#13043
-        ser = Series(
-            [Period("2015-01-01", freq="D"), Period("2015-01-02", freq="D")],
-            name="xxx",
-        )
-        assert ser.dtype == "Period[D]"
+class TestPeriodMethods:
+    def test_round_trip(self):
+        p = Period("2000Q1")
+        new_p = tm.round_trip_pickle(p)
+        assert new_p == p
 
-        expected = Series(
-            [Period("2015-01-04", freq="D"), Period("2015-01-05", freq="D")],
-            name="xxx",
-        )
+    def test_hash(self):
+        assert hash(Period("2011-01", freq="M")) == hash(Period("2011-01", freq="M"))
 
-        obj = tm.box_expected(ser, box_with_array)
-        if box_with_array is pd.DataFrame:
-            assert (obj.dtypes == "Period[D]").all()
+        assert hash(Period("2011-01-01", freq="D")) != hash(Period("2011-01", freq="M"))
 
-        expected = tm.box_expected(expected, box_with_array)
+        assert hash(Period("2011-01", freq="3M")) != hash(Period("2011-01", freq="2M"))
 
-        result = obj + three_days
-        tm.assert_equal(result, expected)
+        assert hash(Period("2011-01", freq="M")) != hash(Period("2011-02", freq="M"))
 
-        result = three_days + obj
-        tm.assert_equal(result, expected)
+    # --------------------------------------------------------------
+    # to_timestamp
 
-    def test_ops_series_period(self):
-        # GH#13043
-        ser = Series(
-            [Period("2015-01-01", freq="D"), Period("2015-01-02", freq="D")],
-            name="xxx",
-        )
-        assert ser.dtype == "Period[D]"
+    def test_to_timestamp_mult(self):
+        p = Period("2011-01", freq="M")
+        assert p.to_timestamp(how="S") == Timestamp("2011-01-01")
+        expected = Timestamp("2011-02-01") - Timedelta(1, "ns")
+        assert p.to_timestamp(how="E") == expected
 
-        per = Period("2015-01-10", freq="D")
-        off = per.freq
-        # dtype will be object because of original dtype
-        expected = Series([9 * off, 8 * off], name="xxx", dtype=object)
-        tm.assert_series_equal(per - ser, expected)
-        tm.assert_series_equal(ser - per, -1 * expected)
+        p = Period("2011-01", freq="3M")
+        assert p.to_timestamp(how="S") == Timestamp("2011-01-01")
+        expected = Timestamp("2011-04-01") - Timedelta(1, "ns")
+        assert p.to_timestamp(how="E") == expected
 
-        s2 = Series(
-            [Period("2015-01-05", freq="D"), Period("2015-01-04", freq="D")],
-            name="xxx",
-        )
-        assert s2.dtype == "Period[D]"
+    @pytest.mark.filterwarnings(
+        "ignore:Period with BDay freq is deprecated:FutureWarning"
+    )
+    def test_to_timestamp(self):
+        p = Period("1982", freq="Y")
+        start_ts = p.to_timestamp(how="S")
+        aliases = ["s", "StarT", "BEGIn"]
+        for a in aliases:
+            assert start_ts == p.to_timestamp("D", how=a)
+            # freq with mult should not affect to the result
+            assert start_ts == p.to_timestamp("3D", how=a)
 
-        expected = Series([4 * off, 2 * off], name="xxx", dtype=object)
-        tm.assert_series_equal(s2 - ser, expected)
-        tm.assert_series_equal(ser - s2, -1 * expected)
+        end_ts = p.to_timestamp(how="E")
+        aliases = ["e", "end", "FINIsH"]
+        for a in aliases:
+            assert end_ts == p.to_timestamp("D", how=a)
+            assert end_ts == p.to_timestamp("3D", how=a)
 
+        from_lst = ["Y", "Q", "M", "W", "B", "D", "h", "Min", "s"]
 
-class TestPeriodIndexSeriesMethods:
-    """Test PeriodIndex and Period Series Ops consistency"""
+        def _ex(p):
+            if p.freq == "B":
+                return p.start_time + Timedelta(days=1, nanoseconds=-1)
+            return Timestamp((p + p.freq).start_time._value - 1)
 
-    def _check(self, values, func, expected):
-        idx = PeriodIndex(values)
-        result = func(idx)
-        tm.assert_equal(result, expected)
+        for fcode in from_lst:
+            p = Period("1982", freq=fcode)
+            result = p.to_timestamp().to_period(fcode)
+            assert result == p
 
-        ser = Series(values)
-        result = func(ser)
+            assert p.start_time == p.to_timestamp(how="S")
 
-        exp = Series(expected, name=values.name)
-        tm.assert_series_equal(result, exp)
+            assert p.end_time == _ex(p)
 
-    def test_pi_ops(self):
-        idx = PeriodIndex(
-            ["2011-01", "2011-02", "2011-03", "2011-04"], freq="M", name="idx"
-        )
+        # Frequency other than daily
 
-        expected = PeriodIndex(
-            ["2011-03", "2011-04", "2011-05", "2011-06"], freq="M", name="idx"
-        )
+        p = Period("1985", freq="Y")
 
-        self._check(idx, lambda x: x + 2, expected)
-        self._check(idx, lambda x: 2 + x, expected)
+        result = p.to_timestamp("h", how="end")
+        expected = Timestamp(1986, 1, 1) - Timedelta(1, "ns")
+        assert result == expected
+        result = p.to_timestamp("3h", how="end")
+        assert result == expected
 
-        self._check(idx + 2, lambda x: x - 2, idx)
+        result = p.to_timestamp("min", how="end")
+        expected = Timestamp(1986, 1, 1) - Timedelta(1, "ns")
+        assert result == expected
+        result = p.to_timestamp("2min", how="end")
+        assert result == expected
 
-        result = idx - Period("2011-01", freq="M")
-        off = idx.freq
-        exp = pd.Index([0 * off, 1 * off, 2 * off, 3 * off], name="idx")
-        tm.assert_index_equal(result, exp)
+        result = p.to_timestamp(how="end")
+        expected = Timestamp(1986, 1, 1) - Timedelta(1, "ns")
+        assert result == expected
 
-        result = Period("2011-01", freq="M") - idx
-        exp = pd.Index([0 * off, -1 * off, -2 * off, -3 * off], name="idx")
-        tm.assert_index_equal(result, exp)
+        expected = datetime(1985, 1, 1)
+        result = p.to_timestamp("h", how="start")
+        assert result == expected
+        result = p.to_timestamp("min", how="start")
+        assert result == expected
+        result = p.to_timestamp("s", how="start")
+        assert result == expected
+        result = p.to_timestamp("3h", how="start")
+        assert result == expected
+        result = p.to_timestamp("5s", how="start")
+        assert result == expected
 
-    @pytest.mark.parametrize("ng", ["str", 1.5])
+    def test_to_timestamp_business_end(self):
+        with tm.assert_produces_warning(FutureWarning, match=bday_msg):
+            per = Period("1990-01-05", "B")  # Friday
+            result = per.to_timestamp("B", how="E")
+
+        expected = Timestamp("1990-01-06") - Timedelta(nanoseconds=1)
+        assert result == expected
+
     @pytest.mark.parametrize(
-        "func",
+        "ts, expected",
         [
-            lambda obj, ng: obj + ng,
-            lambda obj, ng: ng + obj,
-            lambda obj, ng: obj - ng,
-            lambda obj, ng: ng - obj,
-            lambda obj, ng: np.add(obj, ng),
-            lambda obj, ng: np.add(ng, obj),
-            lambda obj, ng: np.subtract(obj, ng),
-            lambda obj, ng: np.subtract(ng, obj),
+            ("1970-01-01 00:00:00", 0),
+            ("1970-01-01 00:00:00.000001", 1),
+            ("1970-01-01 00:00:00.00001", 10),
+            ("1970-01-01 00:00:00.499", 499000),
+            ("1999-12-31 23:59:59.999", 999000),
+            ("1999-12-31 23:59:59.999999", 999999),
+            ("2050-12-31 23:59:59.5", 500000),
+            ("2050-12-31 23:59:59.500001", 500001),
+            ("2050-12-31 23:59:59.123456", 123456),
         ],
     )
-    def test_parr_ops_errors(self, ng, func, box_with_array):
-        idx = PeriodIndex(
-            ["2011-01", "2011-02", "2011-03", "2011-04"], freq="M", name="idx"
-        )
-        obj = tm.box_expected(idx, box_with_array)
-        msg = "|".join(
-            [
-                r"unsupported operand type\(s\)",
-                "can only concatenate",
-                r"must be str",
-                "object to str implicitly",
-            ]
-        )
+    @pytest.mark.parametrize("freq", [None, "us", "ns"])
+    def test_to_timestamp_microsecond(self, ts, expected, freq):
+        # GH 24444
+        result = Period(ts).to_timestamp(freq=freq).microsecond
+        assert result == expected
 
-        with pytest.raises(TypeError, match=msg):
-            func(obj, ng)
+    # --------------------------------------------------------------
+    # Rendering: __repr__, strftime, etc
 
-    def test_pi_ops_nat(self):
-        idx = PeriodIndex(
-            ["2011-01", "2011-02", "NaT", "2011-04"], freq="M", name="idx"
-        )
-        expected = PeriodIndex(
-            ["2011-03", "2011-04", "NaT", "2011-06"], freq="M", name="idx"
-        )
+    @pytest.mark.parametrize(
+        "str_ts,freq,str_res,str_freq",
+        (
+            ("Jan-2000", None, "2000-01", "M"),
+            ("2000-12-15", None, "2000-12-15", "D"),
+            (
+                "2000-12-15 13:45:26.123456789",
+                "ns",
+                "2000-12-15 13:45:26.123456789",
+                "ns",
+            ),
+            ("2000-12-15 13:45:26.123456789", "us", "2000-12-15 13:45:26.123456", "us"),
+            ("2000-12-15 13:45:26.123456", None, "2000-12-15 13:45:26.123456", "us"),
+            ("2000-12-15 13:45:26.123456789", "ms", "2000-12-15 13:45:26.123", "ms"),
+            ("2000-12-15 13:45:26.123", None, "2000-12-15 13:45:26.123", "ms"),
+            ("2000-12-15 13:45:26", "s", "2000-12-15 13:45:26", "s"),
+            ("2000-12-15 13:45:26", "min", "2000-12-15 13:45", "min"),
+            ("2000-12-15 13:45:26", "h", "2000-12-15 13:00", "h"),
+            ("2000-12-15", "Y", "2000", "Y-DEC"),
+            ("2000-12-15", "Q", "2000Q4", "Q-DEC"),
+            ("2000-12-15", "M", "2000-12", "M"),
+            ("2000-12-15", "W", "2000-12-11/2000-12-17", "W-SUN"),
+            ("2000-12-15", "D", "2000-12-15", "D"),
+            ("2000-12-15", "B", "2000-12-15", "B"),
+        ),
+    )
+    @pytest.mark.filterwarnings(
+        "ignore:Period with BDay freq is deprecated:FutureWarning"
+    )
+    def test_repr(self, str_ts, freq, str_res, str_freq):
+        p = Period(str_ts, freq=freq)
+        assert str(p) == str_res
+        assert repr(p) == f"Period('{str_res}', '{str_freq}')"
 
-        self._check(idx, lambda x: x + 2, expected)
-        self._check(idx, lambda x: 2 + x, expected)
-        self._check(idx, lambda x: np.add(x, 2), expected)
+    def test_repr_nat(self):
+        p = Period("nat", freq="M")
+        assert repr(NaT) in repr(p)
 
-        self._check(idx + 2, lambda x: x - 2, idx)
-        self._check(idx + 2, lambda x: np.subtract(x, 2), idx)
+    def test_strftime(self):
+        # GH#3363
+        p = Period("2000-1-1 12:34:12", freq="s")
+        res = p.strftime("%Y-%m-%d %H:%M:%S")
+        assert res == "2000-01-01 12:34:12"
+        assert isinstance(res, str)
 
-        # freq with mult
-        idx = PeriodIndex(
-            ["2011-01", "2011-02", "NaT", "2011-04"], freq="2M", name="idx"
-        )
-        expected = PeriodIndex(
-            ["2011-07", "2011-08", "NaT", "2011-10"], freq="2M", name="idx"
-        )
 
-        self._check(idx, lambda x: x + 3, expected)
-        self._check(idx, lambda x: 3 + x, expected)
-        self._check(idx, lambda x: np.add(x, 3), expected)
+class TestPeriodProperties:
+    """Test properties such as year, month, weekday, etc...."""
 
-        self._check(idx + 3, lambda x: x - 3, idx)
-        self._check(idx + 3, lambda x: np.subtract(x, 3), idx)
+    @pytest.mark.parametrize("freq", ["Y", "M", "D", "h"])
+    def test_is_leap_year(self, freq):
+        # GH 13727
+        p = Period("2000-01-01 00:00:00", freq=freq)
+        assert p.is_leap_year
+        assert isinstance(p.is_leap_year, bool)
 
-    def test_pi_ops_array_int(self):
-        idx = PeriodIndex(
-            ["2011-01", "2011-02", "NaT", "2011-04"], freq="M", name="idx"
-        )
-        f = lambda x: x + np.array([1, 2, 3, 4])
-        exp = PeriodIndex(
-            ["2011-02", "2011-04", "NaT", "2011-08"], freq="M", name="idx"
-        )
-        self._check(idx, f, exp)
+        p = Period("1999-01-01 00:00:00", freq=freq)
+        assert not p.is_leap_year
 
-        f = lambda x: np.add(x, np.array([4, -1, 1, 2]))
-        exp = PeriodIndex(
-            ["2011-05", "2011-01", "NaT", "2011-06"], freq="M", name="idx"
-        )
-        self._check(idx, f, exp)
+        p = Period("2004-01-01 00:00:00", freq=freq)
+        assert p.is_leap_year
 
-        f = lambda x: x - np.array([1, 2, 3, 4])
-        exp = PeriodIndex(
-            ["2010-12", "2010-12", "NaT", "2010-12"], freq="M", name="idx"
-        )
-        self._check(idx, f, exp)
+        p = Period("2100-01-01 00:00:00", freq=freq)
+        assert not p.is_leap_year
 
-        f = lambda x: np.subtract(x, np.array([3, 2, 3, -2]))
-        exp = PeriodIndex(
-            ["2010-10", "2010-12", "NaT", "2011-06"], freq="M", name="idx"
-        )
-        self._check(idx, f, exp)
+    def test_quarterly_negative_ordinals(self):
+        p = Period(ordinal=-1, freq="Q-DEC")
+        assert p.year == 1969
+        assert p.quarter == 4
+        assert isinstance(p, Period)
 
-    def test_pi_ops_offset(self):
-        idx = PeriodIndex(
-            ["2011-01-01", "2011-02-01", "2011-03-01", "2011-04-01"],
-            freq="D",
-            name="idx",
-        )
-        f = lambda x: x + pd.offsets.Day()
-        exp = PeriodIndex(
-            ["2011-01-02", "2011-02-02", "2011-03-02", "2011-04-02"],
-            freq="D",
-            name="idx",
-        )
-        self._check(idx, f, exp)
+        p = Period(ordinal=-2, freq="Q-DEC")
+        assert p.year == 1969
+        assert p.quarter == 3
+        assert isinstance(p, Period)
 
-        f = lambda x: x + pd.offsets.Day(2)
-        exp = PeriodIndex(
-            ["2011-01-03", "2011-02-03", "2011-03-03", "2011-04-03"],
-            freq="D",
-            name="idx",
-        )
-        self._check(idx, f, exp)
+        p = Period(ordinal=-2, freq="M")
+        assert p.year == 1969
+        assert p.month == 11
+        assert isinstance(p, Period)
 
-        f = lambda x: x - pd.offsets.Day(2)
-        exp = PeriodIndex(
-            ["2010-12-30", "2011-01-30", "2011-02-27", "2011-03-30"],
-            freq="D",
-            name="idx",
-        )
-        self._check(idx, f, exp)
+    def test_freq_str(self):
+        i1 = Period("1982", freq="Min")
+        assert i1.freq == offsets.Minute()
+        assert i1.freqstr == "min"
 
-    def test_pi_offset_errors(self):
-        idx = PeriodIndex(
-            ["2011-01-01", "2011-02-01", "2011-03-01", "2011-04-01"],
-            freq="D",
-            name="idx",
-        )
-        ser = Series(idx)
+    @pytest.mark.filterwarnings(
+        "ignore:Period with BDay freq is deprecated:FutureWarning"
+    )
+    def test_period_deprecated_freq(self):
+        cases = {
+            "M": ["MTH", "MONTH", "MONTHLY", "Mth", "month", "monthly"],
+            "B": ["BUS", "BUSINESS", "BUSINESSLY", "WEEKDAY", "bus"],
+            "D": ["DAY", "DLY", "DAILY", "Day", "Dly", "Daily"],
+            "h": ["HR", "HOUR", "HRLY", "HOURLY", "hr", "Hour", "HRly"],
+            "min": ["minute", "MINUTE", "MINUTELY", "minutely"],
+            "s": ["sec", "SEC", "SECOND", "SECONDLY", "second"],
+            "ms": ["MILLISECOND", "MILLISECONDLY", "millisecond"],
+            "us": ["MICROSECOND", "MICROSECONDLY", "microsecond"],
+            "ns": ["NANOSECOND", "NANOSECONDLY", "nanosecond"],
+        }
 
-        msg = (
-            "Cannot add/subtract timedelta-like from PeriodArray that is not "
-            "an integer multiple of the PeriodArray's freq"
-        )
-        for obj in [idx, ser]:
-            with pytest.raises(IncompatibleFrequency, match=msg):
-                obj + pd.offsets.Hour(2)
+        msg = INVALID_FREQ_ERR_MSG
+        for exp, freqs in cases.items():
+            for freq in freqs:
+                with pytest.raises(ValueError, match=msg):
+                    Period("2016-03-01 09:00", freq=freq)
+                with pytest.raises(ValueError, match=msg):
+                    Period(ordinal=1, freq=freq)
 
-            with pytest.raises(IncompatibleFrequency, match=msg):
-                pd.offsets.Hour(2) + obj
+            # check supported freq-aliases still works
+            p1 = Period("2016-03-01 09:00", freq=exp)
+            p2 = Period(ordinal=1, freq=exp)
+            assert isinstance(p1, Period)
+            assert isinstance(p2, Period)
 
-            with pytest.raises(IncompatibleFrequency, match=msg):
-                obj - pd.offsets.Hour(2)
-
-    def test_pi_sub_period(self):
-        # GH#13071
-        idx = PeriodIndex(
-            ["2011-01", "2011-02", "2011-03", "2011-04"], freq="M", name="idx"
-        )
-
-        result = idx - Period("2012-01", freq="M")
-        off = idx.freq
-        exp = pd.Index([-12 * off, -11 * off, -10 * off, -9 * off], name="idx")
-        tm.assert_index_equal(result, exp)
-
-        result = np.subtract(idx, Period("2012-01", freq="M"))
-        tm.assert_index_equal(result, exp)
-
-        result = Period("2012-01", freq="M") - idx
-        exp = pd.Index([12 * off, 11 * off, 10 * off, 9 * off], name="idx")
-        tm.assert_index_equal(result, exp)
-
-        result = np.subtract(Period("2012-01", freq="M"), idx)
-        tm.assert_index_equal(result, exp)
-
-        exp = TimedeltaIndex([np.nan, np.nan, np.nan, np.nan], name="idx")
-        result = idx - Period("NaT", freq="M")
-        tm.assert_index_equal(result, exp)
-        assert result.freq == exp.freq
-
-        result = Period("NaT", freq="M") - idx
-        tm.assert_index_equal(result, exp)
-        assert result.freq == exp.freq
-
-    def test_pi_sub_pdnat(self):
-        # GH#13071, GH#19389
-        idx = PeriodIndex(
-            ["2011-01", "2011-02", "NaT", "2011-04"], freq="M", name="idx"
-        )
-        exp = TimedeltaIndex([pd.NaT] * 4, name="idx")
-        tm.assert_index_equal(pd.NaT - idx, exp)
-        tm.assert_index_equal(idx - pd.NaT, exp)
-
-    def test_pi_sub_period_nat(self):
-        # GH#13071
-        idx = PeriodIndex(
-            ["2011-01", "NaT", "2011-03", "2011-04"], freq="M", name="idx"
+    @staticmethod
+    def _period_constructor(bound, offset):
+        return Period(
+            year=bound.year,
+            month=bound.month,
+            day=bound.day,
+            hour=bound.hour,
+            minute=bound.minute,
+            second=bound.second + offset,
+            freq="us",
         )
 
-        result = idx - Period("2012-01", freq="M")
-        off = idx.freq
-        exp = pd.Index([-12 * off, pd.NaT, -10 * off, -9 * off], name="idx")
-        tm.assert_index_equal(result, exp)
+    @pytest.mark.parametrize("bound, offset", [(Timestamp.min, -1), (Timestamp.max, 1)])
+    @pytest.mark.parametrize("period_property", ["start_time", "end_time"])
+    def test_outer_bounds_start_and_end_time(self, bound, offset, period_property):
+        # GH #13346
+        period = TestPeriodProperties._period_constructor(bound, offset)
+        with pytest.raises(OutOfBoundsDatetime, match="Out of bounds nanosecond"):
+            getattr(period, period_property)
 
-        result = Period("2012-01", freq="M") - idx
-        exp = pd.Index([12 * off, pd.NaT, 10 * off, 9 * off], name="idx")
-        tm.assert_index_equal(result, exp)
+    @pytest.mark.parametrize("bound, offset", [(Timestamp.min, -1), (Timestamp.max, 1)])
+    @pytest.mark.parametrize("period_property", ["start_time", "end_time"])
+    def test_inner_bounds_start_and_end_time(self, bound, offset, period_property):
+        # GH #13346
+        period = TestPeriodProperties._period_constructor(bound, -offset)
+        expected = period.to_timestamp().round(freq="s")
+        assert getattr(period, period_property).round(freq="s") == expected
+        expected = (bound - offset * Timedelta(1, unit="s")).floor("s")
+        assert getattr(period, period_property).floor("s") == expected
 
-        exp = TimedeltaIndex([np.nan, np.nan, np.nan, np.nan], name="idx")
-        tm.assert_index_equal(idx - Period("NaT", freq="M"), exp)
-        tm.assert_index_equal(Period("NaT", freq="M") - idx, exp)
+    def test_start_time(self):
+        freq_lst = ["Y", "Q", "M", "D", "h", "min", "s"]
+        xp = datetime(2012, 1, 1)
+        for f in freq_lst:
+            p = Period("2012", freq=f)
+            assert p.start_time == xp
+        with tm.assert_produces_warning(FutureWarning, match=bday_msg):
+            assert Period("2012", freq="B").start_time == datetime(2012, 1, 2)
+        assert Period("2012", freq="W").start_time == datetime(2011, 12, 26)
+
+    def test_end_time(self):
+        p = Period("2012", freq="Y")
+
+        def _ex(*args):
+            return Timestamp(Timestamp(datetime(*args)).as_unit("ns")._value - 1)
+
+        xp = _ex(2013, 1, 1)
+        assert xp == p.end_time
+
+        p = Period("2012", freq="Q")
+        xp = _ex(2012, 4, 1)
+        assert xp == p.end_time
+
+        p = Period("2012", freq="M")
+        xp = _ex(2012, 2, 1)
+        assert xp == p.end_time
+
+        p = Period("2012", freq="D")
+        xp = _ex(2012, 1, 2)
+        assert xp == p.end_time
+
+        p = Period("2012", freq="h")
+        xp = _ex(2012, 1, 1, 1)
+        assert xp == p.end_time
+
+        with tm.assert_produces_warning(FutureWarning, match=bday_msg):
+            p = Period("2012", freq="B")
+            xp = _ex(2012, 1, 3)
+            assert xp == p.end_time
+
+        p = Period("2012", freq="W")
+        xp = _ex(2012, 1, 2)
+        assert xp == p.end_time
+
+        # Test for GH 11738
+        p = Period("2012", freq="15D")
+        xp = _ex(2012, 1, 16)
+        assert xp == p.end_time
+
+        p = Period("2012", freq="1D1h")
+        xp = _ex(2012, 1, 2, 1)
+        assert xp == p.end_time
+
+        p = Period("2012", freq="1h1D")
+        xp = _ex(2012, 1, 2, 1)
+        assert xp == p.end_time
+
+    def test_end_time_business_friday(self):
+        # GH#34449
+        with tm.assert_produces_warning(FutureWarning, match=bday_msg):
+            per = Period("1990-01-05", "B")
+            result = per.end_time
+
+        expected = Timestamp("1990-01-06") - Timedelta(nanoseconds=1)
+        assert result == expected
+
+    def test_anchor_week_end_time(self):
+        def _ex(*args):
+            return Timestamp(Timestamp(datetime(*args)).as_unit("ns")._value - 1)
+
+        p = Period("2013-1-1", "W-SAT")
+        xp = _ex(2013, 1, 6)
+        assert p.end_time == xp
+
+    def test_properties_annually(self):
+        # Test properties on Periods with annually frequency.
+        a_date = Period(freq="Y", year=2007)
+        assert a_date.year == 2007
+
+    def test_properties_quarterly(self):
+        # Test properties on Periods with daily frequency.
+        qedec_date = Period(freq="Q-DEC", year=2007, quarter=1)
+        qejan_date = Period(freq="Q-JAN", year=2007, quarter=1)
+        qejun_date = Period(freq="Q-JUN", year=2007, quarter=1)
+        #
+        for x in range(3):
+            for qd in (qedec_date, qejan_date, qejun_date):
+                assert (qd + x).qyear == 2007
+                assert (qd + x).quarter == x + 1
+
+    def test_properties_monthly(self):
+        # Test properties on Periods with daily frequency.
+        m_date = Period(freq="M", year=2007, month=1)
+        for x in range(11):
+            m_ival_x = m_date + x
+            assert m_ival_x.year == 2007
+            if 1 <= x + 1 <= 3:
+                assert m_ival_x.quarter == 1
+            elif 4 <= x + 1 <= 6:
+                assert m_ival_x.quarter == 2
+            elif 7 <= x + 1 <= 9:
+                assert m_ival_x.quarter == 3
+            elif 10 <= x + 1 <= 12:
+                assert m_ival_x.quarter == 4
+            assert m_ival_x.month == x + 1
+
+    def test_properties_weekly(self):
+        # Test properties on Periods with daily frequency.
+        w_date = Period(freq="W", year=2007, month=1, day=7)
+        #
+        assert w_date.year == 2007
+        assert w_date.quarter == 1
+        assert w_date.month == 1
+        assert w_date.week == 1
+        assert (w_date - 1).week == 52
+        assert w_date.days_in_month == 31
+        assert Period(freq="W", year=2012, month=2, day=1).days_in_month == 29
+
+    def test_properties_weekly_legacy(self):
+        # Test properties on Periods with daily frequency.
+        w_date = Period(freq="W", year=2007, month=1, day=7)
+        assert w_date.year == 2007
+        assert w_date.quarter == 1
+        assert w_date.month == 1
+        assert w_date.week == 1
+        assert (w_date - 1).week == 52
+        assert w_date.days_in_month == 31
+
+        exp = Period(freq="W", year=2012, month=2, day=1)
+        assert exp.days_in_month == 29
+
+        msg = INVALID_FREQ_ERR_MSG
+        with pytest.raises(ValueError, match=msg):
+            Period(freq="WK", year=2007, month=1, day=7)
+
+    def test_properties_daily(self):
+        # Test properties on Periods with daily frequency.
+        with tm.assert_produces_warning(FutureWarning, match=bday_msg):
+            b_date = Period(freq="B", year=2007, month=1, day=1)
+        #
+        assert b_date.year == 2007
+        assert b_date.quarter == 1
+        assert b_date.month == 1
+        assert b_date.day == 1
+        assert b_date.weekday == 0
+        assert b_date.dayofyear == 1
+        assert b_date.days_in_month == 31
+        with tm.assert_produces_warning(FutureWarning, match=bday_msg):
+            assert Period(freq="B", year=2012, month=2, day=1).days_in_month == 29
+
+        d_date = Period(freq="D", year=2007, month=1, day=1)
+
+        assert d_date.year == 2007
+        assert d_date.quarter == 1
+        assert d_date.month == 1
+        assert d_date.day == 1
+        assert d_date.weekday == 0
+        assert d_date.dayofyear == 1
+        assert d_date.days_in_month == 31
+        assert Period(freq="D", year=2012, month=2, day=1).days_in_month == 29
+
+    def test_properties_hourly(self):
+        # Test properties on Periods with hourly frequency.
+        h_date1 = Period(freq="h", year=2007, month=1, day=1, hour=0)
+        h_date2 = Period(freq="2h", year=2007, month=1, day=1, hour=0)
+
+        for h_date in [h_date1, h_date2]:
+            assert h_date.year == 2007
+            assert h_date.quarter == 1
+            assert h_date.month == 1
+            assert h_date.day == 1
+            assert h_date.weekday == 0
+            assert h_date.dayofyear == 1
+            assert h_date.hour == 0
+            assert h_date.days_in_month == 31
+            assert (
+                Period(freq="h", year=2012, month=2, day=1, hour=0).days_in_month == 29
+            )
+
+    def test_properties_minutely(self):
+        # Test properties on Periods with minutely frequency.
+        t_date = Period(freq="Min", year=2007, month=1, day=1, hour=0, minute=0)
+        #
+        assert t_date.quarter == 1
+        assert t_date.month == 1
+        assert t_date.day == 1
+        assert t_date.weekday == 0
+        assert t_date.dayofyear == 1
+        assert t_date.hour == 0
+        assert t_date.minute == 0
+        assert t_date.days_in_month == 31
+        assert (
+            Period(freq="D", year=2012, month=2, day=1, hour=0, minute=0).days_in_month
+            == 29
+        )
+
+    def test_properties_secondly(self):
+        # Test properties on Periods with secondly frequency.
+        s_date = Period(
+            freq="Min", year=2007, month=1, day=1, hour=0, minute=0, second=0
+        )
+        #
+        assert s_date.year == 2007
+        assert s_date.quarter == 1
+        assert s_date.month == 1
+        assert s_date.day == 1
+        assert s_date.weekday == 0
+        assert s_date.dayofyear == 1
+        assert s_date.hour == 0
+        assert s_date.minute == 0
+        assert s_date.second == 0
+        assert s_date.days_in_month == 31
+        assert (
+            Period(
+                freq="Min", year=2012, month=2, day=1, hour=0, minute=0, second=0
+            ).days_in_month
+            == 29
+        )
+
+
+class TestPeriodComparisons:
+    def test_sort_periods(self):
+        jan = Period("2000-01", "M")
+        feb = Period("2000-02", "M")
+        mar = Period("2000-03", "M")
+        periods = [mar, jan, feb]
+        correctPeriods = [jan, feb, mar]
+        assert sorted(periods) == correctPeriods
+
+
+def test_period_immutable():
+    # see gh-17116
+    msg = "not writable"
+
+    per = Period("2014Q1")
+    with pytest.raises(AttributeError, match=msg):
+        per.ordinal = 14
+
+    freq = per.freq
+    with pytest.raises(AttributeError, match=msg):
+        per.freq = 2 * freq
+
+
+def test_small_year_parsing():
+    per1 = Period("0001-01-07", "D")
+    assert per1.year == 1
+    assert per1.day == 7
+
+
+def test_negone_ordinals():
+    freqs = ["Y", "M", "Q", "D", "h", "min", "s"]
+
+    period = Period(ordinal=-1, freq="D")
+    for freq in freqs:
+        repr(period.asfreq(freq))
+
+    for freq in freqs:
+        period = Period(ordinal=-1, freq=freq)
+        repr(period)
+        assert period.year == 1969
+
+    with tm.assert_produces_warning(FutureWarning, match=bday_msg):
+        period = Period(ordinal=-1, freq="B")
+    repr(period)
+    period = Period(ordinal=-1, freq="W")
+    repr(period)

@@ -4,195 +4,202 @@ import pytest
 from pandas._libs.tslibs import IncompatibleFrequency
 
 from pandas import (
-    DataFrame,
-    Period,
+    DatetimeIndex,
+    PeriodIndex,
     Series,
     Timestamp,
     date_range,
+    isna,
+    notna,
+    offsets,
     period_range,
-    to_datetime,
 )
 import pandas._testing as tm
 
 
-@pytest.fixture
-def date_range_frame():
-    """
-    Fixture for DataFrame of ints with date_range index
+class TestSeriesAsof:
+    def test_asof_nanosecond_index_access(self):
+        ts = Timestamp("20130101").as_unit("ns")._value
+        dti = DatetimeIndex([ts + 50 + i for i in range(100)])
+        ser = Series(np.random.default_rng(2).standard_normal(100), index=dti)
 
-    Columns are ['A', 'B'].
-    """
-    N = 50
-    rng = date_range("1/1/1990", periods=N, freq="53s")
-    return DataFrame({"A": np.arange(N), "B": np.arange(N)}, index=rng)
+        first_value = ser.asof(ser.index[0])
 
+        # GH#46903 previously incorrectly was "day"
+        assert dti.resolution == "nanosecond"
 
-class TestFrameAsof:
-    def test_basic(self, date_range_frame):
-        # Explicitly cast to float to avoid implicit cast when setting np.nan
-        df = date_range_frame.astype({"A": "float"})
+        # this used to not work bc parsing was done by dateutil that didn't
+        #  handle nanoseconds
+        assert first_value == ser["2013-01-01 00:00:00.000000050"]
+
+        expected_ts = np.datetime64("2013-01-01 00:00:00.000000050", "ns")
+        assert first_value == ser[Timestamp(expected_ts)]
+
+    def test_basic(self):
+        # array or list or dates
         N = 50
-        df.loc[df.index[15:30], "A"] = np.nan
+        rng = date_range("1/1/1990", periods=N, freq="53s")
+        ts = Series(np.random.default_rng(2).standard_normal(N), index=rng)
+        ts.iloc[15:30] = np.nan
         dates = date_range("1/1/1990", periods=N * 3, freq="25s")
 
-        result = df.asof(dates)
-        assert result.notna().all(1).all()
-        lb = df.index[14]
-        ub = df.index[30]
+        result = ts.asof(dates)
+        assert notna(result).all()
+        lb = ts.index[14]
+        ub = ts.index[30]
 
-        dates = list(dates)
-
-        result = df.asof(dates)
-        assert result.notna().all(1).all()
+        result = ts.asof(list(dates))
+        assert notna(result).all()
+        lb = ts.index[14]
+        ub = ts.index[30]
 
         mask = (result.index >= lb) & (result.index < ub)
         rs = result[mask]
-        assert (rs == 14).all(1).all()
+        assert (rs == ts[lb]).all()
 
-    def test_subset(self, date_range_frame):
-        N = 10
-        # explicitly cast to float to avoid implicit upcast when setting to np.nan
-        df = date_range_frame.iloc[:N].copy().astype({"A": "float"})
-        df.loc[df.index[4:8], "A"] = np.nan
-        dates = date_range("1/1/1990", periods=N * 3, freq="25s")
+        val = result[result.index[result.index >= ub][0]]
+        assert ts[ub] == val
 
-        # with a subset of A should be the same
-        result = df.asof(dates, subset="A")
-        expected = df.asof(dates)
-        tm.assert_frame_equal(result, expected)
+    def test_scalar(self):
+        N = 30
+        rng = date_range("1/1/1990", periods=N, freq="53s")
+        # Explicit cast to float avoid implicit cast when setting nan
+        ts = Series(np.arange(N), index=rng, dtype="float")
+        ts.iloc[5:10] = np.nan
+        ts.iloc[15:20] = np.nan
 
-        # same with A/B
-        result = df.asof(dates, subset=["A", "B"])
-        expected = df.asof(dates)
-        tm.assert_frame_equal(result, expected)
+        val1 = ts.asof(ts.index[7])
+        val2 = ts.asof(ts.index[19])
 
-        # B gives df.asof
-        result = df.asof(dates, subset="B")
-        expected = df.resample("25s", closed="right").ffill().reindex(dates)
-        expected.iloc[20:] = 9
-        # no "missing", so "B" can retain int dtype (df["A"].dtype platform-dependent)
-        expected["B"] = expected["B"].astype(df["B"].dtype)
+        assert val1 == ts.iloc[4]
+        assert val2 == ts.iloc[14]
 
-        tm.assert_frame_equal(result, expected)
+        # accepts strings
+        val1 = ts.asof(str(ts.index[7]))
+        assert val1 == ts.iloc[4]
 
-    def test_missing(self, date_range_frame):
-        # GH 15118
-        # no match found - `where` value before earliest date in index
-        N = 10
-        # Cast to 'float64' to avoid upcast when introducing nan in df.asof
-        df = date_range_frame.iloc[:N].copy().astype("float64")
+        # in there
+        result = ts.asof(ts.index[3])
+        assert result == ts.iloc[3]
 
-        result = df.asof("1989-12-31")
+        # no as of value
+        d = ts.index[0] - offsets.BDay()
+        assert np.isnan(ts.asof(d))
 
+    def test_with_nan(self):
+        # basic asof test
+        rng = date_range("1/1/2000", "1/2/2000", freq="4h")
+        s = Series(np.arange(len(rng)), index=rng)
+        r = s.resample("2h").mean()
+
+        result = r.asof(r.index)
         expected = Series(
-            index=["A", "B"], name=Timestamp("1989-12-31"), dtype=np.float64
+            [0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6.0],
+            index=date_range("1/1/2000", "1/2/2000", freq="2h"),
         )
         tm.assert_series_equal(result, expected)
 
-        result = df.asof(to_datetime(["1989-12-31"]))
-        expected = DataFrame(
-            index=to_datetime(["1989-12-31"]), columns=["A", "B"], dtype="float64"
+        r.iloc[3:5] = np.nan
+        result = r.asof(r.index)
+        expected = Series(
+            [0, 0, 1, 1, 1, 1, 3, 3, 4, 4, 5, 5, 6.0],
+            index=date_range("1/1/2000", "1/2/2000", freq="2h"),
         )
-        tm.assert_frame_equal(result, expected)
-
-        # Check that we handle PeriodIndex correctly, dont end up with
-        #  period.ordinal for series name
-        df = df.to_period("D")
-        result = df.asof("1989-12-31")
-        assert isinstance(result.name, Period)
-
-    def test_asof_all_nans(self, frame_or_series):
-        # GH 15713
-        # DataFrame/Series is all nans
-        result = frame_or_series([np.nan]).asof([0])
-        expected = frame_or_series([np.nan])
-        tm.assert_equal(result, expected)
-
-    def test_all_nans(self, date_range_frame):
-        # GH 15713
-        # DataFrame is all nans
-
-        # testing non-default indexes, multiple inputs
-        N = 150
-        rng = date_range_frame.index
-        dates = date_range("1/1/1990", periods=N, freq="25s")
-        result = DataFrame(np.nan, index=rng, columns=["A"]).asof(dates)
-        expected = DataFrame(np.nan, index=dates, columns=["A"])
-        tm.assert_frame_equal(result, expected)
-
-        # testing multiple columns
-        dates = date_range("1/1/1990", periods=N, freq="25s")
-        result = DataFrame(np.nan, index=rng, columns=["A", "B", "C"]).asof(dates)
-        expected = DataFrame(np.nan, index=dates, columns=["A", "B", "C"])
-        tm.assert_frame_equal(result, expected)
-
-        # testing scalar input
-        result = DataFrame(np.nan, index=[1, 2], columns=["A", "B"]).asof([3])
-        expected = DataFrame(np.nan, index=[3], columns=["A", "B"])
-        tm.assert_frame_equal(result, expected)
-
-        result = DataFrame(np.nan, index=[1, 2], columns=["A", "B"]).asof(3)
-        expected = Series(np.nan, index=["A", "B"], name=3)
         tm.assert_series_equal(result, expected)
 
-    @pytest.mark.parametrize(
-        "stamp,expected",
-        [
-            (
-                Timestamp("2018-01-01 23:22:43.325+00:00"),
-                Series(2, name=Timestamp("2018-01-01 23:22:43.325+00:00")),
-            ),
-            (
-                Timestamp("2018-01-01 22:33:20.682+01:00"),
-                Series(1, name=Timestamp("2018-01-01 22:33:20.682+01:00")),
-            ),
-        ],
-    )
-    def test_time_zone_aware_index(self, stamp, expected):
-        # GH21194
-        # Testing awareness of DataFrame index considering different
-        # UTC and timezone
-        df = DataFrame(
-            data=[1, 2],
-            index=[
-                Timestamp("2018-01-01 21:00:05.001+00:00"),
-                Timestamp("2018-01-01 22:35:10.550+00:00"),
-            ],
+        r.iloc[-3:] = np.nan
+        result = r.asof(r.index)
+        expected = Series(
+            [0, 0, 1, 1, 1, 1, 3, 3, 4, 4, 4, 4, 4.0],
+            index=date_range("1/1/2000", "1/2/2000", freq="2h"),
         )
-
-        result = df.asof(stamp)
         tm.assert_series_equal(result, expected)
 
-    def test_is_copy(self, date_range_frame):
-        # GH-27357, GH-30784: ensure the result of asof is an actual copy and
-        # doesn't track the parent dataframe / doesn't give SettingWithCopy warnings
-        df = date_range_frame.astype({"A": "float"})
-        N = 50
-        df.loc[df.index[15:30], "A"] = np.nan
-        dates = date_range("1/1/1990", periods=N * 3, freq="25s")
-
-        result = df.asof(dates)
-
-        with tm.assert_produces_warning(None):
-            result["C"] = 1
-
-    def test_asof_periodindex_mismatched_freq(self):
+    def test_periodindex(self):
+        # array or list or dates
         N = 50
         rng = period_range("1/1/1990", periods=N, freq="h")
-        df = DataFrame(np.random.default_rng(2).standard_normal(N), index=rng)
+        ts = Series(np.random.default_rng(2).standard_normal(N), index=rng)
+        ts.iloc[15:30] = np.nan
+        dates = date_range("1/1/1990", periods=N * 3, freq="37min")
+
+        result = ts.asof(dates)
+        assert notna(result).all()
+        lb = ts.index[14]
+        ub = ts.index[30]
+
+        result = ts.asof(list(dates))
+        assert notna(result).all()
+        lb = ts.index[14]
+        ub = ts.index[30]
+
+        pix = PeriodIndex(result.index.values, freq="h")
+        mask = (pix >= lb) & (pix < ub)
+        rs = result[mask]
+        assert (rs == ts[lb]).all()
+
+        ts.iloc[5:10] = np.nan
+        ts.iloc[15:20] = np.nan
+
+        val1 = ts.asof(ts.index[7])
+        val2 = ts.asof(ts.index[19])
+
+        assert val1 == ts.iloc[4]
+        assert val2 == ts.iloc[14]
+
+        # accepts strings
+        val1 = ts.asof(str(ts.index[7]))
+        assert val1 == ts.iloc[4]
+
+        # in there
+        assert ts.asof(ts.index[3]) == ts.iloc[3]
+
+        # no as of value
+        d = ts.index[0].to_timestamp() - offsets.BDay()
+        assert isna(ts.asof(d))
 
         # Mismatched freq
         msg = "Input has different freq"
         with pytest.raises(IncompatibleFrequency, match=msg):
-            df.asof(rng.asfreq("D"))
+            ts.asof(rng.asfreq("D"))
 
-    def test_asof_preserves_bool_dtype(self):
-        # GH#16063 was casting bools to floats
-        dti = date_range("2017-01-01", freq="MS", periods=4)
-        ser = Series([True, False, True], index=dti[:-1])
+    def test_errors(self):
+        s = Series(
+            [1, 2, 3],
+            index=[Timestamp("20130101"), Timestamp("20130103"), Timestamp("20130102")],
+        )
 
-        ts = dti[-1]
-        res = ser.asof([ts])
+        # non-monotonic
+        assert not s.index.is_monotonic_increasing
+        with pytest.raises(ValueError, match="requires a sorted index"):
+            s.asof(s.index[0])
 
-        expected = Series([True], index=[ts])
-        tm.assert_series_equal(res, expected)
+        # subset with Series
+        N = 10
+        rng = date_range("1/1/1990", periods=N, freq="53s")
+        s = Series(np.random.default_rng(2).standard_normal(N), index=rng)
+        with pytest.raises(ValueError, match="not valid for Series"):
+            s.asof(s.index[0], subset="foo")
+
+    def test_all_nans(self):
+        # GH 15713
+        # series is all nans
+
+        # testing non-default indexes
+        N = 50
+        rng = date_range("1/1/1990", periods=N, freq="53s")
+
+        dates = date_range("1/1/1990", periods=N * 3, freq="25s")
+        result = Series(np.nan, index=rng).asof(dates)
+        expected = Series(np.nan, index=dates)
+        tm.assert_series_equal(result, expected)
+
+        # testing scalar input
+        date = date_range("1/1/1990", periods=N * 3, freq="25s")[0]
+        result = Series(np.nan, index=rng).asof(date)
+        assert isna(result)
+
+        # test name is propagated
+        result = Series(np.nan, index=[1, 2, 3, 4], name="test").asof([4, 5])
+        expected = Series(np.nan, index=[4, 5], name="test")
+        tm.assert_series_equal(result, expected)

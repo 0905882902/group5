@@ -1,89 +1,46 @@
 """
-Tests for np.foo applied to DataFrame, not necessarily ufuncs.
+Tests for np.foo applied to Series, not necessarily ufuncs.
 """
-import numpy as np
 
-from pandas import (
-    Categorical,
-    DataFrame,
-)
+import numpy as np
+import pytest
+
+import pandas.util._test_decorators as td
+
+from pandas import Series
 import pandas._testing as tm
 
 
-class TestAsArray:
-    def test_asarray_homogeneous(self):
-        df = DataFrame({"A": Categorical([1, 2]), "B": Categorical([1, 2])})
-        result = np.asarray(df)
-        # may change from object in the future
-        expected = np.array([[1, 1], [2, 2]], dtype="object")
-        tm.assert_numpy_array_equal(result, expected)
+class TestPtp:
+    def test_ptp(self):
+        # GH#21614
+        N = 1000
+        arr = np.random.default_rng(2).standard_normal(N)
+        ser = Series(arr)
+        assert np.ptp(ser) == np.ptp(arr)
 
-    def test_np_sqrt(self, float_frame):
-        with np.errstate(all="ignore"):
-            result = np.sqrt(float_frame)
-        assert isinstance(result, type(float_frame))
-        assert result.index.is_(float_frame.index)
-        assert result.columns.is_(float_frame.columns)
 
-        tm.assert_frame_equal(result, float_frame.apply(np.sqrt))
+def test_numpy_unique(datetime_series):
+    # it works!
+    np.unique(datetime_series)
 
-    def test_sum_deprecated_axis_behavior(self):
-        # GH#52042 deprecated behavior of df.sum(axis=None), which gets
-        #  called when we do np.sum(df)
 
-        arr = np.random.default_rng(2).standard_normal((4, 3))
-        df = DataFrame(arr)
+@pytest.mark.parametrize("index", [["a", "b", "c", "d", "e"], None])
+def test_numpy_argwhere(index):
+    # GH#35331
 
-        msg = "The behavior of DataFrame.sum with axis=None is deprecated"
-        with tm.assert_produces_warning(
-            FutureWarning, match=msg, check_stacklevel=False
-        ):
-            res = np.sum(df)
+    s = Series(range(5), index=index, dtype=np.int64)
 
-        with tm.assert_produces_warning(FutureWarning, match=msg):
-            expected = df.sum(axis=None)
-        tm.assert_series_equal(res, expected)
+    result = np.argwhere(s > 2).astype(np.int64)
+    expected = np.array([[3], [4]], dtype=np.int64)
 
-    def test_np_ravel(self):
-        # GH26247
-        arr = np.array(
-            [
-                [0.11197053, 0.44361564, -0.92589452],
-                [0.05883648, -0.00948922, -0.26469934],
-            ]
-        )
+    tm.assert_numpy_array_equal(result, expected)
 
-        result = np.ravel([DataFrame(batch.reshape(1, 3)) for batch in arr])
-        expected = np.array(
-            [
-                0.11197053,
-                0.44361564,
-                -0.92589452,
-                0.05883648,
-                -0.00948922,
-                -0.26469934,
-            ]
-        )
-        tm.assert_numpy_array_equal(result, expected)
 
-        result = np.ravel(DataFrame(arr[0].reshape(1, 3), columns=["x1", "x2", "x3"]))
-        expected = np.array([0.11197053, 0.44361564, -0.92589452])
-        tm.assert_numpy_array_equal(result, expected)
-
-        result = np.ravel(
-            [
-                DataFrame(batch.reshape(1, 3), columns=["x1", "x2", "x3"])
-                for batch in arr
-            ]
-        )
-        expected = np.array(
-            [
-                0.11197053,
-                0.44361564,
-                -0.92589452,
-                0.05883648,
-                -0.00948922,
-                -0.26469934,
-            ]
-        )
-        tm.assert_numpy_array_equal(result, expected)
+@td.skip_if_no("pyarrow")
+def test_log_arrow_backed_missing_value():
+    # GH#56285
+    ser = Series([1, 2, None], dtype="float64[pyarrow]")
+    result = np.log(ser)
+    expected = np.log(Series([1, 2, None], dtype="float64"))
+    tm.assert_series_equal(result, expected)
