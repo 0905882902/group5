@@ -5,8 +5,10 @@
 from scipy._lib.deprecation import _sub_module_deprecation
 
 __all__ = [  # noqa: F822
-    'fft','ifft','fftn','ifftn','rfft','irfft',
-    'fft2','ifft2'
+    'diff',
+    'tilbert', 'itilbert', 'hilbert', 'ihilbert',
+    'cs_diff', 'cc_diff', 'sc_diff', 'ss_diff',
+    'shift', 'iscomplexobj', 'convolve'
 ]
 
 
@@ -15,6 +17,6 @@ def __dir__():
 
 
 def __getattr__(name):
-    return _sub_module_deprecation(sub_package="fftpack", module="basic",
-                                   private_modules=["_basic"], all=__all__,
+    return _sub_module_deprecation(sub_package="fftpack", module="pseudo_diffs",
+                                   private_modules=["_pseudo_diffs"], all=__all__,
                                    attribute=name)

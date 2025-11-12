@@ -1,3 +1,4 @@
-[pandas_plotting_backends]
-matplotlib = pandas:plotting._matplotlib
+[console_scripts]
+pip=pip._internal.cli.main:main
+pip3=pip._internal.cli.main:main
 
