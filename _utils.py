@@ -1,83 +1,81 @@
-# Adapted from https://stackoverflow.com/a/9558001/2536294
+import os
+import shutil
+from ._registry import method_files_map
 
-import ast
-import operator as op
-from dataclasses import dataclass
-
-from ._multiprocessing_helpers import mp
-
-if mp is not None:
-    from .externals.loky.process_executor import _ExceptionWithTraceback
+try:
+    import platformdirs
+except ImportError:
+    platformdirs = None  # type: ignore[assignment]
 
 
-# supported operators
-operators = {
-    ast.Add: op.add,
-    ast.Sub: op.sub,
-    ast.Mult: op.mul,
-    ast.Div: op.truediv,
-    ast.FloorDiv: op.floordiv,
-    ast.Mod: op.mod,
-    ast.Pow: op.pow,
-    ast.USub: op.neg,
-}
+def _clear_cache(datasets, cache_dir=None, method_map=None):
+    if method_map is None:
+        # Use SciPy Datasets method map
+        method_map = method_files_map
+    if cache_dir is None:
+        # Use default cache_dir path
+        if platformdirs is None:
+            # platformdirs is pooch dependency
+            raise ImportError("Missing optional dependency 'pooch' required "
+                              "for scipy.datasets module. Please use pip or "
+                              "conda to install 'pooch'.")
+        cache_dir = platformdirs.user_cache_dir("scipy-data")
 
+    if not os.path.exists(cache_dir):
+        print(f"Cache Directory {cache_dir} doesn't exist. Nothing to clear.")
+        return
 
-def eval_expr(expr):
-    """
-    >>> eval_expr('2*6')
-    12
-    >>> eval_expr('2**6')
-    64
-    >>> eval_expr('1 + 2*3**(4) / (6 + -7)')
-    -161.0
-    """
-    try:
-        return eval_(ast.parse(expr, mode="eval").body)
-    except (TypeError, SyntaxError, KeyError) as e:
-        raise ValueError(
-            f"{expr!r} is not a valid or supported arithmetic expression."
-        ) from e
-
-
-def eval_(node):
-    if isinstance(node, ast.Constant):  # <constant>
-        return node.value
-    elif isinstance(node, ast.BinOp):  # <left> <operator> <right>
-        return operators[type(node.op)](eval_(node.left), eval_(node.right))
-    elif isinstance(node, ast.UnaryOp):  # <operator> <operand> e.g., -1
-        return operators[type(node.op)](eval_(node.operand))
+    if datasets is None:
+        print(f"Cleaning the cache directory {cache_dir}!")
+        shutil.rmtree(cache_dir)
     else:
-        raise TypeError(node)
+        if not isinstance(datasets, (list, tuple)):
+            # single dataset method passed should be converted to list
+            datasets = [datasets, ]
+        for dataset in datasets:
+            assert callable(dataset)
+            dataset_name = dataset.__name__  # Name of the dataset method
+            if dataset_name not in method_map:
+                raise ValueError(f"Dataset method {dataset_name} doesn't "
+                                 "exist. Please check if the passed dataset "
+                                 "is a subset of the following dataset "
+                                 f"methods: {list(method_map.keys())}")
+
+            data_files = method_map[dataset_name]
+            data_filepaths = [os.path.join(cache_dir, file)
+                              for file in data_files]
+            for data_filepath in data_filepaths:
+                if os.path.exists(data_filepath):
+                    print("Cleaning the file "
+                          f"{os.path.split(data_filepath)[1]} "
+                          f"for dataset {dataset_name}")
+                    os.remove(data_filepath)
+                else:
+                    print(f"Path {data_filepath} doesn't exist. "
+                          "Nothing to clear.")
 
 
-@dataclass(frozen=True)
-class _Sentinel:
-    """A sentinel to mark a parameter as not explicitly set"""
+def clear_cache(datasets=None):
+    """
+    Cleans the scipy datasets cache directory.
 
-    default_value: object
+    If a scipy.datasets method or a list/tuple of the same is
+    provided, then clear_cache removes all the data files
+    associated to the passed dataset method callable(s).
 
-    def __repr__(self):
-        return f"default({self.default_value!r})"
+    By default, it removes all the cached data files.
 
+    Parameters
+    ----------
+    datasets : callable or list/tuple of callable or None
 
-class _TracebackCapturingWrapper:
-    """Protect function call and return error with traceback."""
-
-    def __init__(self, func):
-        self.func = func
-
-    def __call__(self, **kwargs):
-        try:
-            return self.func(**kwargs)
-        except BaseException as e:
-            return _ExceptionWithTraceback(e)
-
-
-def _retrieve_traceback_capturing_wrapped_call(out):
-    if isinstance(out, _ExceptionWithTraceback):
-        rebuild, args = out.__reduce__()
-        out = rebuild(*args)
-    if isinstance(out, BaseException):
-        raise out
-    return out
+    Examples
+    --------
+    >>> from scipy import datasets
+    >>> ascent_array = datasets.ascent()
+    >>> ascent_array.shape
+    (512, 512)
+    >>> datasets.clear_cache([datasets.ascent])
+    Cleaning the file ascent.dat for dataset ascent
+    """
+    _clear_cache(datasets)
