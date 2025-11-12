@@ -1,20 +1,10 @@
-"""Test for the deprecation helper"""
-
-# Authors: Guillaume Lemaitre <g.lemaitre58@gmail.com>
-# License: MIT
-
-from imblearn.utils.deprecation import deprecate_parameter
-from imblearn.utils.testing import warns
+import pytest
 
 
-class Sampler:
-    def __init__(self):
-        self.a = "something"
-        self.b = "something"
-
-
-def test_deprecate_parameter():
-    with warns(DeprecationWarning, match="is deprecated from"):
-        deprecate_parameter(Sampler(), "0.2", "a")
-    with warns(DeprecationWarning, match="Use 'b' instead."):
-        deprecate_parameter(Sampler(), "0.2", "a", "b")
+def test_cython_api_deprecation():
+    match = ("`scipy._lib._test_deprecation_def.foo_deprecated` "
+             "is deprecated, use `foo` instead!\n"
+             "Deprecated in Scipy 42.0.0")
+    with pytest.warns(DeprecationWarning, match=match):
+        from .. import _test_deprecation_call
+    assert _test_deprecation_call.call() == (1, 1)
