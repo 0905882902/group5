@@ -1,615 +1,395 @@
-import sys
+from copy import deepcopy
+import inspect
+import pydoc
 
 import numpy as np
-from numpy.core._rational_tests import rational
 import pytest
-from numpy.testing import (
-     assert_, assert_equal, assert_array_equal, assert_raises, assert_warns,
-     HAS_REFCOUNT
+
+from pandas._config import using_string_dtype
+from pandas._config.config import option_context
+
+from pandas.compat import HAS_PYARROW
+
+import pandas as pd
+from pandas import (
+    DataFrame,
+    Series,
+    date_range,
+    timedelta_range,
+)
+import pandas._testing as tm
+
+
+class TestDataFrameMisc:
+    def test_getitem_pop_assign_name(self, float_frame):
+        s = float_frame["A"]
+        assert s.name == "A"
+
+        s = float_frame.pop("A")
+        assert s.name == "A"
+
+        s = float_frame.loc[:, "B"]
+        assert s.name == "B"
+
+        s2 = s.loc[:]
+        assert s2.name == "B"
+
+    def test_get_axis(self, float_frame):
+        f = float_frame
+        assert f._get_axis_number(0) == 0
+        assert f._get_axis_number(1) == 1
+        assert f._get_axis_number("index") == 0
+        assert f._get_axis_number("rows") == 0
+        assert f._get_axis_number("columns") == 1
+
+        assert f._get_axis_name(0) == "index"
+        assert f._get_axis_name(1) == "columns"
+        assert f._get_axis_name("index") == "index"
+        assert f._get_axis_name("rows") == "index"
+        assert f._get_axis_name("columns") == "columns"
+
+        assert f._get_axis(0) is f.index
+        assert f._get_axis(1) is f.columns
+
+        with pytest.raises(ValueError, match="No axis named"):
+            f._get_axis_number(2)
+
+        with pytest.raises(ValueError, match="No axis.*foo"):
+            f._get_axis_name("foo")
+
+        with pytest.raises(ValueError, match="No axis.*None"):
+            f._get_axis_name(None)
+
+        with pytest.raises(ValueError, match="No axis named"):
+            f._get_axis_number(None)
+
+    def test_column_contains_raises(self, float_frame):
+        with pytest.raises(TypeError, match="unhashable type: 'Index'"):
+            float_frame.columns in float_frame
+
+    def test_tab_completion(self):
+        # DataFrame whose columns are identifiers shall have them in __dir__.
+        df = DataFrame([list("abcd"), list("efgh")], columns=list("ABCD"))
+        for key in list("ABCD"):
+            assert key in dir(df)
+        assert isinstance(df.__getitem__("A"), Series)
+
+        # DataFrame whose first-level columns are identifiers shall have
+        # them in __dir__.
+        df = DataFrame(
+            [list("abcd"), list("efgh")],
+            columns=pd.MultiIndex.from_tuples(list(zip("ABCD", "EFGH"))),
+        )
+        for key in list("ABCD"):
+            assert key in dir(df)
+        for key in list("EFGH"):
+            assert key not in dir(df)
+        assert isinstance(df.__getitem__("A"), DataFrame)
+
+    def test_display_max_dir_items(self):
+        # display.max_dir_items increaes the number of columns that are in __dir__.
+        columns = ["a" + str(i) for i in range(420)]
+        values = [range(420), range(420)]
+        df = DataFrame(values, columns=columns)
+
+        # The default value for display.max_dir_items is 100
+        assert "a99" in dir(df)
+        assert "a100" not in dir(df)
+
+        with option_context("display.max_dir_items", 300):
+            df = DataFrame(values, columns=columns)
+            assert "a299" in dir(df)
+            assert "a300" not in dir(df)
+
+        with option_context("display.max_dir_items", None):
+            df = DataFrame(values, columns=columns)
+            assert "a419" in dir(df)
+
+    def test_not_hashable(self):
+        empty_frame = DataFrame()
+
+        df = DataFrame([1])
+        msg = "unhashable type: 'DataFrame'"
+        with pytest.raises(TypeError, match=msg):
+            hash(df)
+        with pytest.raises(TypeError, match=msg):
+            hash(empty_frame)
+
+    @pytest.mark.xfail(
+        using_string_dtype() and HAS_PYARROW, reason="surrogates not allowed"
     )
-
-
-def test_array_array():
-    tobj = type(object)
-    ones11 = np.ones((1, 1), np.float64)
-    tndarray = type(ones11)
-    # Test is_ndarray
-    assert_equal(np.array(ones11, dtype=np.float64), ones11)
-    if HAS_REFCOUNT:
-        old_refcount = sys.getrefcount(tndarray)
-        np.array(ones11)
-        assert_equal(old_refcount, sys.getrefcount(tndarray))
-
-    # test None
-    assert_equal(np.array(None, dtype=np.float64),
-                 np.array(np.nan, dtype=np.float64))
-    if HAS_REFCOUNT:
-        old_refcount = sys.getrefcount(tobj)
-        np.array(None, dtype=np.float64)
-        assert_equal(old_refcount, sys.getrefcount(tobj))
-
-    # test scalar
-    assert_equal(np.array(1.0, dtype=np.float64),
-                 np.ones((), dtype=np.float64))
-    if HAS_REFCOUNT:
-        old_refcount = sys.getrefcount(np.float64)
-        np.array(np.array(1.0, dtype=np.float64), dtype=np.float64)
-        assert_equal(old_refcount, sys.getrefcount(np.float64))
-
-    # test string
-    S2 = np.dtype((bytes, 2))
-    S3 = np.dtype((bytes, 3))
-    S5 = np.dtype((bytes, 5))
-    assert_equal(np.array(b"1.0", dtype=np.float64),
-                 np.ones((), dtype=np.float64))
-    assert_equal(np.array(b"1.0").dtype, S3)
-    assert_equal(np.array(b"1.0", dtype=bytes).dtype, S3)
-    assert_equal(np.array(b"1.0", dtype=S2), np.array(b"1."))
-    assert_equal(np.array(b"1", dtype=S5), np.ones((), dtype=S5))
-
-    # test string
-    U2 = np.dtype((str, 2))
-    U3 = np.dtype((str, 3))
-    U5 = np.dtype((str, 5))
-    assert_equal(np.array("1.0", dtype=np.float64),
-                 np.ones((), dtype=np.float64))
-    assert_equal(np.array("1.0").dtype, U3)
-    assert_equal(np.array("1.0", dtype=str).dtype, U3)
-    assert_equal(np.array("1.0", dtype=U2), np.array(str("1.")))
-    assert_equal(np.array("1", dtype=U5), np.ones((), dtype=U5))
-
-    builtins = getattr(__builtins__, '__dict__', __builtins__)
-    assert_(hasattr(builtins, 'get'))
-
-    # test memoryview
-    dat = np.array(memoryview(b'1.0'), dtype=np.float64)
-    assert_equal(dat, [49.0, 46.0, 48.0])
-    assert_(dat.dtype.type is np.float64)
-
-    dat = np.array(memoryview(b'1.0'))
-    assert_equal(dat, [49, 46, 48])
-    assert_(dat.dtype.type is np.uint8)
-
-    # test array interface
-    a = np.array(100.0, dtype=np.float64)
-    o = type("o", (object,),
-             dict(__array_interface__=a.__array_interface__))
-    assert_equal(np.array(o, dtype=np.float64), a)
-
-    # test array_struct interface
-    a = np.array([(1, 4.0, 'Hello'), (2, 6.0, 'World')],
-                 dtype=[('f0', int), ('f1', float), ('f2', str)])
-    o = type("o", (object,),
-             dict(__array_struct__=a.__array_struct__))
-    ## wasn't what I expected... is np.array(o) supposed to equal a ?
-    ## instead we get a array([...], dtype=">V18")
-    assert_equal(bytes(np.array(o).data), bytes(a.data))
-
-    # test array
-    o = type("o", (object,),
-             dict(__array__=lambda *x: np.array(100.0, dtype=np.float64)))()
-    assert_equal(np.array(o, dtype=np.float64), np.array(100.0, np.float64))
-
-    # test recursion
-    nested = 1.5
-    for i in range(np.MAXDIMS):
-        nested = [nested]
-
-    # no error
-    np.array(nested)
-
-    # Exceeds recursion limit
-    assert_raises(ValueError, np.array, [nested], dtype=np.float64)
-
-    # Try with lists...
-    # float32
-    assert_equal(np.array([None] * 10, dtype=np.float32),
-                 np.full((10,), np.nan, dtype=np.float32))
-    assert_equal(np.array([[None]] * 10, dtype=np.float32),
-                 np.full((10, 1), np.nan, dtype=np.float32))
-    assert_equal(np.array([[None] * 10], dtype=np.float32),
-                 np.full((1, 10), np.nan, dtype=np.float32))
-    assert_equal(np.array([[None] * 10] * 10, dtype=np.float32),
-                 np.full((10, 10), np.nan, dtype=np.float32))
-    # float64
-    assert_equal(np.array([None] * 10, dtype=np.float64),
-                 np.full((10,), np.nan, dtype=np.float64))
-    assert_equal(np.array([[None]] * 10, dtype=np.float64),
-                 np.full((10, 1), np.nan, dtype=np.float64))
-    assert_equal(np.array([[None] * 10], dtype=np.float64),
-                 np.full((1, 10), np.nan, dtype=np.float64))
-    assert_equal(np.array([[None] * 10] * 10, dtype=np.float64),
-                 np.full((10, 10), np.nan, dtype=np.float64))
-
-    assert_equal(np.array([1.0] * 10, dtype=np.float64),
-                 np.ones((10,), dtype=np.float64))
-    assert_equal(np.array([[1.0]] * 10, dtype=np.float64),
-                 np.ones((10, 1), dtype=np.float64))
-    assert_equal(np.array([[1.0] * 10], dtype=np.float64),
-                 np.ones((1, 10), dtype=np.float64))
-    assert_equal(np.array([[1.0] * 10] * 10, dtype=np.float64),
-                 np.ones((10, 10), dtype=np.float64))
-
-    # Try with tuples
-    assert_equal(np.array((None,) * 10, dtype=np.float64),
-                 np.full((10,), np.nan, dtype=np.float64))
-    assert_equal(np.array([(None,)] * 10, dtype=np.float64),
-                 np.full((10, 1), np.nan, dtype=np.float64))
-    assert_equal(np.array([(None,) * 10], dtype=np.float64),
-                 np.full((1, 10), np.nan, dtype=np.float64))
-    assert_equal(np.array([(None,) * 10] * 10, dtype=np.float64),
-                 np.full((10, 10), np.nan, dtype=np.float64))
-
-    assert_equal(np.array((1.0,) * 10, dtype=np.float64),
-                 np.ones((10,), dtype=np.float64))
-    assert_equal(np.array([(1.0,)] * 10, dtype=np.float64),
-                 np.ones((10, 1), dtype=np.float64))
-    assert_equal(np.array([(1.0,) * 10], dtype=np.float64),
-                 np.ones((1, 10), dtype=np.float64))
-    assert_equal(np.array([(1.0,) * 10] * 10, dtype=np.float64),
-                 np.ones((10, 10), dtype=np.float64))
-
-@pytest.mark.parametrize("array", [True, False])
-def test_array_impossible_casts(array):
-    # All builtin types can be forcibly cast, at least theoretically,
-    # but user dtypes cannot necessarily.
-    rt = rational(1, 2)
-    if array:
-        rt = np.array(rt)
-    with assert_raises(TypeError):
-        np.array(rt, dtype="M8")
-
-
-# TODO: remove when fastCopyAndTranspose deprecation expires
-@pytest.mark.parametrize("a",
-    (
-        np.array(2),  # 0D array
-        np.array([3, 2, 7, 0]),  # 1D array
-        np.arange(6).reshape(2, 3)  # 2D array
-    ),
-)
-def test_fastCopyAndTranspose(a):
-    with pytest.deprecated_call():
-        b = np.fastCopyAndTranspose(a)
-        assert_equal(b, a.T)
-        assert b.flags.owndata
-
-
-def test_array_astype():
-    a = np.arange(6, dtype='f4').reshape(2, 3)
-    # Default behavior: allows unsafe casts, keeps memory layout,
-    #                   always copies.
-    b = a.astype('i4')
-    assert_equal(a, b)
-    assert_equal(b.dtype, np.dtype('i4'))
-    assert_equal(a.strides, b.strides)
-    b = a.T.astype('i4')
-    assert_equal(a.T, b)
-    assert_equal(b.dtype, np.dtype('i4'))
-    assert_equal(a.T.strides, b.strides)
-    b = a.astype('f4')
-    assert_equal(a, b)
-    assert_(not (a is b))
-
-    # copy=False parameter can sometimes skip a copy
-    b = a.astype('f4', copy=False)
-    assert_(a is b)
-
-    # order parameter allows overriding of the memory layout,
-    # forcing a copy if the layout is wrong
-    b = a.astype('f4', order='F', copy=False)
-    assert_equal(a, b)
-    assert_(not (a is b))
-    assert_(b.flags.f_contiguous)
-
-    b = a.astype('f4', order='C', copy=False)
-    assert_equal(a, b)
-    assert_(a is b)
-    assert_(b.flags.c_contiguous)
-
-    # casting parameter allows catching bad casts
-    b = a.astype('c8', casting='safe')
-    assert_equal(a, b)
-    assert_equal(b.dtype, np.dtype('c8'))
-
-    assert_raises(TypeError, a.astype, 'i4', casting='safe')
-
-    # subok=False passes through a non-subclassed array
-    b = a.astype('f4', subok=0, copy=False)
-    assert_(a is b)
-
-    class MyNDArray(np.ndarray):
-        pass
-
-    a = np.array([[0, 1, 2], [3, 4, 5]], dtype='f4').view(MyNDArray)
-
-    # subok=True passes through a subclass
-    b = a.astype('f4', subok=True, copy=False)
-    assert_(a is b)
-
-    # subok=True is default, and creates a subtype on a cast
-    b = a.astype('i4', copy=False)
-    assert_equal(a, b)
-    assert_equal(type(b), MyNDArray)
-
-    # subok=False never returns a subclass
-    b = a.astype('f4', subok=False, copy=False)
-    assert_equal(a, b)
-    assert_(not (a is b))
-    assert_(type(b) is not MyNDArray)
-
-    # Make sure converting from string object to fixed length string
-    # does not truncate.
-    a = np.array([b'a'*100], dtype='O')
-    b = a.astype('S')
-    assert_equal(a, b)
-    assert_equal(b.dtype, np.dtype('S100'))
-    a = np.array(['a'*100], dtype='O')
-    b = a.astype('U')
-    assert_equal(a, b)
-    assert_equal(b.dtype, np.dtype('U100'))
-
-    # Same test as above but for strings shorter than 64 characters
-    a = np.array([b'a'*10], dtype='O')
-    b = a.astype('S')
-    assert_equal(a, b)
-    assert_equal(b.dtype, np.dtype('S10'))
-    a = np.array(['a'*10], dtype='O')
-    b = a.astype('U')
-    assert_equal(a, b)
-    assert_equal(b.dtype, np.dtype('U10'))
-
-    a = np.array(123456789012345678901234567890, dtype='O').astype('S')
-    assert_array_equal(a, np.array(b'1234567890' * 3, dtype='S30'))
-    a = np.array(123456789012345678901234567890, dtype='O').astype('U')
-    assert_array_equal(a, np.array('1234567890' * 3, dtype='U30'))
-
-    a = np.array([123456789012345678901234567890], dtype='O').astype('S')
-    assert_array_equal(a, np.array(b'1234567890' * 3, dtype='S30'))
-    a = np.array([123456789012345678901234567890], dtype='O').astype('U')
-    assert_array_equal(a, np.array('1234567890' * 3, dtype='U30'))
-
-    a = np.array(123456789012345678901234567890, dtype='S')
-    assert_array_equal(a, np.array(b'1234567890' * 3, dtype='S30'))
-    a = np.array(123456789012345678901234567890, dtype='U')
-    assert_array_equal(a, np.array('1234567890' * 3, dtype='U30'))
-
-    a = np.array('a\u0140', dtype='U')
-    b = np.ndarray(buffer=a, dtype='uint32', shape=2)
-    assert_(b.size == 2)
-
-    a = np.array([1000], dtype='i4')
-    assert_raises(TypeError, a.astype, 'S1', casting='safe')
-
-    a = np.array(1000, dtype='i4')
-    assert_raises(TypeError, a.astype, 'U1', casting='safe')
-
-    # gh-24023
-    assert_raises(TypeError, a.astype)
-
-@pytest.mark.parametrize("dt", ["S", "U"])
-def test_array_astype_to_string_discovery_empty(dt):
-    # See also gh-19085
-    arr = np.array([""], dtype=object)
-    # Note, the itemsize is the `0 -> 1` logic, which should change.
-    # The important part the test is rather that it does not error.
-    assert arr.astype(dt).dtype.itemsize == np.dtype(f"{dt}1").itemsize
-
-    # check the same thing for `np.can_cast` (since it accepts arrays)
-    assert np.can_cast(arr, dt, casting="unsafe")
-    assert not np.can_cast(arr, dt, casting="same_kind")
-    # as well as for the object as a descriptor:
-    assert np.can_cast("O", dt, casting="unsafe")
-
-@pytest.mark.parametrize("dt", ["d", "f", "S13", "U32"])
-def test_array_astype_to_void(dt):
-    dt = np.dtype(dt)
-    arr = np.array([], dtype=dt)
-    assert arr.astype("V").dtype.itemsize == dt.itemsize
-
-def test_object_array_astype_to_void():
-    # This is different to `test_array_astype_to_void` as object arrays
-    # are inspected.  The default void is "V8" (8 is the length of double)
-    arr = np.array([], dtype="O").astype("V")
-    assert arr.dtype == "V8"
-
-@pytest.mark.parametrize("t",
-    np.sctypes['uint'] + np.sctypes['int'] + np.sctypes['float']
-)
-def test_array_astype_warning(t):
-    # test ComplexWarning when casting from complex to float or int
-    a = np.array(10, dtype=np.complex_)
-    assert_warns(np.ComplexWarning, a.astype, t)
-
-@pytest.mark.parametrize(["dtype", "out_dtype"],
-        [(np.bytes_, np.bool_),
-         (np.str_, np.bool_),
-         (np.dtype("S10,S9"), np.dtype("?,?"))])
-def test_string_to_boolean_cast(dtype, out_dtype):
-    """
-    Currently, for `astype` strings are cast to booleans effectively by
-    calling `bool(int(string)`. This is not consistent (see gh-9875) and
-    will eventually be deprecated.
-    """
-    arr = np.array(["10", "10\0\0\0", "0\0\0", "0"], dtype=dtype)
-    expected = np.array([True, True, False, False], dtype=out_dtype)
-    assert_array_equal(arr.astype(out_dtype), expected)
-
-@pytest.mark.parametrize(["dtype", "out_dtype"],
-        [(np.bytes_, np.bool_),
-         (np.str_, np.bool_),
-         (np.dtype("S10,S9"), np.dtype("?,?"))])
-def test_string_to_boolean_cast_errors(dtype, out_dtype):
-    """
-    These currently error out, since cast to integers fails, but should not
-    error out in the future.
-    """
-    for invalid in ["False", "True", "", "\0", "non-empty"]:
-        arr = np.array([invalid], dtype=dtype)
-        with assert_raises(ValueError):
-            arr.astype(out_dtype)
-
-@pytest.mark.parametrize("str_type", [str, bytes, np.str_, np.unicode_])
-@pytest.mark.parametrize("scalar_type",
-        [np.complex64, np.complex128, np.clongdouble])
-def test_string_to_complex_cast(str_type, scalar_type):
-    value = scalar_type(b"1+3j")
-    assert scalar_type(value) == 1+3j
-    assert np.array([value], dtype=object).astype(scalar_type)[()] == 1+3j
-    assert np.array(value).astype(scalar_type)[()] == 1+3j
-    arr = np.zeros(1, dtype=scalar_type)
-    arr[0] = value
-    assert arr[0] == 1+3j
-
-@pytest.mark.parametrize("dtype", np.typecodes["AllFloat"])
-def test_none_to_nan_cast(dtype):
-    # Note that at the time of writing this test, the scalar constructors
-    # reject None
-    arr = np.zeros(1, dtype=dtype)
-    arr[0] = None
-    assert np.isnan(arr)[0]
-    assert np.isnan(np.array(None, dtype=dtype))[()]
-    assert np.isnan(np.array([None], dtype=dtype))[0]
-    assert np.isnan(np.array(None).astype(dtype))[()]
-
-def test_copyto_fromscalar():
-    a = np.arange(6, dtype='f4').reshape(2, 3)
-
-    # Simple copy
-    np.copyto(a, 1.5)
-    assert_equal(a, 1.5)
-    np.copyto(a.T, 2.5)
-    assert_equal(a, 2.5)
-
-    # Where-masked copy
-    mask = np.array([[0, 1, 0], [0, 0, 1]], dtype='?')
-    np.copyto(a, 3.5, where=mask)
-    assert_equal(a, [[2.5, 3.5, 2.5], [2.5, 2.5, 3.5]])
-    mask = np.array([[0, 1], [1, 1], [1, 0]], dtype='?')
-    np.copyto(a.T, 4.5, where=mask)
-    assert_equal(a, [[2.5, 4.5, 4.5], [4.5, 4.5, 3.5]])
-
-def test_copyto():
-    a = np.arange(6, dtype='i4').reshape(2, 3)
-
-    # Simple copy
-    np.copyto(a, [[3, 1, 5], [6, 2, 1]])
-    assert_equal(a, [[3, 1, 5], [6, 2, 1]])
-
-    # Overlapping copy should work
-    np.copyto(a[:, :2], a[::-1, 1::-1])
-    assert_equal(a, [[2, 6, 5], [1, 3, 1]])
-
-    # Defaults to 'same_kind' casting
-    assert_raises(TypeError, np.copyto, a, 1.5)
-
-    # Force a copy with 'unsafe' casting, truncating 1.5 to 1
-    np.copyto(a, 1.5, casting='unsafe')
-    assert_equal(a, 1)
-
-    # Copying with a mask
-    np.copyto(a, 3, where=[True, False, True])
-    assert_equal(a, [[3, 1, 3], [3, 1, 3]])
-
-    # Casting rule still applies with a mask
-    assert_raises(TypeError, np.copyto, a, 3.5, where=[True, False, True])
-
-    # Lists of integer 0's and 1's is ok too
-    np.copyto(a, 4.0, casting='unsafe', where=[[0, 1, 1], [1, 0, 0]])
-    assert_equal(a, [[3, 4, 4], [4, 1, 3]])
-
-    # Overlapping copy with mask should work
-    np.copyto(a[:, :2], a[::-1, 1::-1], where=[[0, 1], [1, 1]])
-    assert_equal(a, [[3, 4, 4], [4, 3, 3]])
-
-    # 'dst' must be an array
-    assert_raises(TypeError, np.copyto, [1, 2, 3], [2, 3, 4])
-
-def test_copyto_permut():
-    # test explicit overflow case
-    pad = 500
-    l = [True] * pad + [True, True, True, True]
-    r = np.zeros(len(l)-pad)
-    d = np.ones(len(l)-pad)
-    mask = np.array(l)[pad:]
-    np.copyto(r, d, where=mask[::-1])
-
-    # test all permutation of possible masks, 9 should be sufficient for
-    # current 4 byte unrolled code
-    power = 9
-    d = np.ones(power)
-    for i in range(2**power):
-        r = np.zeros(power)
-        l = [(i & x) != 0 for x in range(power)]
-        mask = np.array(l)
-        np.copyto(r, d, where=mask)
-        assert_array_equal(r == 1, l)
-        assert_equal(r.sum(), sum(l))
-
-        r = np.zeros(power)
-        np.copyto(r, d, where=mask[::-1])
-        assert_array_equal(r == 1, l[::-1])
-        assert_equal(r.sum(), sum(l))
-
-        r = np.zeros(power)
-        np.copyto(r[::2], d[::2], where=mask[::2])
-        assert_array_equal(r[::2] == 1, l[::2])
-        assert_equal(r[::2].sum(), sum(l[::2]))
-
-        r = np.zeros(power)
-        np.copyto(r[::2], d[::2], where=mask[::-2])
-        assert_array_equal(r[::2] == 1, l[::-2])
-        assert_equal(r[::2].sum(), sum(l[::-2]))
-
-        for c in [0xFF, 0x7F, 0x02, 0x10]:
-            r = np.zeros(power)
-            mask = np.array(l)
-            imask = np.array(l).view(np.uint8)
-            imask[mask != 0] = c
-            np.copyto(r, d, where=mask)
-            assert_array_equal(r == 1, l)
-            assert_equal(r.sum(), sum(l))
-
-    r = np.zeros(power)
-    np.copyto(r, d, where=True)
-    assert_equal(r.sum(), r.size)
-    r = np.ones(power)
-    d = np.zeros(power)
-    np.copyto(r, d, where=False)
-    assert_equal(r.sum(), r.size)
-
-def test_copy_order():
-    a = np.arange(24).reshape(2, 1, 3, 4)
-    b = a.copy(order='F')
-    c = np.arange(24).reshape(2, 1, 4, 3).swapaxes(2, 3)
-
-    def check_copy_result(x, y, ccontig, fcontig, strides=False):
-        assert_(not (x is y))
-        assert_equal(x, y)
-        assert_equal(res.flags.c_contiguous, ccontig)
-        assert_equal(res.flags.f_contiguous, fcontig)
-
-    # Validate the initial state of a, b, and c
-    assert_(a.flags.c_contiguous)
-    assert_(not a.flags.f_contiguous)
-    assert_(not b.flags.c_contiguous)
-    assert_(b.flags.f_contiguous)
-    assert_(not c.flags.c_contiguous)
-    assert_(not c.flags.f_contiguous)
-
-    # Copy with order='C'
-    res = a.copy(order='C')
-    check_copy_result(res, a, ccontig=True, fcontig=False, strides=True)
-    res = b.copy(order='C')
-    check_copy_result(res, b, ccontig=True, fcontig=False, strides=False)
-    res = c.copy(order='C')
-    check_copy_result(res, c, ccontig=True, fcontig=False, strides=False)
-    res = np.copy(a, order='C')
-    check_copy_result(res, a, ccontig=True, fcontig=False, strides=True)
-    res = np.copy(b, order='C')
-    check_copy_result(res, b, ccontig=True, fcontig=False, strides=False)
-    res = np.copy(c, order='C')
-    check_copy_result(res, c, ccontig=True, fcontig=False, strides=False)
-
-    # Copy with order='F'
-    res = a.copy(order='F')
-    check_copy_result(res, a, ccontig=False, fcontig=True, strides=False)
-    res = b.copy(order='F')
-    check_copy_result(res, b, ccontig=False, fcontig=True, strides=True)
-    res = c.copy(order='F')
-    check_copy_result(res, c, ccontig=False, fcontig=True, strides=False)
-    res = np.copy(a, order='F')
-    check_copy_result(res, a, ccontig=False, fcontig=True, strides=False)
-    res = np.copy(b, order='F')
-    check_copy_result(res, b, ccontig=False, fcontig=True, strides=True)
-    res = np.copy(c, order='F')
-    check_copy_result(res, c, ccontig=False, fcontig=True, strides=False)
-
-    # Copy with order='K'
-    res = a.copy(order='K')
-    check_copy_result(res, a, ccontig=True, fcontig=False, strides=True)
-    res = b.copy(order='K')
-    check_copy_result(res, b, ccontig=False, fcontig=True, strides=True)
-    res = c.copy(order='K')
-    check_copy_result(res, c, ccontig=False, fcontig=False, strides=True)
-    res = np.copy(a, order='K')
-    check_copy_result(res, a, ccontig=True, fcontig=False, strides=True)
-    res = np.copy(b, order='K')
-    check_copy_result(res, b, ccontig=False, fcontig=True, strides=True)
-    res = np.copy(c, order='K')
-    check_copy_result(res, c, ccontig=False, fcontig=False, strides=True)
-
-def test_contiguous_flags():
-    a = np.ones((4, 4, 1))[::2,:,:]
-    a.strides = a.strides[:2] + (-123,)
-    b = np.ones((2, 2, 1, 2, 2)).swapaxes(3, 4)
-
-    def check_contig(a, ccontig, fcontig):
-        assert_(a.flags.c_contiguous == ccontig)
-        assert_(a.flags.f_contiguous == fcontig)
-
-    # Check if new arrays are correct:
-    check_contig(a, False, False)
-    check_contig(b, False, False)
-    check_contig(np.empty((2, 2, 0, 2, 2)), True, True)
-    check_contig(np.array([[[1], [2]]], order='F'), True, True)
-    check_contig(np.empty((2, 2)), True, False)
-    check_contig(np.empty((2, 2), order='F'), False, True)
-
-    # Check that np.array creates correct contiguous flags:
-    check_contig(np.array(a, copy=False), False, False)
-    check_contig(np.array(a, copy=False, order='C'), True, False)
-    check_contig(np.array(a, ndmin=4, copy=False, order='F'), False, True)
-
-    # Check slicing update of flags and :
-    check_contig(a[0], True, True)
-    check_contig(a[None, ::4, ..., None], True, True)
-    check_contig(b[0, 0, ...], False, True)
-    check_contig(b[:, :, 0:0, :, :], True, True)
-
-    # Test ravel and squeeze.
-    check_contig(a.ravel(), True, True)
-    check_contig(np.ones((1, 3, 1)).squeeze(), True, True)
-
-def test_broadcast_arrays():
-    # Test user defined dtypes
-    a = np.array([(1, 2, 3)], dtype='u4,u4,u4')
-    b = np.array([(1, 2, 3), (4, 5, 6), (7, 8, 9)], dtype='u4,u4,u4')
-    result = np.broadcast_arrays(a, b)
-    assert_equal(result[0], np.array([(1, 2, 3), (1, 2, 3), (1, 2, 3)], dtype='u4,u4,u4'))
-    assert_equal(result[1], np.array([(1, 2, 3), (4, 5, 6), (7, 8, 9)], dtype='u4,u4,u4'))
-
-@pytest.mark.parametrize(["shape", "fill_value", "expected_output"],
-        [((2, 2), [5.0,  6.0], np.array([[5.0, 6.0], [5.0, 6.0]])),
-         ((3, 2), [1.0,  2.0], np.array([[1.0, 2.0], [1.0, 2.0], [1.0,  2.0]]))])
-def test_full_from_list(shape, fill_value, expected_output):
-    output = np.full(shape, fill_value)
-    assert_equal(output, expected_output)
-
-def test_astype_copyflag():
-    # test the various copyflag options
-    arr = np.arange(10, dtype=np.intp)
-
-    res_true = arr.astype(np.intp, copy=True)
-    assert not np.may_share_memory(arr, res_true)
-    res_always = arr.astype(np.intp, copy=np._CopyMode.ALWAYS)
-    assert not np.may_share_memory(arr, res_always)
-
-    res_false = arr.astype(np.intp, copy=False)
-    # `res_false is arr` currently, but check `may_share_memory`.
-    assert np.may_share_memory(arr, res_false)
-    res_if_needed = arr.astype(np.intp, copy=np._CopyMode.IF_NEEDED)
-    # `res_if_needed is arr` currently, but check `may_share_memory`.
-    assert np.may_share_memory(arr, res_if_needed)
-
-    res_never = arr.astype(np.intp, copy=np._CopyMode.NEVER)
-    assert np.may_share_memory(arr, res_never)
-
-    # Simple tests for when a copy is necessary:
-    res_false = arr.astype(np.float64, copy=False)
-    assert_array_equal(res_false, arr)
-    res_if_needed = arr.astype(np.float64, 
-                               copy=np._CopyMode.IF_NEEDED)
-    assert_array_equal(res_if_needed, arr)
-    assert_raises(ValueError, arr.astype, np.float64,
-                  copy=np._CopyMode.NEVER)
+    def test_column_name_contains_unicode_surrogate(self):
+        # GH 25509
+        colname = "\ud83d"
+        df = DataFrame({colname: []})
+        # this should not crash
+        assert colname not in dir(df)
+        assert df.columns[0] == colname
+
+    def test_new_empty_index(self):
+        df1 = DataFrame(np.random.default_rng(2).standard_normal((0, 3)))
+        df2 = DataFrame(np.random.default_rng(2).standard_normal((0, 3)))
+        df1.index.name = "foo"
+        assert df2.index.name is None
+
+    def test_get_agg_axis(self, float_frame):
+        cols = float_frame._get_agg_axis(0)
+        assert cols is float_frame.columns
+
+        idx = float_frame._get_agg_axis(1)
+        assert idx is float_frame.index
+
+        msg = r"Axis must be 0 or 1 \(got 2\)"
+        with pytest.raises(ValueError, match=msg):
+            float_frame._get_agg_axis(2)
+
+    def test_empty(self, float_frame, float_string_frame):
+        empty_frame = DataFrame()
+        assert empty_frame.empty
+
+        assert not float_frame.empty
+        assert not float_string_frame.empty
+
+        # corner case
+        df = DataFrame({"A": [1.0, 2.0, 3.0], "B": ["a", "b", "c"]}, index=np.arange(3))
+        del df["A"]
+        assert not df.empty
+
+    def test_len(self, float_frame):
+        assert len(float_frame) == len(float_frame.index)
+
+        # single block corner case
+        arr = float_frame[["A", "B"]].values
+        expected = float_frame.reindex(columns=["A", "B"]).values
+        tm.assert_almost_equal(arr, expected)
+
+    def test_axis_aliases(self, float_frame):
+        f = float_frame
+
+        # reg name
+        expected = f.sum(axis=0)
+        result = f.sum(axis="index")
+        tm.assert_series_equal(result, expected)
+
+        expected = f.sum(axis=1)
+        result = f.sum(axis="columns")
+        tm.assert_series_equal(result, expected)
+
+    def test_class_axis(self):
+        # GH 18147
+        # no exception and no empty docstring
+        assert pydoc.getdoc(DataFrame.index)
+        assert pydoc.getdoc(DataFrame.columns)
+
+    def test_series_put_names(self, float_string_frame):
+        series = float_string_frame._series
+        for k, v in series.items():
+            assert v.name == k
+
+    def test_empty_nonzero(self):
+        df = DataFrame([1, 2, 3])
+        assert not df.empty
+        df = DataFrame(index=[1], columns=[1])
+        assert not df.empty
+        df = DataFrame(index=["a", "b"], columns=["c", "d"]).dropna()
+        assert df.empty
+        assert df.T.empty
+
+    @pytest.mark.parametrize(
+        "df",
+        [
+            DataFrame(),
+            DataFrame(index=[1]),
+            DataFrame(columns=[1]),
+            DataFrame({1: []}),
+        ],
+    )
+    def test_empty_like(self, df):
+        assert df.empty
+        assert df.T.empty
+
+    def test_with_datetimelikes(self):
+        df = DataFrame(
+            {
+                "A": date_range("20130101", periods=10),
+                "B": timedelta_range("1 day", periods=10),
+            }
+        )
+        t = df.T
+
+        result = t.dtypes.value_counts()
+        expected = Series({np.dtype("object"): 10}, name="count")
+        tm.assert_series_equal(result, expected)
+
+    def test_deepcopy(self, float_frame):
+        cp = deepcopy(float_frame)
+        cp.loc[0, "A"] = 10
+        assert not float_frame.equals(cp)
+
+    def test_inplace_return_self(self):
+        # GH 1893
+
+        data = DataFrame(
+            {"a": ["foo", "bar", "baz", "qux"], "b": [0, 0, 1, 1], "c": [1, 2, 3, 4]}
+        )
+
+        def _check_f(base, f):
+            result = f(base)
+            assert result is None
+
+        # -----DataFrame-----
+
+        # set_index
+        f = lambda x: x.set_index("a", inplace=True)
+        _check_f(data.copy(), f)
+
+        # reset_index
+        f = lambda x: x.reset_index(inplace=True)
+        _check_f(data.set_index("a"), f)
+
+        # drop_duplicates
+        f = lambda x: x.drop_duplicates(inplace=True)
+        _check_f(data.copy(), f)
+
+        # sort
+        f = lambda x: x.sort_values("b", inplace=True)
+        _check_f(data.copy(), f)
+
+        # sort_index
+        f = lambda x: x.sort_index(inplace=True)
+        _check_f(data.copy(), f)
+
+        # fillna
+        f = lambda x: x.fillna(0, inplace=True)
+        _check_f(data.copy(), f)
+
+        # replace
+        f = lambda x: x.replace(1, 0, inplace=True)
+        _check_f(data.copy(), f)
+
+        # rename
+        f = lambda x: x.rename({1: "foo"}, inplace=True)
+        _check_f(data.copy(), f)
+
+        # -----Series-----
+        d = data.copy()["c"]
+
+        # reset_index
+        f = lambda x: x.reset_index(inplace=True, drop=True)
+        _check_f(data.set_index("a")["c"], f)
+
+        # fillna
+        f = lambda x: x.fillna(0, inplace=True)
+        _check_f(d.copy(), f)
+
+        # replace
+        f = lambda x: x.replace(1, 0, inplace=True)
+        _check_f(d.copy(), f)
+
+        # rename
+        f = lambda x: x.rename({1: "foo"}, inplace=True)
+        _check_f(d.copy(), f)
+
+    def test_tab_complete_warning(self, ip, frame_or_series):
+        # GH 16409
+        pytest.importorskip("IPython", minversion="6.0.0")
+        from IPython.core.completer import provisionalcompleter
+
+        if frame_or_series is DataFrame:
+            code = "from pandas import DataFrame; obj = DataFrame()"
+        else:
+            code = "from pandas import Series; obj = Series(dtype=object)"
+
+        ip.run_cell(code)
+        # GH 31324 newer jedi version raises Deprecation warning;
+        #  appears resolved 2021-02-02
+        with tm.assert_produces_warning(None, raise_on_extra_warnings=False):
+            with provisionalcompleter("ignore"):
+                list(ip.Completer.completions("obj.", 1))
+
+    def test_attrs(self):
+        df = DataFrame({"A": [2, 3]})
+        assert df.attrs == {}
+        df.attrs["version"] = 1
+
+        result = df.rename(columns=str)
+        assert result.attrs == {"version": 1}
+
+    def test_attrs_deepcopy(self):
+        df = DataFrame({"A": [2, 3]})
+        assert df.attrs == {}
+        df.attrs["tags"] = {"spam", "ham"}
+
+        result = df.rename(columns=str)
+        assert result.attrs == df.attrs
+        assert result.attrs["tags"] is not df.attrs["tags"]
+
+    @pytest.mark.parametrize("allows_duplicate_labels", [True, False, None])
+    def test_set_flags(
+        self,
+        allows_duplicate_labels,
+        frame_or_series,
+        using_copy_on_write,
+        warn_copy_on_write,
+    ):
+        obj = DataFrame({"A": [1, 2]})
+        key = (0, 0)
+        if frame_or_series is Series:
+            obj = obj["A"]
+            key = 0
+
+        result = obj.set_flags(allows_duplicate_labels=allows_duplicate_labels)
+
+        if allows_duplicate_labels is None:
+            # We don't update when it's not provided
+            assert result.flags.allows_duplicate_labels is True
+        else:
+            assert result.flags.allows_duplicate_labels is allows_duplicate_labels
+
+        # We made a copy
+        assert obj is not result
+
+        # We didn't mutate obj
+        assert obj.flags.allows_duplicate_labels is True
+
+        # But we didn't copy data
+        if frame_or_series is Series:
+            assert np.may_share_memory(obj.values, result.values)
+        else:
+            assert np.may_share_memory(obj["A"].values, result["A"].values)
+
+        with tm.assert_cow_warning(warn_copy_on_write):
+            result.iloc[key] = 0
+        if using_copy_on_write:
+            assert obj.iloc[key] == 1
+        else:
+            assert obj.iloc[key] == 0
+            # set back to 1 for test below
+            with tm.assert_cow_warning(warn_copy_on_write):
+                result.iloc[key] = 1
+
+        # Now we do copy.
+        result = obj.set_flags(
+            copy=True, allows_duplicate_labels=allows_duplicate_labels
+        )
+        result.iloc[key] = 10
+        assert obj.iloc[key] == 1
+
+    def test_constructor_expanddim(self):
+        # GH#33628 accessing _constructor_expanddim should not raise NotImplementedError
+        # GH38782 pandas has no container higher than DataFrame (two-dim), so
+        # DataFrame._constructor_expand_dim, doesn't make sense, so is removed.
+        df = DataFrame()
+
+        msg = "'DataFrame' object has no attribute '_constructor_expanddim'"
+        with pytest.raises(AttributeError, match=msg):
+            df._constructor_expanddim(np.arange(27).reshape(3, 3, 3))
+
+    def test_inspect_getmembers(self):
+        # GH38740
+        df = DataFrame()
+        msg = "DataFrame._data is deprecated"
+        with tm.assert_produces_warning(
+            DeprecationWarning, match=msg, check_stacklevel=False
+        ):
+            inspect.getmembers(df)
