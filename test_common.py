@@ -1,180 +1,257 @@
-import warnings
-
-import pytest
 import numpy as np
-
-from scipy import sparse
-
-from sklearn.datasets import load_iris
-from sklearn.model_selection import train_test_split
+import pytest
 
 from sklearn.base import clone
+from sklearn.base import ClassifierMixin
+from sklearn.base import is_classifier
 
-from sklearn.preprocessing import maxabs_scale
-from sklearn.preprocessing import minmax_scale
-from sklearn.preprocessing import scale
-from sklearn.preprocessing import power_transform
-from sklearn.preprocessing import quantile_transform
-from sklearn.preprocessing import robust_scale
+from sklearn.datasets import make_classification
+from sklearn.datasets import make_regression
+from sklearn.datasets import load_iris, load_diabetes
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression, LinearRegression
+from sklearn.svm import LinearSVC, LinearSVR, SVC, SVR
+from sklearn.pipeline import make_pipeline
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 
-from sklearn.preprocessing import MaxAbsScaler
-from sklearn.preprocessing import MinMaxScaler
-from sklearn.preprocessing import StandardScaler
-from sklearn.preprocessing import PowerTransformer
-from sklearn.preprocessing import QuantileTransformer
-from sklearn.preprocessing import RobustScaler
+from sklearn.ensemble import StackingClassifier, StackingRegressor
+from sklearn.ensemble import VotingClassifier, VotingRegressor
 
-from sklearn.utils._testing import assert_array_equal
-from sklearn.utils._testing import assert_allclose
+X, y = load_iris(return_X_y=True)
 
-iris = load_iris()
-
-
-def _get_valid_samples_by_column(X, col):
-    """Get non NaN samples in column of X"""
-    return X[:, [col]][~np.isnan(X[:, col])]
+X_r, y_r = load_diabetes(return_X_y=True)
 
 
 @pytest.mark.parametrize(
-    "est, func, support_sparse, strictly_positive, omit_kwargs",
+    "X, y, estimator",
     [
-        (MaxAbsScaler(), maxabs_scale, True, False, []),
-        (MinMaxScaler(), minmax_scale, False, False, ["clip"]),
-        (StandardScaler(), scale, False, False, []),
-        (StandardScaler(with_mean=False), scale, True, False, []),
-        (PowerTransformer("yeo-johnson"), power_transform, False, False, []),
-        (PowerTransformer("box-cox"), power_transform, False, True, []),
-        (QuantileTransformer(n_quantiles=10), quantile_transform, True, False, []),
-        (RobustScaler(), robust_scale, False, False, []),
-        (RobustScaler(with_centering=False), robust_scale, True, False, []),
-    ],
-)
-def test_missing_value_handling(
-    est, func, support_sparse, strictly_positive, omit_kwargs
-):
-    # check that the preprocessing method let pass nan
-    rng = np.random.RandomState(42)
-    X = iris.data.copy()
-    n_missing = 50
-    X[
-        rng.randint(X.shape[0], size=n_missing), rng.randint(X.shape[1], size=n_missing)
-    ] = np.nan
-    if strictly_positive:
-        X += np.nanmin(X) + 0.1
-    X_train, X_test = train_test_split(X, random_state=1)
-    # sanity check
-    assert not np.all(np.isnan(X_train), axis=0).any()
-    assert np.any(np.isnan(X_train), axis=0).all()
-    assert np.any(np.isnan(X_test), axis=0).all()
-    X_test[:, 0] = np.nan  # make sure this boundary case is tested
-
-    with pytest.warns(None) as records:
-        Xt = est.fit(X_train).transform(X_test)
-    # ensure no warnings are raised
-    assert len(records) == 0
-    # missing values should still be missing, and only them
-    assert_array_equal(np.isnan(Xt), np.isnan(X_test))
-
-    # check that the function leads to the same results as the class
-    with pytest.warns(None) as records:
-        Xt_class = est.transform(X_train)
-    assert len(records) == 0
-    kwargs = est.get_params()
-    # remove the parameters which should be omitted because they
-    # are not defined in the sister function of the preprocessing class
-    for kwarg in omit_kwargs:
-        _ = kwargs.pop(kwarg)
-    Xt_func = func(X_train, **kwargs)
-    assert_array_equal(np.isnan(Xt_func), np.isnan(Xt_class))
-    assert_allclose(Xt_func[~np.isnan(Xt_func)], Xt_class[~np.isnan(Xt_class)])
-
-    # check that the inverse transform keep NaN
-    Xt_inv = est.inverse_transform(Xt)
-    assert_array_equal(np.isnan(Xt_inv), np.isnan(X_test))
-    # FIXME: we can introduce equal_nan=True in recent version of numpy.
-    # For the moment which just check that non-NaN values are almost equal.
-    assert_allclose(Xt_inv[~np.isnan(Xt_inv)], X_test[~np.isnan(X_test)])
-
-    for i in range(X.shape[1]):
-        # train only on non-NaN
-        est.fit(_get_valid_samples_by_column(X_train, i))
-        # check transforming with NaN works even when training without NaN
-        with pytest.warns(None) as records:
-            Xt_col = est.transform(X_test[:, [i]])
-        assert len(records) == 0
-        assert_allclose(Xt_col, Xt[:, [i]])
-        # check non-NaN is handled as before - the 1st column is all nan
-        if not np.isnan(X_test[:, i]).all():
-            Xt_col_nonan = est.transform(_get_valid_samples_by_column(X_test, i))
-            assert_array_equal(Xt_col_nonan, Xt_col[~np.isnan(Xt_col.squeeze())])
-
-    if support_sparse:
-        est_dense = clone(est)
-        est_sparse = clone(est)
-
-        with pytest.warns(None) as records:
-            Xt_dense = est_dense.fit(X_train).transform(X_test)
-            Xt_inv_dense = est_dense.inverse_transform(Xt_dense)
-        assert len(records) == 0
-        for sparse_constructor in (
-            sparse.csr_matrix,
-            sparse.csc_matrix,
-            sparse.bsr_matrix,
-            sparse.coo_matrix,
-            sparse.dia_matrix,
-            sparse.dok_matrix,
-            sparse.lil_matrix,
-        ):
-            # check that the dense and sparse inputs lead to the same results
-            # precompute the matrix to avoid catching side warnings
-            X_train_sp = sparse_constructor(X_train)
-            X_test_sp = sparse_constructor(X_test)
-            with pytest.warns(None) as records:
-                warnings.simplefilter("ignore", PendingDeprecationWarning)
-                Xt_sp = est_sparse.fit(X_train_sp).transform(X_test_sp)
-            assert len(records) == 0
-            assert_allclose(Xt_sp.A, Xt_dense)
-            with pytest.warns(None) as records:
-                warnings.simplefilter("ignore", PendingDeprecationWarning)
-                Xt_inv_sp = est_sparse.inverse_transform(Xt_sp)
-            assert len(records) == 0
-            assert_allclose(Xt_inv_sp.A, Xt_inv_dense)
-
-
-@pytest.mark.parametrize(
-    "est, func",
-    [
-        (MaxAbsScaler(), maxabs_scale),
-        (MinMaxScaler(), minmax_scale),
-        (StandardScaler(), scale),
-        (StandardScaler(with_mean=False), scale),
-        (PowerTransformer("yeo-johnson"), power_transform),
         (
-            PowerTransformer("box-cox"),
-            power_transform,
+            *make_classification(n_samples=10),
+            StackingClassifier(
+                estimators=[
+                    ("lr", LogisticRegression()),
+                    ("svm", LinearSVC()),
+                    ("rf", RandomForestClassifier(n_estimators=5, max_depth=3)),
+                ],
+                cv=2,
+            ),
         ),
-        (QuantileTransformer(n_quantiles=3), quantile_transform),
-        (RobustScaler(), robust_scale),
-        (RobustScaler(with_centering=False), robust_scale),
+        (
+            *make_classification(n_samples=10),
+            VotingClassifier(
+                estimators=[
+                    ("lr", LogisticRegression()),
+                    ("svm", LinearSVC()),
+                    ("rf", RandomForestClassifier(n_estimators=5, max_depth=3)),
+                ]
+            ),
+        ),
+        (
+            *make_regression(n_samples=10),
+            StackingRegressor(
+                estimators=[
+                    ("lr", LinearRegression()),
+                    ("svm", LinearSVR()),
+                    ("rf", RandomForestRegressor(n_estimators=5, max_depth=3)),
+                ],
+                cv=2,
+            ),
+        ),
+        (
+            *make_regression(n_samples=10),
+            VotingRegressor(
+                estimators=[
+                    ("lr", LinearRegression()),
+                    ("svm", LinearSVR()),
+                    ("rf", RandomForestRegressor(n_estimators=5, max_depth=3)),
+                ]
+            ),
+        ),
+    ],
+    ids=[
+        "stacking-classifier",
+        "voting-classifier",
+        "stacking-regressor",
+        "voting-regressor",
     ],
 )
-def test_missing_value_pandas_na_support(est, func):
-    # Test pandas IntegerArray with pd.NA
-    pd = pytest.importorskip("pandas", minversion="1.0")
+def test_ensemble_heterogeneous_estimators_behavior(X, y, estimator):
+    # check that the behavior of `estimators`, `estimators_`,
+    # `named_estimators`, `named_estimators_` is consistent across all
+    # ensemble classes and when using `set_params()`.
 
-    X = np.array(
-        [
-            [1, 2, 3, np.nan, np.nan, 4, 5, 1],
-            [np.nan, np.nan, 8, 4, 6, np.nan, np.nan, 8],
-            [1, 2, 3, 4, 5, 6, 7, 8],
-        ]
-    ).T
+    # before fit
+    assert "svm" in estimator.named_estimators
+    assert estimator.named_estimators.svm is estimator.estimators[1][1]
+    assert estimator.named_estimators.svm is estimator.named_estimators["svm"]
 
-    # Creates dataframe with IntegerArrays with pd.NA
-    X_df = pd.DataFrame(X, dtype="Int16", columns=["a", "b", "c"])
-    X_df["c"] = X_df["c"].astype("int")
+    # check fitted attributes
+    estimator.fit(X, y)
+    assert len(estimator.named_estimators) == 3
+    assert len(estimator.named_estimators_) == 3
+    assert sorted(list(estimator.named_estimators_.keys())) == sorted(
+        ["lr", "svm", "rf"]
+    )
 
-    X_trans = est.fit_transform(X)
-    X_df_trans = est.fit_transform(X_df)
+    # check that set_params() does not add a new attribute
+    estimator_new_params = clone(estimator)
+    svm_estimator = SVC() if is_classifier(estimator) else SVR()
+    estimator_new_params.set_params(svm=svm_estimator).fit(X, y)
+    assert not hasattr(estimator_new_params, "svm")
+    assert (
+        estimator_new_params.named_estimators.lr.get_params()
+        == estimator.named_estimators.lr.get_params()
+    )
+    assert (
+        estimator_new_params.named_estimators.rf.get_params()
+        == estimator.named_estimators.rf.get_params()
+    )
 
-    assert_allclose(X_trans, X_df_trans)
+    # check the behavior when setting an dropping an estimator
+    estimator_dropped = clone(estimator)
+    estimator_dropped.set_params(svm="drop")
+    estimator_dropped.fit(X, y)
+    assert len(estimator_dropped.named_estimators) == 3
+    assert estimator_dropped.named_estimators.svm == "drop"
+    assert len(estimator_dropped.named_estimators_) == 3
+    assert sorted(list(estimator_dropped.named_estimators_.keys())) == sorted(
+        ["lr", "svm", "rf"]
+    )
+    for sub_est in estimator_dropped.named_estimators_:
+        # check that the correspondence is correct
+        assert not isinstance(sub_est, type(estimator.named_estimators.svm))
+
+    # check that we can set the parameters of the underlying classifier
+    estimator.set_params(svm__C=10.0)
+    estimator.set_params(rf__max_depth=5)
+    assert (
+        estimator.get_params()["svm__C"]
+        == estimator.get_params()["svm"].get_params()["C"]
+    )
+    assert (
+        estimator.get_params()["rf__max_depth"]
+        == estimator.get_params()["rf"].get_params()["max_depth"]
+    )
+
+
+@pytest.mark.parametrize(
+    "Ensemble",
+    [StackingClassifier, VotingClassifier, StackingRegressor, VotingRegressor],
+)
+def test_ensemble_heterogeneous_estimators_type(Ensemble):
+    # check that ensemble will fail during validation if the underlying
+    # estimators are not of the same type (i.e. classifier or regressor)
+    if issubclass(Ensemble, ClassifierMixin):
+        X, y = make_classification(n_samples=10)
+        estimators = [("lr", LinearRegression())]
+        ensemble_type = "classifier"
+    else:
+        X, y = make_regression(n_samples=10)
+        estimators = [("lr", LogisticRegression())]
+        ensemble_type = "regressor"
+    ensemble = Ensemble(estimators=estimators)
+
+    err_msg = "should be a {}".format(ensemble_type)
+    with pytest.raises(ValueError, match=err_msg):
+        ensemble.fit(X, y)
+
+
+@pytest.mark.parametrize(
+    "X, y, Ensemble",
+    [
+        (*make_classification(n_samples=10), StackingClassifier),
+        (*make_classification(n_samples=10), VotingClassifier),
+        (*make_regression(n_samples=10), StackingRegressor),
+        (*make_regression(n_samples=10), VotingRegressor),
+    ],
+)
+def test_ensemble_heterogeneous_estimators_name_validation(X, y, Ensemble):
+    # raise an error when the name contains dunder
+    if issubclass(Ensemble, ClassifierMixin):
+        estimators = [("lr__", LogisticRegression())]
+    else:
+        estimators = [("lr__", LinearRegression())]
+    ensemble = Ensemble(estimators=estimators)
+
+    err_msg = r"Estimator names must not contain __: got \['lr__'\]"
+    with pytest.raises(ValueError, match=err_msg):
+        ensemble.fit(X, y)
+
+    # raise an error when the name is not unique
+    if issubclass(Ensemble, ClassifierMixin):
+        estimators = [("lr", LogisticRegression()), ("lr", LogisticRegression())]
+    else:
+        estimators = [("lr", LinearRegression()), ("lr", LinearRegression())]
+    ensemble = Ensemble(estimators=estimators)
+
+    err_msg = r"Names provided are not unique: \['lr', 'lr'\]"
+    with pytest.raises(ValueError, match=err_msg):
+        ensemble.fit(X, y)
+
+    # raise an error when the name conflicts with the parameters
+    if issubclass(Ensemble, ClassifierMixin):
+        estimators = [("estimators", LogisticRegression())]
+    else:
+        estimators = [("estimators", LinearRegression())]
+    ensemble = Ensemble(estimators=estimators)
+
+    err_msg = "Estimator names conflict with constructor arguments"
+    with pytest.raises(ValueError, match=err_msg):
+        ensemble.fit(X, y)
+
+
+@pytest.mark.parametrize(
+    "X, y, estimator",
+    [
+        (
+            *make_classification(n_samples=10),
+            StackingClassifier(estimators=[("lr", LogisticRegression())]),
+        ),
+        (
+            *make_classification(n_samples=10),
+            VotingClassifier(estimators=[("lr", LogisticRegression())]),
+        ),
+        (
+            *make_regression(n_samples=10),
+            StackingRegressor(estimators=[("lr", LinearRegression())]),
+        ),
+        (
+            *make_regression(n_samples=10),
+            VotingRegressor(estimators=[("lr", LinearRegression())]),
+        ),
+    ],
+    ids=[
+        "stacking-classifier",
+        "voting-classifier",
+        "stacking-regressor",
+        "voting-regressor",
+    ],
+)
+def test_ensemble_heterogeneous_estimators_all_dropped(X, y, estimator):
+    # check that we raise a consistent error when all estimators are
+    # dropped
+    estimator.set_params(lr="drop")
+    with pytest.raises(ValueError, match="All estimators are dropped."):
+        estimator.fit(X, y)
+
+
+@pytest.mark.parametrize(
+    "Ensemble, Estimator, X, y",
+    [
+        (StackingClassifier, LogisticRegression, X, y),
+        (StackingRegressor, LinearRegression, X_r, y_r),
+        (VotingClassifier, LogisticRegression, X, y),
+        (VotingRegressor, LinearRegression, X_r, y_r),
+    ],
+)
+# FIXME: we should move this test in `estimator_checks` once we are able
+# to construct meta-estimator instances
+def test_heterogeneous_ensemble_support_missing_values(Ensemble, Estimator, X, y):
+    # check that Voting and Stacking predictor delegate the missing values
+    # validation to the underlying estimator.
+    X = X.copy()
+    mask = np.random.choice([1, 0], X.shape, p=[0.1, 0.9]).astype(bool)
+    X[mask] = np.nan
+    pipe = make_pipeline(SimpleImputer(), Estimator())
+    ensemble = Ensemble(estimators=[("pipe1", pipe), ("pipe2", pipe)])
+    ensemble.fit(X, y).score(X, y)
