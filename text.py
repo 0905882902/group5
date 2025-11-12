@@ -1,2105 +1,1361 @@
-# -*- coding: utf-8 -*-
-# Authors: Olivier Grisel <olivier.grisel@ensta.org>
-#          Mathieu Blondel <mathieu@mblondel.org>
-#          Lars Buitinck
-#          Robert Layton <robertlayton@gmail.com>
-#          Jochen Wersdörfer <jochen@wersdoerfer.de>
-#          Roman Sinayev <roman.sinayev@gmail.com>
-#
-# License: BSD 3 clause
-"""
-The :mod:`sklearn.feature_extraction.text` submodule gathers utilities to
-build feature vectors from text documents.
-"""
-
-import array
-from collections import defaultdict
-from collections.abc import Mapping
-from functools import partial
-import numbers
-from operator import itemgetter
 import re
-import unicodedata
-import warnings
+from functools import partial, reduce
+from math import gcd
+from operator import itemgetter
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    NamedTuple,
+    Optional,
+    Pattern,
+    Tuple,
+    Union,
+)
 
-import numpy as np
-import scipy.sparse as sp
+from ._loop import loop_last
+from ._pick import pick_bool
+from ._wrap import divide_line
+from .align import AlignMethod
+from .cells import cell_len, set_cell_size
+from .containers import Lines
+from .control import strip_control_codes
+from .emoji import EmojiVariant
+from .jupyter import JupyterMixin
+from .measure import Measurement
+from .segment import Segment
+from .style import Style, StyleType
 
-from ..base import BaseEstimator, TransformerMixin, _OneToOneFeatureMixin
-from ..preprocessing import normalize
-from ._hash import FeatureHasher
-from ._stop_words import ENGLISH_STOP_WORDS
-from ..utils.validation import check_is_fitted, check_array, FLOAT_DTYPES, check_scalar
-from ..utils.deprecation import deprecated
-from ..utils import _IS_32BIT
-from ..utils.fixes import _astype_copy_false
-from ..exceptions import NotFittedError
+if TYPE_CHECKING:  # pragma: no cover
+    from .console import Console, ConsoleOptions, JustifyMethod, OverflowMethod
 
-
-__all__ = [
-    "HashingVectorizer",
-    "CountVectorizer",
-    "ENGLISH_STOP_WORDS",
-    "TfidfTransformer",
-    "TfidfVectorizer",
-    "strip_accents_ascii",
-    "strip_accents_unicode",
-    "strip_tags",
-]
+DEFAULT_JUSTIFY: "JustifyMethod" = "default"
+DEFAULT_OVERFLOW: "OverflowMethod" = "fold"
 
 
-def _preprocess(doc, accent_function=None, lower=False):
-    """Chain together an optional series of text preprocessing steps to
-    apply to a document.
+_re_whitespace = re.compile(r"\s+$")
 
-    Parameters
-    ----------
-    doc: str
-        The string to preprocess
-    accent_function: callable, default=None
-        Function for handling accented characters. Common strategies include
-        normalizing and removing.
-    lower: bool, default=False
-        Whether to use str.lower to lowercase all of the text
+TextType = Union[str, "Text"]
+"""A plain string or a :class:`Text` instance."""
 
-    Returns
-    -------
-    doc: str
-        preprocessed string
+GetStyleCallable = Callable[[str], Optional[StyleType]]
+
+
+class Span(NamedTuple):
+    """A marked up region in some text."""
+
+    start: int
+    """Span start index."""
+    end: int
+    """Span end index."""
+    style: Union[str, Style]
+    """Style associated with the span."""
+
+    def __repr__(self) -> str:
+        return f"Span({self.start}, {self.end}, {self.style!r})"
+
+    def __bool__(self) -> bool:
+        return self.end > self.start
+
+    def split(self, offset: int) -> Tuple["Span", Optional["Span"]]:
+        """Split a span in to 2 from a given offset."""
+
+        if offset < self.start:
+            return self, None
+        if offset >= self.end:
+            return self, None
+
+        start, end, style = self
+        span1 = Span(start, min(end, offset), style)
+        span2 = Span(span1.end, end, style)
+        return span1, span2
+
+    def move(self, offset: int) -> "Span":
+        """Move start and end by a given offset.
+
+        Args:
+            offset (int): Number of characters to add to start and end.
+
+        Returns:
+            TextSpan: A new TextSpan with adjusted position.
+        """
+        start, end, style = self
+        return Span(start + offset, end + offset, style)
+
+    def right_crop(self, offset: int) -> "Span":
+        """Crop the span at the given offset.
+
+        Args:
+            offset (int): A value between start and end.
+
+        Returns:
+            Span: A new (possibly smaller) span.
+        """
+        start, end, style = self
+        if offset >= end:
+            return self
+        return Span(start, min(offset, end), style)
+
+    def extend(self, cells: int) -> "Span":
+        """Extend the span by the given number of cells.
+
+        Args:
+            cells (int): Additional space to add to end of span.
+
+        Returns:
+            Span: A span.
+        """
+        if cells:
+            start, end, style = self
+            return Span(start, end + cells, style)
+        else:
+            return self
+
+
+class Text(JupyterMixin):
+    """Text with color / style.
+
+    Args:
+        text (str, optional): Default unstyled text. Defaults to "".
+        style (Union[str, Style], optional): Base style for text. Defaults to "".
+        justify (str, optional): Justify method: "left", "center", "full", "right". Defaults to None.
+        overflow (str, optional): Overflow method: "crop", "fold", "ellipsis". Defaults to None.
+        no_wrap (bool, optional): Disable text wrapping, or None for default. Defaults to None.
+        end (str, optional): Character to end text with. Defaults to "\\\\n".
+        tab_size (int): Number of spaces per tab, or ``None`` to use ``console.tab_size``. Defaults to None.
+        spans (List[Span], optional). A list of predefined style spans. Defaults to None.
     """
-    if lower:
-        doc = doc.lower()
-    if accent_function is not None:
-        doc = accent_function(doc)
-    return doc
 
+    __slots__ = [
+        "_text",
+        "style",
+        "justify",
+        "overflow",
+        "no_wrap",
+        "end",
+        "tab_size",
+        "_spans",
+        "_length",
+    ]
 
-def _analyze(
-    doc,
-    analyzer=None,
-    tokenizer=None,
-    ngrams=None,
-    preprocessor=None,
-    decoder=None,
-    stop_words=None,
-):
-    """Chain together an optional series of text processing steps to go from
-    a single document to ngrams, with or without tokenizing or preprocessing.
+    def __init__(
+        self,
+        text: str = "",
+        style: Union[str, Style] = "",
+        *,
+        justify: Optional["JustifyMethod"] = None,
+        overflow: Optional["OverflowMethod"] = None,
+        no_wrap: Optional[bool] = None,
+        end: str = "\n",
+        tab_size: Optional[int] = None,
+        spans: Optional[List[Span]] = None,
+    ) -> None:
+        sanitized_text = strip_control_codes(text)
+        self._text = [sanitized_text]
+        self.style = style
+        self.justify: Optional["JustifyMethod"] = justify
+        self.overflow: Optional["OverflowMethod"] = overflow
+        self.no_wrap = no_wrap
+        self.end = end
+        self.tab_size = tab_size
+        self._spans: List[Span] = spans or []
+        self._length: int = len(sanitized_text)
 
-    If analyzer is used, only the decoder argument is used, as the analyzer is
-    intended to replace the preprocessor, tokenizer, and ngrams steps.
+    def __len__(self) -> int:
+        return self._length
 
-    Parameters
-    ----------
-    analyzer: callable, default=None
-    tokenizer: callable, default=None
-    ngrams: callable, default=None
-    preprocessor: callable, default=None
-    decoder: callable, default=None
-    stop_words: list, default=None
+    def __bool__(self) -> bool:
+        return bool(self._length)
 
-    Returns
-    -------
-    ngrams: list
-        A sequence of tokens, possibly with pairs, triples, etc.
-    """
+    def __str__(self) -> str:
+        return self.plain
 
-    if decoder is not None:
-        doc = decoder(doc)
-    if analyzer is not None:
-        doc = analyzer(doc)
-    else:
-        if preprocessor is not None:
-            doc = preprocessor(doc)
-        if tokenizer is not None:
-            doc = tokenizer(doc)
-        if ngrams is not None:
-            if stop_words is not None:
-                doc = ngrams(doc, stop_words)
+    def __repr__(self) -> str:
+        return f"<text {self.plain!r} {self._spans!r} {self.style!r}>"
+
+    def __add__(self, other: Any) -> "Text":
+        if isinstance(other, (str, Text)):
+            result = self.copy()
+            result.append(other)
+            return result
+        return NotImplemented
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Text):
+            return NotImplemented
+        return self.plain == other.plain and self._spans == other._spans
+
+    def __contains__(self, other: object) -> bool:
+        if isinstance(other, str):
+            return other in self.plain
+        elif isinstance(other, Text):
+            return other.plain in self.plain
+        return False
+
+    def __getitem__(self, slice: Union[int, slice]) -> "Text":
+        def get_text_at(offset: int) -> "Text":
+            _Span = Span
+            text = Text(
+                self.plain[offset],
+                spans=[
+                    _Span(0, 1, style)
+                    for start, end, style in self._spans
+                    if end > offset >= start
+                ],
+                end="",
+            )
+            return text
+
+        if isinstance(slice, int):
+            return get_text_at(slice)
+        else:
+            start, stop, step = slice.indices(len(self.plain))
+            if step == 1:
+                lines = self.divide([start, stop])
+                return lines[1]
             else:
-                doc = ngrams(doc)
-    return doc
+                # This would be a bit of work to implement efficiently
+                # For now, its not required
+                raise TypeError("slices with step!=1 are not supported")
 
+    @property
+    def cell_len(self) -> int:
+        """Get the number of cells required to render this text."""
+        return cell_len(self.plain)
 
-def strip_accents_unicode(s):
-    """Transform accentuated unicode symbols into their simple counterpart
+    @property
+    def markup(self) -> str:
+        """Get console markup to render this Text.
 
-    Warning: the python-level loop and join operations make this
-    implementation 20 times slower than the strip_accents_ascii basic
-    normalization.
-
-    Parameters
-    ----------
-    s : string
-        The string to strip
-
-    See Also
-    --------
-    strip_accents_ascii : Remove accentuated char for any unicode symbol that
-        has a direct ASCII equivalent.
-    """
-    try:
-        # If `s` is ASCII-compatible, then it does not contain any accented
-        # characters and we can avoid an expensive list comprehension
-        s.encode("ASCII", errors="strict")
-        return s
-    except UnicodeEncodeError:
-        normalized = unicodedata.normalize("NFKD", s)
-        return "".join([c for c in normalized if not unicodedata.combining(c)])
-
-
-def strip_accents_ascii(s):
-    """Transform accentuated unicode symbols into ascii or nothing
-
-    Warning: this solution is only suited for languages that have a direct
-    transliteration to ASCII symbols.
-
-    Parameters
-    ----------
-    s : str
-        The string to strip
-
-    See Also
-    --------
-    strip_accents_unicode : Remove accentuated char for any unicode symbol.
-    """
-    nkfd_form = unicodedata.normalize("NFKD", s)
-    return nkfd_form.encode("ASCII", "ignore").decode("ASCII")
-
-
-def strip_tags(s):
-    """Basic regexp based HTML / XML tag stripper function
-
-    For serious HTML/XML preprocessing you should rather use an external
-    library such as lxml or BeautifulSoup.
-
-    Parameters
-    ----------
-    s : str
-        The string to strip
-    """
-    return re.compile(r"<([^>]+)>", flags=re.UNICODE).sub(" ", s)
-
-
-def _check_stop_list(stop):
-    if stop == "english":
-        return ENGLISH_STOP_WORDS
-    elif isinstance(stop, str):
-        raise ValueError("not a built-in stop list: %s" % stop)
-    elif stop is None:
-        return None
-    else:  # assume it's a collection
-        return frozenset(stop)
-
-
-class _VectorizerMixin:
-    """Provides common code for text vectorizers (tokenization logic)."""
-
-    _white_spaces = re.compile(r"\s\s+")
-
-    def decode(self, doc):
-        """Decode the input into a string of unicode symbols.
-
-        The decoding strategy depends on the vectorizer parameters.
-
-        Parameters
-        ----------
-        doc : bytes or str
-            The string to decode.
-
-        Returns
-        -------
-        doc: str
-            A string of unicode symbols.
+        Returns:
+            str: A string potentially creating markup tags.
         """
-        if self.input == "filename":
-            with open(doc, "rb") as fh:
-                doc = fh.read()
+        from .markup import escape
 
-        elif self.input == "file":
-            doc = doc.read()
+        output: List[str] = []
 
-        if isinstance(doc, bytes):
-            doc = doc.decode(self.encoding, self.decode_error)
+        plain = self.plain
+        markup_spans = [
+            (0, False, self.style),
+            *((span.start, False, span.style) for span in self._spans),
+            *((span.end, True, span.style) for span in self._spans),
+            (len(plain), True, self.style),
+        ]
+        markup_spans.sort(key=itemgetter(0, 1))
+        position = 0
+        append = output.append
+        for offset, closing, style in markup_spans:
+            if offset > position:
+                append(escape(plain[position:offset]))
+                position = offset
+            if style:
+                append(f"[/{style}]" if closing else f"[{style}]")
+        markup = "".join(output)
+        return markup
 
-        if doc is np.nan:
-            raise ValueError(
-                "np.nan is an invalid document, expected byte or unicode string."
-            )
+    @classmethod
+    def from_markup(
+        cls,
+        text: str,
+        *,
+        style: Union[str, Style] = "",
+        emoji: bool = True,
+        emoji_variant: Optional[EmojiVariant] = None,
+        justify: Optional["JustifyMethod"] = None,
+        overflow: Optional["OverflowMethod"] = None,
+        end: str = "\n",
+    ) -> "Text":
+        """Create Text instance from markup.
 
-        return doc
+        Args:
+            text (str): A string containing console markup.
+            style (Union[str, Style], optional): Base style for text. Defaults to "".
+            emoji (bool, optional): Also render emoji code. Defaults to True.
+            emoji_variant (str, optional): Optional emoji variant, either "text" or "emoji". Defaults to None.
+            justify (str, optional): Justify method: "left", "center", "full", "right". Defaults to None.
+            overflow (str, optional): Overflow method: "crop", "fold", "ellipsis". Defaults to None.
+            end (str, optional): Character to end text with. Defaults to "\\\\n".
 
-    def _word_ngrams(self, tokens, stop_words=None):
-        """Turn tokens into a sequence of n-grams after stop words filtering"""
-        # handle stop words
-        if stop_words is not None:
-            tokens = [w for w in tokens if w not in stop_words]
+        Returns:
+            Text: A Text instance with markup rendered.
+        """
+        from .markup import render
 
-        # handle token n-grams
-        min_n, max_n = self.ngram_range
-        if max_n != 1:
-            original_tokens = tokens
-            if min_n == 1:
-                # no need to do any slicing for unigrams
-                # just iterate through the original tokens
-                tokens = list(original_tokens)
-                min_n += 1
+        rendered_text = render(text, style, emoji=emoji, emoji_variant=emoji_variant)
+        rendered_text.justify = justify
+        rendered_text.overflow = overflow
+        rendered_text.end = end
+        return rendered_text
+
+    @classmethod
+    def from_ansi(
+        cls,
+        text: str,
+        *,
+        style: Union[str, Style] = "",
+        justify: Optional["JustifyMethod"] = None,
+        overflow: Optional["OverflowMethod"] = None,
+        no_wrap: Optional[bool] = None,
+        end: str = "\n",
+        tab_size: Optional[int] = 8,
+    ) -> "Text":
+        """Create a Text object from a string containing ANSI escape codes.
+
+        Args:
+            text (str): A string containing escape codes.
+            style (Union[str, Style], optional): Base style for text. Defaults to "".
+            justify (str, optional): Justify method: "left", "center", "full", "right". Defaults to None.
+            overflow (str, optional): Overflow method: "crop", "fold", "ellipsis". Defaults to None.
+            no_wrap (bool, optional): Disable text wrapping, or None for default. Defaults to None.
+            end (str, optional): Character to end text with. Defaults to "\\\\n".
+            tab_size (int): Number of spaces per tab, or ``None`` to use ``console.tab_size``. Defaults to None.
+        """
+        from .ansi import AnsiDecoder
+
+        joiner = Text(
+            "\n",
+            justify=justify,
+            overflow=overflow,
+            no_wrap=no_wrap,
+            end=end,
+            tab_size=tab_size,
+            style=style,
+        )
+        decoder = AnsiDecoder()
+        result = joiner.join(line for line in decoder.decode(text))
+        return result
+
+    @classmethod
+    def styled(
+        cls,
+        text: str,
+        style: StyleType = "",
+        *,
+        justify: Optional["JustifyMethod"] = None,
+        overflow: Optional["OverflowMethod"] = None,
+    ) -> "Text":
+        """Construct a Text instance with a pre-applied styled. A style applied in this way won't be used
+        to pad the text when it is justified.
+
+        Args:
+            text (str): A string containing console markup.
+            style (Union[str, Style]): Style to apply to the text. Defaults to "".
+            justify (str, optional): Justify method: "left", "center", "full", "right". Defaults to None.
+            overflow (str, optional): Overflow method: "crop", "fold", "ellipsis". Defaults to None.
+
+        Returns:
+            Text: A text instance with a style applied to the entire string.
+        """
+        styled_text = cls(text, justify=justify, overflow=overflow)
+        styled_text.stylize(style)
+        return styled_text
+
+    @classmethod
+    def assemble(
+        cls,
+        *parts: Union[str, "Text", Tuple[str, StyleType]],
+        style: Union[str, Style] = "",
+        justify: Optional["JustifyMethod"] = None,
+        overflow: Optional["OverflowMethod"] = None,
+        no_wrap: Optional[bool] = None,
+        end: str = "\n",
+        tab_size: int = 8,
+        meta: Optional[Dict[str, Any]] = None,
+    ) -> "Text":
+        """Construct a text instance by combining a sequence of strings with optional styles.
+        The positional arguments should be either strings, or a tuple of string + style.
+
+        Args:
+            style (Union[str, Style], optional): Base style for text. Defaults to "".
+            justify (str, optional): Justify method: "left", "center", "full", "right". Defaults to None.
+            overflow (str, optional): Overflow method: "crop", "fold", "ellipsis". Defaults to None.
+            no_wrap (bool, optional): Disable text wrapping, or None for default. Defaults to None.
+            end (str, optional): Character to end text with. Defaults to "\\\\n".
+            tab_size (int): Number of spaces per tab, or ``None`` to use ``console.tab_size``. Defaults to None.
+            meta (Dict[str, Any], optional). Meta data to apply to text, or None for no meta data. Default to None
+
+        Returns:
+            Text: A new text instance.
+        """
+        text = cls(
+            style=style,
+            justify=justify,
+            overflow=overflow,
+            no_wrap=no_wrap,
+            end=end,
+            tab_size=tab_size,
+        )
+        append = text.append
+        _Text = Text
+        for part in parts:
+            if isinstance(part, (_Text, str)):
+                append(part)
             else:
-                tokens = []
+                append(*part)
+        if meta:
+            text.apply_meta(meta)
+        return text
 
-            n_original_tokens = len(original_tokens)
+    @property
+    def plain(self) -> str:
+        """Get the text as a single string."""
+        if len(self._text) != 1:
+            self._text[:] = ["".join(self._text)]
+        return self._text[0]
 
-            # bind method outside of loop to reduce overhead
-            tokens_append = tokens.append
-            space_join = " ".join
+    @plain.setter
+    def plain(self, new_text: str) -> None:
+        """Set the text to a new value."""
+        if new_text != self.plain:
+            sanitized_text = strip_control_codes(new_text)
+            self._text[:] = [sanitized_text]
+            old_length = self._length
+            self._length = len(sanitized_text)
+            if old_length > self._length:
+                self._trim_spans()
 
-            for n in range(min_n, min(max_n + 1, n_original_tokens + 1)):
-                for i in range(n_original_tokens - n + 1):
-                    tokens_append(space_join(original_tokens[i : i + n]))
+    @property
+    def spans(self) -> List[Span]:
+        """Get a reference to the internal list of spans."""
+        return self._spans
 
-        return tokens
+    @spans.setter
+    def spans(self, spans: List[Span]) -> None:
+        """Set spans."""
+        self._spans = spans[:]
 
-    def _char_ngrams(self, text_document):
-        """Tokenize text_document into a sequence of character n-grams"""
-        # normalize white spaces
-        text_document = self._white_spaces.sub(" ", text_document)
+    def blank_copy(self, plain: str = "") -> "Text":
+        """Return a new Text instance with copied metadata (but not the string or spans)."""
+        copy_self = Text(
+            plain,
+            style=self.style,
+            justify=self.justify,
+            overflow=self.overflow,
+            no_wrap=self.no_wrap,
+            end=self.end,
+            tab_size=self.tab_size,
+        )
+        return copy_self
 
-        text_len = len(text_document)
-        min_n, max_n = self.ngram_range
-        if min_n == 1:
-            # no need to do any slicing for unigrams
-            # iterate through the string
-            ngrams = list(text_document)
-            min_n += 1
+    def copy(self) -> "Text":
+        """Return a copy of this instance."""
+        copy_self = Text(
+            self.plain,
+            style=self.style,
+            justify=self.justify,
+            overflow=self.overflow,
+            no_wrap=self.no_wrap,
+            end=self.end,
+            tab_size=self.tab_size,
+        )
+        copy_self._spans[:] = self._spans
+        return copy_self
+
+    def stylize(
+        self,
+        style: Union[str, Style],
+        start: int = 0,
+        end: Optional[int] = None,
+    ) -> None:
+        """Apply a style to the text, or a portion of the text.
+
+        Args:
+            style (Union[str, Style]): Style instance or style definition to apply.
+            start (int): Start offset (negative indexing is supported). Defaults to 0.
+            end (Optional[int], optional): End offset (negative indexing is supported), or None for end of text. Defaults to None.
+        """
+        if style:
+            length = len(self)
+            if start < 0:
+                start = length + start
+            if end is None:
+                end = length
+            if end < 0:
+                end = length + end
+            if start >= length or end <= start:
+                # Span not in text or not valid
+                return
+            self._spans.append(Span(start, min(length, end), style))
+
+    def stylize_before(
+        self,
+        style: Union[str, Style],
+        start: int = 0,
+        end: Optional[int] = None,
+    ) -> None:
+        """Apply a style to the text, or a portion of the text. Styles will be applied before other styles already present.
+
+        Args:
+            style (Union[str, Style]): Style instance or style definition to apply.
+            start (int): Start offset (negative indexing is supported). Defaults to 0.
+            end (Optional[int], optional): End offset (negative indexing is supported), or None for end of text. Defaults to None.
+        """
+        if style:
+            length = len(self)
+            if start < 0:
+                start = length + start
+            if end is None:
+                end = length
+            if end < 0:
+                end = length + end
+            if start >= length or end <= start:
+                # Span not in text or not valid
+                return
+            self._spans.insert(0, Span(start, min(length, end), style))
+
+    def apply_meta(
+        self, meta: Dict[str, Any], start: int = 0, end: Optional[int] = None
+    ) -> None:
+        """Apply metadata to the text, or a portion of the text.
+
+        Args:
+            meta (Dict[str, Any]): A dict of meta information.
+            start (int): Start offset (negative indexing is supported). Defaults to 0.
+            end (Optional[int], optional): End offset (negative indexing is supported), or None for end of text. Defaults to None.
+
+        """
+        style = Style.from_meta(meta)
+        self.stylize(style, start=start, end=end)
+
+    def on(self, meta: Optional[Dict[str, Any]] = None, **handlers: Any) -> "Text":
+        """Apply event handlers (used by Textual project).
+
+        Example:
+            >>> from rich.text import Text
+            >>> text = Text("hello world")
+            >>> text.on(click="view.toggle('world')")
+
+        Args:
+            meta (Dict[str, Any]): Mapping of meta information.
+            **handlers: Keyword args are prefixed with "@" to defined handlers.
+
+        Returns:
+            Text: Self is returned to method may be chained.
+        """
+        meta = {} if meta is None else meta
+        meta.update({f"@{key}": value for key, value in handlers.items()})
+        self.stylize(Style.from_meta(meta))
+        return self
+
+    def remove_suffix(self, suffix: str) -> None:
+        """Remove a suffix if it exists.
+
+        Args:
+            suffix (str): Suffix to remove.
+        """
+        if self.plain.endswith(suffix):
+            self.right_crop(len(suffix))
+
+    def get_style_at_offset(self, console: "Console", offset: int) -> Style:
+        """Get the style of a character at give offset.
+
+        Args:
+            console (~Console): Console where text will be rendered.
+            offset (int): Offset in to text (negative indexing supported)
+
+        Returns:
+            Style: A Style instance.
+        """
+        # TODO: This is a little inefficient, it is only used by full justify
+        if offset < 0:
+            offset = len(self) + offset
+        get_style = console.get_style
+        style = get_style(self.style).copy()
+        for start, end, span_style in self._spans:
+            if end > offset >= start:
+                style += get_style(span_style, default="")
+        return style
+
+    def extend_style(self, spaces: int) -> None:
+        """Extend the Text given number of spaces where the spaces have the same style as the last character.
+
+        Args:
+            spaces (int): Number of spaces to add to the Text.
+        """
+        if spaces <= 0:
+            return
+        spans = self.spans
+        new_spaces = " " * spaces
+        if spans:
+            end_offset = len(self)
+            self._spans[:] = [
+                span.extend(spaces) if span.end >= end_offset else span
+                for span in spans
+            ]
+            self._text.append(new_spaces)
+            self._length += spaces
         else:
-            ngrams = []
+            self.plain += new_spaces
 
-        # bind method outside of loop to reduce overhead
-        ngrams_append = ngrams.append
+    def highlight_regex(
+        self,
+        re_highlight: Union[Pattern[str], str],
+        style: Optional[Union[GetStyleCallable, StyleType]] = None,
+        *,
+        style_prefix: str = "",
+    ) -> int:
+        """Highlight text with a regular expression, where group names are
+        translated to styles.
 
-        for n in range(min_n, min(max_n + 1, text_len + 1)):
-            for i in range(text_len - n + 1):
-                ngrams_append(text_document[i : i + n])
-        return ngrams
+        Args:
+            re_highlight (Union[re.Pattern, str]): A regular expression object or string.
+            style (Union[GetStyleCallable, StyleType]): Optional style to apply to whole match, or a callable
+                which accepts the matched text and returns a style. Defaults to None.
+            style_prefix (str, optional): Optional prefix to add to style group names.
 
-    def _char_wb_ngrams(self, text_document):
-        """Whitespace sensitive char-n-gram tokenization.
-
-        Tokenize text_document into a sequence of character n-grams
-        operating only inside word boundaries. n-grams at the edges
-        of words are padded with space."""
-        # normalize white spaces
-        text_document = self._white_spaces.sub(" ", text_document)
-
-        min_n, max_n = self.ngram_range
-        ngrams = []
-
-        # bind method outside of loop to reduce overhead
-        ngrams_append = ngrams.append
-
-        for w in text_document.split():
-            w = " " + w + " "
-            w_len = len(w)
-            for n in range(min_n, max_n + 1):
-                offset = 0
-                ngrams_append(w[offset : offset + n])
-                while offset + n < w_len:
-                    offset += 1
-                    ngrams_append(w[offset : offset + n])
-                if offset == 0:  # count a short word (w_len < n) only once
-                    break
-        return ngrams
-
-    def build_preprocessor(self):
-        """Return a function to preprocess the text before tokenization.
-
-        Returns
-        -------
-        preprocessor: callable
-              A function to preprocess the text before tokenization.
+        Returns:
+            int: Number of regex matches
         """
-        if self.preprocessor is not None:
-            return self.preprocessor
+        count = 0
+        append_span = self._spans.append
+        _Span = Span
+        plain = self.plain
+        if isinstance(re_highlight, str):
+            re_highlight = re.compile(re_highlight)
+        for match in re_highlight.finditer(plain):
+            get_span = match.span
+            if style:
+                start, end = get_span()
+                match_style = style(plain[start:end]) if callable(style) else style
+                if match_style is not None and end > start:
+                    append_span(_Span(start, end, match_style))
 
-        # accent stripping
-        if not self.strip_accents:
-            strip_accents = None
-        elif callable(self.strip_accents):
-            strip_accents = self.strip_accents
-        elif self.strip_accents == "ascii":
-            strip_accents = strip_accents_ascii
-        elif self.strip_accents == "unicode":
-            strip_accents = strip_accents_unicode
-        else:
-            raise ValueError(
-                'Invalid value for "strip_accents": %s' % self.strip_accents
-            )
+            count += 1
+            for name in match.groupdict().keys():
+                start, end = get_span(name)
+                if start != -1 and end > start:
+                    append_span(_Span(start, end, f"{style_prefix}{name}"))
+        return count
 
-        return partial(_preprocess, accent_function=strip_accents, lower=self.lowercase)
+    def highlight_words(
+        self,
+        words: Iterable[str],
+        style: Union[str, Style],
+        *,
+        case_sensitive: bool = True,
+    ) -> int:
+        """Highlight words with a style.
 
-    def build_tokenizer(self):
-        """Return a function that splits a string into a sequence of tokens.
+        Args:
+            words (Iterable[str]): Words to highlight.
+            style (Union[str, Style]): Style to apply.
+            case_sensitive (bool, optional): Enable case sensitive matching. Defaults to True.
 
-        Returns
-        -------
-        tokenizer: callable
-              A function to split a string into a sequence of tokens.
+        Returns:
+            int: Number of words highlighted.
         """
-        if self.tokenizer is not None:
-            return self.tokenizer
-        token_pattern = re.compile(self.token_pattern)
-
-        if token_pattern.groups > 1:
-            raise ValueError(
-                "More than 1 capturing group in token pattern. Only a single "
-                "group should be captured."
-            )
-
-        return token_pattern.findall
-
-    def get_stop_words(self):
-        """Build or fetch the effective stop words list.
-
-        Returns
-        -------
-        stop_words: list or None
-                A list of stop words.
-        """
-        return _check_stop_list(self.stop_words)
-
-    def _check_stop_words_consistency(self, stop_words, preprocess, tokenize):
-        """Check if stop words are consistent
-
-        Returns
-        -------
-        is_consistent : True if stop words are consistent with the preprocessor
-                        and tokenizer, False if they are not, None if the check
-                        was previously performed, "error" if it could not be
-                        performed (e.g. because of the use of a custom
-                        preprocessor / tokenizer)
-        """
-        if id(self.stop_words) == getattr(self, "_stop_words_id", None):
-            # Stop words are were previously validated
-            return None
-
-        # NB: stop_words is validated, unlike self.stop_words
-        try:
-            inconsistent = set()
-            for w in stop_words or ():
-                tokens = list(tokenize(preprocess(w)))
-                for token in tokens:
-                    if token not in stop_words:
-                        inconsistent.add(token)
-            self._stop_words_id = id(self.stop_words)
-
-            if inconsistent:
-                warnings.warn(
-                    "Your stop_words may be inconsistent with "
-                    "your preprocessing. Tokenizing the stop "
-                    "words generated tokens %r not in "
-                    "stop_words."
-                    % sorted(inconsistent)
-                )
-            return not inconsistent
-        except Exception:
-            # Failed to check stop words consistency (e.g. because a custom
-            # preprocessor or tokenizer was used)
-            self._stop_words_id = id(self.stop_words)
-            return "error"
-
-    def build_analyzer(self):
-        """Return a callable to process input data.
-
-        The callable handles that handles preprocessing, tokenization, and
-        n-grams generation.
-
-        Returns
-        -------
-        analyzer: callable
-            A function to handle preprocessing, tokenization
-            and n-grams generation.
-        """
-
-        if callable(self.analyzer):
-            return partial(_analyze, analyzer=self.analyzer, decoder=self.decode)
-
-        preprocess = self.build_preprocessor()
-
-        if self.analyzer == "char":
-            return partial(
-                _analyze,
-                ngrams=self._char_ngrams,
-                preprocessor=preprocess,
-                decoder=self.decode,
-            )
-
-        elif self.analyzer == "char_wb":
-
-            return partial(
-                _analyze,
-                ngrams=self._char_wb_ngrams,
-                preprocessor=preprocess,
-                decoder=self.decode,
-            )
-
-        elif self.analyzer == "word":
-            stop_words = self.get_stop_words()
-            tokenize = self.build_tokenizer()
-            self._check_stop_words_consistency(stop_words, preprocess, tokenize)
-            return partial(
-                _analyze,
-                ngrams=self._word_ngrams,
-                tokenizer=tokenize,
-                preprocessor=preprocess,
-                decoder=self.decode,
-                stop_words=stop_words,
-            )
-
-        else:
-            raise ValueError(
-                "%s is not a valid tokenization scheme/analyzer" % self.analyzer
-            )
-
-    def _validate_vocabulary(self):
-        vocabulary = self.vocabulary
-        if vocabulary is not None:
-            if isinstance(vocabulary, set):
-                vocabulary = sorted(vocabulary)
-            if not isinstance(vocabulary, Mapping):
-                vocab = {}
-                for i, t in enumerate(vocabulary):
-                    if vocab.setdefault(t, i) != i:
-                        msg = "Duplicate term in vocabulary: %r" % t
-                        raise ValueError(msg)
-                vocabulary = vocab
-            else:
-                indices = set(vocabulary.values())
-                if len(indices) != len(vocabulary):
-                    raise ValueError("Vocabulary contains repeated indices.")
-                for i in range(len(vocabulary)):
-                    if i not in indices:
-                        msg = "Vocabulary of size %d doesn't contain index %d." % (
-                            len(vocabulary),
-                            i,
-                        )
-                        raise ValueError(msg)
-            if not vocabulary:
-                raise ValueError("empty vocabulary passed to fit")
-            self.fixed_vocabulary_ = True
-            self.vocabulary_ = dict(vocabulary)
-        else:
-            self.fixed_vocabulary_ = False
-
-    def _check_vocabulary(self):
-        """Check if vocabulary is empty or missing (not fitted)"""
-        if not hasattr(self, "vocabulary_"):
-            self._validate_vocabulary()
-            if not self.fixed_vocabulary_:
-                raise NotFittedError("Vocabulary not fitted or provided")
-
-        if len(self.vocabulary_) == 0:
-            raise ValueError("Vocabulary is empty")
-
-    def _validate_params(self):
-        """Check validity of ngram_range parameter"""
-        min_n, max_m = self.ngram_range
-        if min_n > max_m:
-            raise ValueError(
-                "Invalid value for ngram_range=%s "
-                "lower boundary larger than the upper boundary."
-                % str(self.ngram_range)
-            )
-
-    def _warn_for_unused_params(self):
-
-        if self.tokenizer is not None and self.token_pattern is not None:
-            warnings.warn(
-                "The parameter 'token_pattern' will not be used"
-                " since 'tokenizer' is not None'"
-            )
-
-        if self.preprocessor is not None and callable(self.analyzer):
-            warnings.warn(
-                "The parameter 'preprocessor' will not be used"
-                " since 'analyzer' is callable'"
-            )
-
-        if (
-            self.ngram_range != (1, 1)
-            and self.ngram_range is not None
-            and callable(self.analyzer)
+        re_words = "|".join(re.escape(word) for word in words)
+        add_span = self._spans.append
+        count = 0
+        _Span = Span
+        for match in re.finditer(
+            re_words, self.plain, flags=0 if case_sensitive else re.IGNORECASE
         ):
-            warnings.warn(
-                "The parameter 'ngram_range' will not be used"
-                " since 'analyzer' is callable'"
-            )
-        if self.analyzer != "word" or callable(self.analyzer):
-            if self.stop_words is not None:
-                warnings.warn(
-                    "The parameter 'stop_words' will not be used"
-                    " since 'analyzer' != 'word'"
-                )
-            if (
-                self.token_pattern is not None
-                and self.token_pattern != r"(?u)\b\w\w+\b"
-            ):
-                warnings.warn(
-                    "The parameter 'token_pattern' will not be used"
-                    " since 'analyzer' != 'word'"
-                )
-            if self.tokenizer is not None:
-                warnings.warn(
-                    "The parameter 'tokenizer' will not be used"
-                    " since 'analyzer' != 'word'"
-                )
+            start, end = match.span(0)
+            add_span(_Span(start, end, style))
+            count += 1
+        return count
 
+    def rstrip(self) -> None:
+        """Strip whitespace from end of text."""
+        self.plain = self.plain.rstrip()
 
-class HashingVectorizer(TransformerMixin, _VectorizerMixin, BaseEstimator):
-    r"""Convert a collection of text documents to a matrix of token occurrences.
+    def rstrip_end(self, size: int) -> None:
+        """Remove whitespace beyond a certain width at the end of the text.
 
-    It turns a collection of text documents into a scipy.sparse matrix holding
-    token occurrence counts (or binary occurrence information), possibly
-    normalized as token frequencies if norm='l1' or projected on the euclidean
-    unit sphere if norm='l2'.
-
-    This text vectorizer implementation uses the hashing trick to find the
-    token string name to feature integer index mapping.
-
-    This strategy has several advantages:
-
-    - it is very low memory scalable to large datasets as there is no need to
-      store a vocabulary dictionary in memory.
-
-    - it is fast to pickle and un-pickle as it holds no state besides the
-      constructor parameters.
-
-    - it can be used in a streaming (partial fit) or parallel pipeline as there
-      is no state computed during fit.
-
-    There are also a couple of cons (vs using a CountVectorizer with an
-    in-memory vocabulary):
-
-    - there is no way to compute the inverse transform (from feature indices to
-      string feature names) which can be a problem when trying to introspect
-      which features are most important to a model.
-
-    - there can be collisions: distinct tokens can be mapped to the same
-      feature index. However in practice this is rarely an issue if n_features
-      is large enough (e.g. 2 ** 18 for text classification problems).
-
-    - no IDF weighting as this would render the transformer stateful.
-
-    The hash function employed is the signed 32-bit version of Murmurhash3.
-
-    Read more in the :ref:`User Guide <text_feature_extraction>`.
-
-    Parameters
-    ----------
-    input : {'filename', 'file', 'content'}, default='content'
-        - If `'filename'`, the sequence passed as an argument to fit is
-          expected to be a list of filenames that need reading to fetch
-          the raw content to analyze.
-
-        - If `'file'`, the sequence items must have a 'read' method (file-like
-          object) that is called to fetch the bytes in memory.
-
-        - If `'content'`, the input is expected to be a sequence of items that
-          can be of type string or byte.
-
-    encoding : str, default='utf-8'
-        If bytes or files are given to analyze, this encoding is used to
-        decode.
-
-    decode_error : {'strict', 'ignore', 'replace'}, default='strict'
-        Instruction on what to do if a byte sequence is given to analyze that
-        contains characters not of the given `encoding`. By default, it is
-        'strict', meaning that a UnicodeDecodeError will be raised. Other
-        values are 'ignore' and 'replace'.
-
-    strip_accents : {'ascii', 'unicode'}, default=None
-        Remove accents and perform other character normalization
-        during the preprocessing step.
-        'ascii' is a fast method that only works on characters that have
-        a direct ASCII mapping.
-        'unicode' is a slightly slower method that works on any characters.
-        None (default) does nothing.
-
-        Both 'ascii' and 'unicode' use NFKD normalization from
-        :func:`unicodedata.normalize`.
-
-    lowercase : bool, default=True
-        Convert all characters to lowercase before tokenizing.
-
-    preprocessor : callable, default=None
-        Override the preprocessing (string transformation) stage while
-        preserving the tokenizing and n-grams generation steps.
-        Only applies if ``analyzer`` is not callable.
-
-    tokenizer : callable, default=None
-        Override the string tokenization step while preserving the
-        preprocessing and n-grams generation steps.
-        Only applies if ``analyzer == 'word'``.
-
-    stop_words : {'english'}, list, default=None
-        If 'english', a built-in stop word list for English is used.
-        There are several known issues with 'english' and you should
-        consider an alternative (see :ref:`stop_words`).
-
-        If a list, that list is assumed to contain stop words, all of which
-        will be removed from the resulting tokens.
-        Only applies if ``analyzer == 'word'``.
-
-    token_pattern : str, default=r"(?u)\\b\\w\\w+\\b"
-        Regular expression denoting what constitutes a "token", only used
-        if ``analyzer == 'word'``. The default regexp selects tokens of 2
-        or more alphanumeric characters (punctuation is completely ignored
-        and always treated as a token separator).
-
-        If there is a capturing group in token_pattern then the
-        captured group content, not the entire match, becomes the token.
-        At most one capturing group is permitted.
-
-    ngram_range : tuple (min_n, max_n), default=(1, 1)
-        The lower and upper boundary of the range of n-values for different
-        n-grams to be extracted. All values of n such that min_n <= n <= max_n
-        will be used. For example an ``ngram_range`` of ``(1, 1)`` means only
-        unigrams, ``(1, 2)`` means unigrams and bigrams, and ``(2, 2)`` means
-        only bigrams.
-        Only applies if ``analyzer`` is not callable.
-
-    analyzer : {'word', 'char', 'char_wb'} or callable, default='word'
-        Whether the feature should be made of word or character n-grams.
-        Option 'char_wb' creates character n-grams only from text inside
-        word boundaries; n-grams at the edges of words are padded with space.
-
-        If a callable is passed it is used to extract the sequence of features
-        out of the raw, unprocessed input.
-
-        .. versionchanged:: 0.21
-            Since v0.21, if ``input`` is ``'filename'`` or ``'file'``, the data
-            is first read from the file and then passed to the given callable
-            analyzer.
-
-    n_features : int, default=(2 ** 20)
-        The number of features (columns) in the output matrices. Small numbers
-        of features are likely to cause hash collisions, but large numbers
-        will cause larger coefficient dimensions in linear learners.
-
-    binary : bool, default=False
-        If True, all non zero counts are set to 1. This is useful for discrete
-        probabilistic models that model binary events rather than integer
-        counts.
-
-    norm : {'l1', 'l2'}, default='l2'
-        Norm used to normalize term vectors. None for no normalization.
-
-    alternate_sign : bool, default=True
-        When True, an alternating sign is added to the features as to
-        approximately conserve the inner product in the hashed space even for
-        small n_features. This approach is similar to sparse random projection.
-
-        .. versionadded:: 0.19
-
-    dtype : type, default=np.float64
-        Type of the matrix returned by fit_transform() or transform().
-
-    See Also
-    --------
-    CountVectorizer : Convert a collection of text documents to a matrix of
-        token counts.
-    TfidfVectorizer : Convert a collection of raw documents to a matrix of
-        TF-IDF features.
-
-    Examples
-    --------
-    >>> from sklearn.feature_extraction.text import HashingVectorizer
-    >>> corpus = [
-    ...     'This is the first document.',
-    ...     'This document is the second document.',
-    ...     'And this is the third one.',
-    ...     'Is this the first document?',
-    ... ]
-    >>> vectorizer = HashingVectorizer(n_features=2**4)
-    >>> X = vectorizer.fit_transform(corpus)
-    >>> print(X.shape)
-    (4, 16)
-    """
-
-    def __init__(
-        self,
-        *,
-        input="content",
-        encoding="utf-8",
-        decode_error="strict",
-        strip_accents=None,
-        lowercase=True,
-        preprocessor=None,
-        tokenizer=None,
-        stop_words=None,
-        token_pattern=r"(?u)\b\w\w+\b",
-        ngram_range=(1, 1),
-        analyzer="word",
-        n_features=(2 ** 20),
-        binary=False,
-        norm="l2",
-        alternate_sign=True,
-        dtype=np.float64,
-    ):
-        self.input = input
-        self.encoding = encoding
-        self.decode_error = decode_error
-        self.strip_accents = strip_accents
-        self.preprocessor = preprocessor
-        self.tokenizer = tokenizer
-        self.analyzer = analyzer
-        self.lowercase = lowercase
-        self.token_pattern = token_pattern
-        self.stop_words = stop_words
-        self.n_features = n_features
-        self.ngram_range = ngram_range
-        self.binary = binary
-        self.norm = norm
-        self.alternate_sign = alternate_sign
-        self.dtype = dtype
-
-    def partial_fit(self, X, y=None):
-        """No-op: this transformer is stateless.
-
-        This method is just there to mark the fact that this transformer
-        can work in a streaming setup.
-
-        Parameters
-        ----------
-        X : ndarray of shape [n_samples, n_features]
-            Training data.
-
-        y : Ignored
-            Not used, present for API consistency by convention.
-
-        Returns
-        -------
-        self : object
-            HashingVectorizer instance.
+        Args:
+            size (int): The desired size of the text.
         """
-        return self
-
-    def fit(self, X, y=None):
-        """No-op: this transformer is stateless.
-
-        Parameters
-        ----------
-        X : ndarray of shape [n_samples, n_features]
-            Training data.
-
-        y : Ignored
-            Not used, present for API consistency by convention.
-
-        Returns
-        -------
-        self : object
-            HashingVectorizer instance.
-        """
-        # triggers a parameter validation
-        if isinstance(X, str):
-            raise ValueError(
-                "Iterable over raw text documents expected, string object received."
-            )
-
-        self._warn_for_unused_params()
-        self._validate_params()
-
-        self._get_hasher().fit(X, y=y)
-        return self
-
-    def transform(self, X):
-        """Transform a sequence of documents to a document-term matrix.
-
-        Parameters
-        ----------
-        X : iterable over raw text documents, length = n_samples
-            Samples. Each sample must be a text document (either bytes or
-            unicode strings, file name or file object depending on the
-            constructor argument) which will be tokenized and hashed.
-
-        Returns
-        -------
-        X : sparse matrix of shape (n_samples, n_features)
-            Document-term matrix.
-        """
-        if isinstance(X, str):
-            raise ValueError(
-                "Iterable over raw text documents expected, string object received."
-            )
-
-        self._validate_params()
-
-        analyzer = self.build_analyzer()
-        X = self._get_hasher().transform(analyzer(doc) for doc in X)
-        if self.binary:
-            X.data.fill(1)
-        if self.norm is not None:
-            X = normalize(X, norm=self.norm, copy=False)
-        return X
-
-    def fit_transform(self, X, y=None):
-        """Transform a sequence of documents to a document-term matrix.
-
-        Parameters
-        ----------
-        X : iterable over raw text documents, length = n_samples
-            Samples. Each sample must be a text document (either bytes or
-            unicode strings, file name or file object depending on the
-            constructor argument) which will be tokenized and hashed.
-        y : any
-            Ignored. This parameter exists only for compatibility with
-            sklearn.pipeline.Pipeline.
-
-        Returns
-        -------
-        X : sparse matrix of shape (n_samples, n_features)
-            Document-term matrix.
-        """
-        return self.fit(X, y).transform(X)
-
-    def _get_hasher(self):
-        return FeatureHasher(
-            n_features=self.n_features,
-            input_type="string",
-            dtype=self.dtype,
-            alternate_sign=self.alternate_sign,
-        )
-
-    def _more_tags(self):
-        return {"X_types": ["string"]}
-
-
-def _document_frequency(X):
-    """Count the number of non-zero values for each feature in sparse X."""
-    if sp.isspmatrix_csr(X):
-        return np.bincount(X.indices, minlength=X.shape[1])
-    else:
-        return np.diff(X.indptr)
-
-
-class CountVectorizer(_VectorizerMixin, BaseEstimator):
-    r"""Convert a collection of text documents to a matrix of token counts.
-
-    This implementation produces a sparse representation of the counts using
-    scipy.sparse.csr_matrix.
-
-    If you do not provide an a-priori dictionary and you do not use an analyzer
-    that does some kind of feature selection then the number of features will
-    be equal to the vocabulary size found by analyzing the data.
-
-    Read more in the :ref:`User Guide <text_feature_extraction>`.
-
-    Parameters
-    ----------
-    input : {'filename', 'file', 'content'}, default='content'
-        - If `'filename'`, the sequence passed as an argument to fit is
-          expected to be a list of filenames that need reading to fetch
-          the raw content to analyze.
-
-        - If `'file'`, the sequence items must have a 'read' method (file-like
-          object) that is called to fetch the bytes in memory.
-
-        - If `'content'`, the input is expected to be a sequence of items that
-          can be of type string or byte.
-
-    encoding : str, default='utf-8'
-        If bytes or files are given to analyze, this encoding is used to
-        decode.
-
-    decode_error : {'strict', 'ignore', 'replace'}, default='strict'
-        Instruction on what to do if a byte sequence is given to analyze that
-        contains characters not of the given `encoding`. By default, it is
-        'strict', meaning that a UnicodeDecodeError will be raised. Other
-        values are 'ignore' and 'replace'.
-
-    strip_accents : {'ascii', 'unicode'}, default=None
-        Remove accents and perform other character normalization
-        during the preprocessing step.
-        'ascii' is a fast method that only works on characters that have
-        an direct ASCII mapping.
-        'unicode' is a slightly slower method that works on any characters.
-        None (default) does nothing.
-
-        Both 'ascii' and 'unicode' use NFKD normalization from
-        :func:`unicodedata.normalize`.
-
-    lowercase : bool, default=True
-        Convert all characters to lowercase before tokenizing.
-
-    preprocessor : callable, default=None
-        Override the preprocessing (strip_accents and lowercase) stage while
-        preserving the tokenizing and n-grams generation steps.
-        Only applies if ``analyzer`` is not callable.
-
-    tokenizer : callable, default=None
-        Override the string tokenization step while preserving the
-        preprocessing and n-grams generation steps.
-        Only applies if ``analyzer == 'word'``.
-
-    stop_words : {'english'}, list, default=None
-        If 'english', a built-in stop word list for English is used.
-        There are several known issues with 'english' and you should
-        consider an alternative (see :ref:`stop_words`).
-
-        If a list, that list is assumed to contain stop words, all of which
-        will be removed from the resulting tokens.
-        Only applies if ``analyzer == 'word'``.
-
-        If None, no stop words will be used. max_df can be set to a value
-        in the range [0.7, 1.0) to automatically detect and filter stop
-        words based on intra corpus document frequency of terms.
-
-    token_pattern : str, default=r"(?u)\\b\\w\\w+\\b"
-        Regular expression denoting what constitutes a "token", only used
-        if ``analyzer == 'word'``. The default regexp select tokens of 2
-        or more alphanumeric characters (punctuation is completely ignored
-        and always treated as a token separator).
-
-        If there is a capturing group in token_pattern then the
-        captured group content, not the entire match, becomes the token.
-        At most one capturing group is permitted.
-
-    ngram_range : tuple (min_n, max_n), default=(1, 1)
-        The lower and upper boundary of the range of n-values for different
-        word n-grams or char n-grams to be extracted. All values of n such
-        such that min_n <= n <= max_n will be used. For example an
-        ``ngram_range`` of ``(1, 1)`` means only unigrams, ``(1, 2)`` means
-        unigrams and bigrams, and ``(2, 2)`` means only bigrams.
-        Only applies if ``analyzer`` is not callable.
-
-    analyzer : {'word', 'char', 'char_wb'} or callable, default='word'
-        Whether the feature should be made of word n-gram or character
-        n-grams.
-        Option 'char_wb' creates character n-grams only from text inside
-        word boundaries; n-grams at the edges of words are padded with space.
-
-        If a callable is passed it is used to extract the sequence of features
-        out of the raw, unprocessed input.
-
-        .. versionchanged:: 0.21
-
-        Since v0.21, if ``input`` is ``filename`` or ``file``, the data is
-        first read from the file and then passed to the given callable
-        analyzer.
-
-    max_df : float in range [0.0, 1.0] or int, default=1.0
-        When building the vocabulary ignore terms that have a document
-        frequency strictly higher than the given threshold (corpus-specific
-        stop words).
-        If float, the parameter represents a proportion of documents, integer
-        absolute counts.
-        This parameter is ignored if vocabulary is not None.
-
-    min_df : float in range [0.0, 1.0] or int, default=1
-        When building the vocabulary ignore terms that have a document
-        frequency strictly lower than the given threshold. This value is also
-        called cut-off in the literature.
-        If float, the parameter represents a proportion of documents, integer
-        absolute counts.
-        This parameter is ignored if vocabulary is not None.
-
-    max_features : int, default=None
-        If not None, build a vocabulary that only consider the top
-        max_features ordered by term frequency across the corpus.
-
-        This parameter is ignored if vocabulary is not None.
-
-    vocabulary : Mapping or iterable, default=None
-        Either a Mapping (e.g., a dict) where keys are terms and values are
-        indices in the feature matrix, or an iterable over terms. If not
-        given, a vocabulary is determined from the input documents. Indices
-        in the mapping should not be repeated and should not have any gap
-        between 0 and the largest index.
-
-    binary : bool, default=False
-        If True, all non zero counts are set to 1. This is useful for discrete
-        probabilistic models that model binary events rather than integer
-        counts.
-
-    dtype : type, default=np.int64
-        Type of the matrix returned by fit_transform() or transform().
-
-    Attributes
-    ----------
-    vocabulary_ : dict
-        A mapping of terms to feature indices.
-
-    fixed_vocabulary_ : bool
-        True if a fixed vocabulary of term to indices mapping
-        is provided by the user.
-
-    stop_words_ : set
-        Terms that were ignored because they either:
-
-          - occurred in too many documents (`max_df`)
-          - occurred in too few documents (`min_df`)
-          - were cut off by feature selection (`max_features`).
-
-        This is only available if no vocabulary was given.
-
-    See Also
-    --------
-    HashingVectorizer : Convert a collection of text documents to a
-        matrix of token counts.
-
-    TfidfVectorizer : Convert a collection of raw documents to a matrix
-        of TF-IDF features.
-
-    Notes
-    -----
-    The ``stop_words_`` attribute can get large and increase the model size
-    when pickling. This attribute is provided only for introspection and can
-    be safely removed using delattr or set to None before pickling.
-
-    Examples
-    --------
-    >>> from sklearn.feature_extraction.text import CountVectorizer
-    >>> corpus = [
-    ...     'This is the first document.',
-    ...     'This document is the second document.',
-    ...     'And this is the third one.',
-    ...     'Is this the first document?',
-    ... ]
-    >>> vectorizer = CountVectorizer()
-    >>> X = vectorizer.fit_transform(corpus)
-    >>> vectorizer.get_feature_names_out()
-    array(['and', 'document', 'first', 'is', 'one', 'second', 'the', 'third',
-           'this'], ...)
-    >>> print(X.toarray())
-    [[0 1 1 1 0 0 1 0 1]
-     [0 2 0 1 0 1 1 0 1]
-     [1 0 0 1 1 0 1 1 1]
-     [0 1 1 1 0 0 1 0 1]]
-    >>> vectorizer2 = CountVectorizer(analyzer='word', ngram_range=(2, 2))
-    >>> X2 = vectorizer2.fit_transform(corpus)
-    >>> vectorizer2.get_feature_names_out()
-    array(['and this', 'document is', 'first document', 'is the', 'is this',
-           'second document', 'the first', 'the second', 'the third', 'third one',
-           'this document', 'this is', 'this the'], ...)
-     >>> print(X2.toarray())
-     [[0 0 1 1 0 0 1 0 0 0 0 1 0]
-     [0 1 0 1 0 1 0 1 0 0 1 0 0]
-     [1 0 0 1 0 0 0 0 1 1 0 1 0]
-     [0 0 1 0 1 0 1 0 0 0 0 0 1]]
-    """
-
-    def __init__(
-        self,
-        *,
-        input="content",
-        encoding="utf-8",
-        decode_error="strict",
-        strip_accents=None,
-        lowercase=True,
-        preprocessor=None,
-        tokenizer=None,
-        stop_words=None,
-        token_pattern=r"(?u)\b\w\w+\b",
-        ngram_range=(1, 1),
-        analyzer="word",
-        max_df=1.0,
-        min_df=1,
-        max_features=None,
-        vocabulary=None,
-        binary=False,
-        dtype=np.int64,
-    ):
-        self.input = input
-        self.encoding = encoding
-        self.decode_error = decode_error
-        self.strip_accents = strip_accents
-        self.preprocessor = preprocessor
-        self.tokenizer = tokenizer
-        self.analyzer = analyzer
-        self.lowercase = lowercase
-        self.token_pattern = token_pattern
-        self.stop_words = stop_words
-        self.max_df = max_df
-        self.min_df = min_df
-        self.max_features = max_features
-        self.ngram_range = ngram_range
-        self.vocabulary = vocabulary
-        self.binary = binary
-        self.dtype = dtype
-
-    def _sort_features(self, X, vocabulary):
-        """Sort features by name
-
-        Returns a reordered matrix and modifies the vocabulary in place
-        """
-        sorted_features = sorted(vocabulary.items())
-        map_index = np.empty(len(sorted_features), dtype=X.indices.dtype)
-        for new_val, (term, old_val) in enumerate(sorted_features):
-            vocabulary[term] = new_val
-            map_index[old_val] = new_val
-
-        X.indices = map_index.take(X.indices, mode="clip")
-        return X
-
-    def _limit_features(self, X, vocabulary, high=None, low=None, limit=None):
-        """Remove too rare or too common features.
-
-        Prune features that are non zero in more samples than high or less
-        documents than low, modifying the vocabulary, and restricting it to
-        at most the limit most frequent.
-
-        This does not prune samples with zero features.
-        """
-        if high is None and low is None and limit is None:
-            return X, set()
-
-        # Calculate a mask based on document frequencies
-        dfs = _document_frequency(X)
-        mask = np.ones(len(dfs), dtype=bool)
-        if high is not None:
-            mask &= dfs <= high
-        if low is not None:
-            mask &= dfs >= low
-        if limit is not None and mask.sum() > limit:
-            tfs = np.asarray(X.sum(axis=0)).ravel()
-            mask_inds = (-tfs[mask]).argsort()[:limit]
-            new_mask = np.zeros(len(dfs), dtype=bool)
-            new_mask[np.where(mask)[0][mask_inds]] = True
-            mask = new_mask
-
-        new_indices = np.cumsum(mask) - 1  # maps old indices to new
-        removed_terms = set()
-        for term, old_index in list(vocabulary.items()):
-            if mask[old_index]:
-                vocabulary[term] = new_indices[old_index]
+        text_length = len(self)
+        if text_length > size:
+            excess = text_length - size
+            whitespace_match = _re_whitespace.search(self.plain)
+            if whitespace_match is not None:
+                whitespace_count = len(whitespace_match.group(0))
+                self.right_crop(min(whitespace_count, excess))
+
+    def set_length(self, new_length: int) -> None:
+        """Set new length of the text, clipping or padding is required."""
+        length = len(self)
+        if length != new_length:
+            if length < new_length:
+                self.pad_right(new_length - length)
             else:
-                del vocabulary[term]
-                removed_terms.add(term)
-        kept_indices = np.where(mask)[0]
-        if len(kept_indices) == 0:
-            raise ValueError(
-                "After pruning, no terms remain. Try a lower min_df or a higher max_df."
+                self.right_crop(length - new_length)
+
+    def __rich_console__(
+        self, console: "Console", options: "ConsoleOptions"
+    ) -> Iterable[Segment]:
+        tab_size: int = console.tab_size if self.tab_size is None else self.tab_size
+        justify = self.justify or options.justify or DEFAULT_JUSTIFY
+
+        overflow = self.overflow or options.overflow or DEFAULT_OVERFLOW
+
+        lines = self.wrap(
+            console,
+            options.max_width,
+            justify=justify,
+            overflow=overflow,
+            tab_size=tab_size or 8,
+            no_wrap=pick_bool(self.no_wrap, options.no_wrap, False),
+        )
+        all_lines = Text("\n").join(lines)
+        yield from all_lines.render(console, end=self.end)
+
+    def __rich_measure__(
+        self, console: "Console", options: "ConsoleOptions"
+    ) -> Measurement:
+        text = self.plain
+        lines = text.splitlines()
+        max_text_width = max(cell_len(line) for line in lines) if lines else 0
+        words = text.split()
+        min_text_width = (
+            max(cell_len(word) for word in words) if words else max_text_width
+        )
+        return Measurement(min_text_width, max_text_width)
+
+    def render(self, console: "Console", end: str = "") -> Iterable["Segment"]:
+        """Render the text as Segments.
+
+        Args:
+            console (Console): Console instance.
+            end (Optional[str], optional): Optional end character.
+
+        Returns:
+            Iterable[Segment]: Result of render that may be written to the console.
+        """
+        _Segment = Segment
+        text = self.plain
+        if not self._spans:
+            yield Segment(text)
+            if end:
+                yield _Segment(end)
+            return
+        get_style = partial(console.get_style, default=Style.null())
+
+        enumerated_spans = list(enumerate(self._spans, 1))
+        style_map = {index: get_style(span.style) for index, span in enumerated_spans}
+        style_map[0] = get_style(self.style)
+
+        spans = [
+            (0, False, 0),
+            *((span.start, False, index) for index, span in enumerated_spans),
+            *((span.end, True, index) for index, span in enumerated_spans),
+            (len(text), True, 0),
+        ]
+        spans.sort(key=itemgetter(0, 1))
+
+        stack: List[int] = []
+        stack_append = stack.append
+        stack_pop = stack.remove
+
+        style_cache: Dict[Tuple[Style, ...], Style] = {}
+        style_cache_get = style_cache.get
+        combine = Style.combine
+
+        def get_current_style() -> Style:
+            """Construct current style from stack."""
+            styles = tuple(style_map[_style_id] for _style_id in sorted(stack))
+            cached_style = style_cache_get(styles)
+            if cached_style is not None:
+                return cached_style
+            current_style = combine(styles)
+            style_cache[styles] = current_style
+            return current_style
+
+        for (offset, leaving, style_id), (next_offset, _, _) in zip(spans, spans[1:]):
+            if leaving:
+                stack_pop(style_id)
+            else:
+                stack_append(style_id)
+            if next_offset > offset:
+                yield _Segment(text[offset:next_offset], get_current_style())
+        if end:
+            yield _Segment(end)
+
+    def join(self, lines: Iterable["Text"]) -> "Text":
+        """Join text together with this instance as the separator.
+
+        Args:
+            lines (Iterable[Text]): An iterable of Text instances to join.
+
+        Returns:
+            Text: A new text instance containing join text.
+        """
+
+        new_text = self.blank_copy()
+
+        def iter_text() -> Iterable["Text"]:
+            if self.plain:
+                for last, line in loop_last(lines):
+                    yield line
+                    if not last:
+                        yield self
+            else:
+                yield from lines
+
+        extend_text = new_text._text.extend
+        append_span = new_text._spans.append
+        extend_spans = new_text._spans.extend
+        offset = 0
+        _Span = Span
+
+        for text in iter_text():
+            extend_text(text._text)
+            if text.style:
+                append_span(_Span(offset, offset + len(text), text.style))
+            extend_spans(
+                _Span(offset + start, offset + end, style)
+                for start, end, style in text._spans
             )
-        return X[:, kept_indices], removed_terms
+            offset += len(text)
+        new_text._length = offset
+        return new_text
 
-    def _count_vocab(self, raw_documents, fixed_vocab):
-        """Create sparse feature matrix, and vocabulary where fixed_vocab=False"""
-        if fixed_vocab:
-            vocabulary = self.vocabulary_
-        else:
-            # Add a new value when a new vocabulary item is seen
-            vocabulary = defaultdict()
-            vocabulary.default_factory = vocabulary.__len__
+    def expand_tabs(self, tab_size: Optional[int] = None) -> None:
+        """Converts tabs to spaces.
 
-        analyze = self.build_analyzer()
-        j_indices = []
-        indptr = []
+        Args:
+            tab_size (int, optional): Size of tabs. Defaults to 8.
 
-        values = _make_int_array()
-        indptr.append(0)
-        for doc in raw_documents:
-            feature_counter = {}
-            for feature in analyze(doc):
-                try:
-                    feature_idx = vocabulary[feature]
-                    if feature_idx not in feature_counter:
-                        feature_counter[feature_idx] = 1
+        """
+        if "\t" not in self.plain:
+            return
+        if tab_size is None:
+            tab_size = self.tab_size
+        if tab_size is None:
+            tab_size = 8
+
+        new_text: List[Text] = []
+        append = new_text.append
+
+        for line in self.split("\n", include_separator=True):
+            if "\t" not in line.plain:
+                append(line)
+            else:
+                cell_position = 0
+                parts = line.split("\t", include_separator=True)
+                for part in parts:
+                    if part.plain.endswith("\t"):
+                        part._text[-1] = part._text[-1][:-1] + " "
+                        cell_position += part.cell_len
+                        tab_remainder = cell_position % tab_size
+                        if tab_remainder:
+                            spaces = tab_size - tab_remainder
+                            part.extend_style(spaces)
+                            cell_position += spaces
                     else:
-                        feature_counter[feature_idx] += 1
-                except KeyError:
-                    # Ignore out-of-vocabulary items for fixed_vocab=True
-                    continue
+                        cell_position += part.cell_len
+                    append(part)
 
-            j_indices.extend(feature_counter.keys())
-            values.extend(feature_counter.values())
-            indptr.append(len(j_indices))
+        result = Text("").join(new_text)
 
-        if not fixed_vocab:
-            # disable defaultdict behaviour
-            vocabulary = dict(vocabulary)
-            if not vocabulary:
-                raise ValueError(
-                    "empty vocabulary; perhaps the documents only contain stop words"
-                )
+        self._text = [result.plain]
+        self._length = len(self.plain)
+        self._spans[:] = result._spans
 
-        if indptr[-1] > np.iinfo(np.int32).max:  # = 2**31 - 1
-            if _IS_32BIT:
-                raise ValueError(
-                    (
-                        "sparse CSR array has {} non-zero "
-                        "elements and requires 64 bit indexing, "
-                        "which is unsupported with 32 bit Python."
-                    ).format(indptr[-1])
-                )
-            indices_dtype = np.int64
-
-        else:
-            indices_dtype = np.int32
-        j_indices = np.asarray(j_indices, dtype=indices_dtype)
-        indptr = np.asarray(indptr, dtype=indices_dtype)
-        values = np.frombuffer(values, dtype=np.intc)
-
-        X = sp.csr_matrix(
-            (values, j_indices, indptr),
-            shape=(len(indptr) - 1, len(vocabulary)),
-            dtype=self.dtype,
-        )
-        X.sort_indices()
-        return vocabulary, X
-
-    def _validate_params(self):
-        """Validation of min_df, max_df and max_features"""
-        super()._validate_params()
-
-        if self.max_features is not None:
-            check_scalar(self.max_features, "max_features", numbers.Integral, min_val=0)
-
-        if isinstance(self.min_df, numbers.Integral):
-            check_scalar(self.min_df, "min_df", numbers.Integral, min_val=0)
-        else:
-            check_scalar(self.min_df, "min_df", numbers.Real, min_val=0.0, max_val=1.0)
-
-        if isinstance(self.max_df, numbers.Integral):
-            check_scalar(self.max_df, "max_df", numbers.Integral, min_val=0)
-        else:
-            check_scalar(self.max_df, "max_df", numbers.Real, min_val=0.0, max_val=1.0)
-
-    def fit(self, raw_documents, y=None):
-        """Learn a vocabulary dictionary of all tokens in the raw documents.
-
-        Parameters
-        ----------
-        raw_documents : iterable
-            An iterable which generates either str, unicode or file objects.
-
-        y : None
-            This parameter is ignored.
-
-        Returns
-        -------
-        self : object
-            Fitted vectorizer.
-        """
-        self._warn_for_unused_params()
-        self.fit_transform(raw_documents)
-        return self
-
-    def fit_transform(self, raw_documents, y=None):
-        """Learn the vocabulary dictionary and return document-term matrix.
-
-        This is equivalent to fit followed by transform, but more efficiently
-        implemented.
-
-        Parameters
-        ----------
-        raw_documents : iterable
-            An iterable which generates either str, unicode or file objects.
-
-        y : None
-            This parameter is ignored.
-
-        Returns
-        -------
-        X : array of shape (n_samples, n_features)
-            Document-term matrix.
-        """
-        # We intentionally don't call the transform method to make
-        # fit_transform overridable without unwanted side effects in
-        # TfidfVectorizer.
-        if isinstance(raw_documents, str):
-            raise ValueError(
-                "Iterable over raw text documents expected, string object received."
-            )
-
-        self._validate_params()
-        self._validate_vocabulary()
-        max_df = self.max_df
-        min_df = self.min_df
-        max_features = self.max_features
-
-        if self.fixed_vocabulary_ and self.lowercase:
-            for term in self.vocabulary:
-                if any(map(str.isupper, term)):
-                    warnings.warn(
-                        "Upper case characters found in"
-                        " vocabulary while 'lowercase'"
-                        " is True. These entries will not"
-                        " be matched with any documents"
-                    )
-                    break
-
-        vocabulary, X = self._count_vocab(raw_documents, self.fixed_vocabulary_)
-
-        if self.binary:
-            X.data.fill(1)
-
-        if not self.fixed_vocabulary_:
-            n_doc = X.shape[0]
-            max_doc_count = (
-                max_df if isinstance(max_df, numbers.Integral) else max_df * n_doc
-            )
-            min_doc_count = (
-                min_df if isinstance(min_df, numbers.Integral) else min_df * n_doc
-            )
-            if max_doc_count < min_doc_count:
-                raise ValueError("max_df corresponds to < documents than min_df")
-            if max_features is not None:
-                X = self._sort_features(X, vocabulary)
-            X, self.stop_words_ = self._limit_features(
-                X, vocabulary, max_doc_count, min_doc_count, max_features
-            )
-            if max_features is None:
-                X = self._sort_features(X, vocabulary)
-            self.vocabulary_ = vocabulary
-
-        return X
-
-    def transform(self, raw_documents):
-        """Transform documents to document-term matrix.
-
-        Extract token counts out of raw text documents using the vocabulary
-        fitted with fit or the one provided to the constructor.
-
-        Parameters
-        ----------
-        raw_documents : iterable
-            An iterable which generates either str, unicode or file objects.
-
-        Returns
-        -------
-        X : sparse matrix of shape (n_samples, n_features)
-            Document-term matrix.
-        """
-        if isinstance(raw_documents, str):
-            raise ValueError(
-                "Iterable over raw text documents expected, string object received."
-            )
-        self._check_vocabulary()
-
-        # use the same matrix-building strategy as fit_transform
-        _, X = self._count_vocab(raw_documents, fixed_vocab=True)
-        if self.binary:
-            X.data.fill(1)
-        return X
-
-    def inverse_transform(self, X):
-        """Return terms per document with nonzero entries in X.
-
-        Parameters
-        ----------
-        X : {array-like, sparse matrix} of shape (n_samples, n_features)
-            Document-term matrix.
-
-        Returns
-        -------
-        X_inv : list of arrays of shape (n_samples,)
-            List of arrays of terms.
-        """
-        self._check_vocabulary()
-        # We need CSR format for fast row manipulations.
-        X = check_array(X, accept_sparse="csr")
-        n_samples = X.shape[0]
-
-        terms = np.array(list(self.vocabulary_.keys()))
-        indices = np.array(list(self.vocabulary_.values()))
-        inverse_vocabulary = terms[np.argsort(indices)]
-
-        if sp.issparse(X):
-            return [
-                inverse_vocabulary[X[i, :].nonzero()[1]].ravel()
-                for i in range(n_samples)
-            ]
-        else:
-            return [
-                inverse_vocabulary[np.flatnonzero(X[i, :])].ravel()
-                for i in range(n_samples)
-            ]
-
-    @deprecated(
-        "get_feature_names is deprecated in 1.0 and will be removed "
-        "in 1.2. Please use get_feature_names_out instead."
-    )
-    def get_feature_names(self):
-        """Array mapping from feature integer indices to feature name.
-
-        Returns
-        -------
-        feature_names : list
-            A list of feature names.
-        """
-        self._check_vocabulary()
-
-        return [t for t, i in sorted(self.vocabulary_.items(), key=itemgetter(1))]
-
-    def get_feature_names_out(self, input_features=None):
-        """Get output feature names for transformation.
-
-        Parameters
-        ----------
-        input_features : array-like of str or None, default=None
-            Not used, present here for API consistency by convention.
-
-        Returns
-        -------
-        feature_names_out : ndarray of str objects
-            Transformed feature names.
-        """
-        self._check_vocabulary()
-        return np.asarray(
-            [t for t, i in sorted(self.vocabulary_.items(), key=itemgetter(1))],
-            dtype=object,
-        )
-
-    def _more_tags(self):
-        return {"X_types": ["string"]}
-
-
-def _make_int_array():
-    """Construct an array.array of a type suitable for scipy.sparse indices."""
-    return array.array(str("i"))
-
-
-class TfidfTransformer(_OneToOneFeatureMixin, TransformerMixin, BaseEstimator):
-    """Transform a count matrix to a normalized tf or tf-idf representation.
-
-    Tf means term-frequency while tf-idf means term-frequency times inverse
-    document-frequency. This is a common term weighting scheme in information
-    retrieval, that has also found good use in document classification.
-
-    The goal of using tf-idf instead of the raw frequencies of occurrence of a
-    token in a given document is to scale down the impact of tokens that occur
-    very frequently in a given corpus and that are hence empirically less
-    informative than features that occur in a small fraction of the training
-    corpus.
-
-    The formula that is used to compute the tf-idf for a term t of a document d
-    in a document set is tf-idf(t, d) = tf(t, d) * idf(t), and the idf is
-    computed as idf(t) = log [ n / df(t) ] + 1 (if ``smooth_idf=False``), where
-    n is the total number of documents in the document set and df(t) is the
-    document frequency of t; the document frequency is the number of documents
-    in the document set that contain the term t. The effect of adding "1" to
-    the idf in the equation above is that terms with zero idf, i.e., terms
-    that occur in all documents in a training set, will not be entirely
-    ignored.
-    (Note that the idf formula above differs from the standard textbook
-    notation that defines the idf as
-    idf(t) = log [ n / (df(t) + 1) ]).
-
-    If ``smooth_idf=True`` (the default), the constant "1" is added to the
-    numerator and denominator of the idf as if an extra document was seen
-    containing every term in the collection exactly once, which prevents
-    zero divisions: idf(t) = log [ (1 + n) / (1 + df(t)) ] + 1.
-
-    Furthermore, the formulas used to compute tf and idf depend
-    on parameter settings that correspond to the SMART notation used in IR
-    as follows:
-
-    Tf is "n" (natural) by default, "l" (logarithmic) when
-    ``sublinear_tf=True``.
-    Idf is "t" when use_idf is given, "n" (none) otherwise.
-    Normalization is "c" (cosine) when ``norm='l2'``, "n" (none)
-    when ``norm=None``.
-
-    Read more in the :ref:`User Guide <text_feature_extraction>`.
-
-    Parameters
-    ----------
-    norm : {'l1', 'l2'}, default='l2'
-        Each output row will have unit norm, either:
-
-        - 'l2': Sum of squares of vector elements is 1. The cosine
-          similarity between two vectors is their dot product when l2 norm has
-          been applied.
-        - 'l1': Sum of absolute values of vector elements is 1.
-          See :func:`preprocessing.normalize`.
-
-    use_idf : bool, default=True
-        Enable inverse-document-frequency reweighting. If False, idf(t) = 1.
-
-    smooth_idf : bool, default=True
-        Smooth idf weights by adding one to document frequencies, as if an
-        extra document was seen containing every term in the collection
-        exactly once. Prevents zero divisions.
-
-    sublinear_tf : bool, default=False
-        Apply sublinear tf scaling, i.e. replace tf with 1 + log(tf).
-
-    Attributes
-    ----------
-    idf_ : array of shape (n_features)
-        The inverse document frequency (IDF) vector; only defined
-        if  ``use_idf`` is True.
-
-        .. versionadded:: 0.20
-
-    n_features_in_ : int
-        Number of features seen during :term:`fit`.
-
-        .. versionadded:: 1.0
-
-    feature_names_in_ : ndarray of shape (`n_features_in_`,)
-        Names of features seen during :term:`fit`. Defined only when `X`
-        has feature names that are all strings.
-
-        .. versionadded:: 1.0
-
-    See Also
-    --------
-    CountVectorizer : Transforms text into a sparse matrix of n-gram counts.
-
-    TfidfVectorizer : Convert a collection of raw documents to a matrix of
-        TF-IDF features.
-
-    HashingVectorizer : Convert a collection of text documents to a matrix
-        of token occurrences.
-
-    References
-    ----------
-    .. [Yates2011] R. Baeza-Yates and B. Ribeiro-Neto (2011). Modern
-                   Information Retrieval. Addison Wesley, pp. 68-74.
-
-    .. [MRS2008] C.D. Manning, P. Raghavan and H. Schütze  (2008).
-                   Introduction to Information Retrieval. Cambridge University
-                   Press, pp. 118-120.
-
-    Examples
-    --------
-    >>> from sklearn.feature_extraction.text import TfidfTransformer
-    >>> from sklearn.feature_extraction.text import CountVectorizer
-    >>> from sklearn.pipeline import Pipeline
-    >>> corpus = ['this is the first document',
-    ...           'this document is the second document',
-    ...           'and this is the third one',
-    ...           'is this the first document']
-    >>> vocabulary = ['this', 'document', 'first', 'is', 'second', 'the',
-    ...               'and', 'one']
-    >>> pipe = Pipeline([('count', CountVectorizer(vocabulary=vocabulary)),
-    ...                  ('tfid', TfidfTransformer())]).fit(corpus)
-    >>> pipe['count'].transform(corpus).toarray()
-    array([[1, 1, 1, 1, 0, 1, 0, 0],
-           [1, 2, 0, 1, 1, 1, 0, 0],
-           [1, 0, 0, 1, 0, 1, 1, 1],
-           [1, 1, 1, 1, 0, 1, 0, 0]])
-    >>> pipe['tfid'].idf_
-    array([1.        , 1.22314355, 1.51082562, 1.        , 1.91629073,
-           1.        , 1.91629073, 1.91629073])
-    >>> pipe.transform(corpus).shape
-    (4, 8)
-    """
-
-    def __init__(self, *, norm="l2", use_idf=True, smooth_idf=True, sublinear_tf=False):
-        self.norm = norm
-        self.use_idf = use_idf
-        self.smooth_idf = smooth_idf
-        self.sublinear_tf = sublinear_tf
-
-    def fit(self, X, y=None):
-        """Learn the idf vector (global term weights).
-
-        Parameters
-        ----------
-        X : sparse matrix of shape n_samples, n_features)
-            A matrix of term/token counts.
-
-        y : None
-            This parameter is not needed to compute tf-idf.
-
-        Returns
-        -------
-        self : object
-            Fitted transformer.
-        """
-        # large sparse data is not supported for 32bit platforms because
-        # _document_frequency uses np.bincount which works on arrays of
-        # dtype NPY_INTP which is int32 for 32bit platforms. See #20923
-        X = self._validate_data(
-            X, accept_sparse=("csr", "csc"), accept_large_sparse=not _IS_32BIT
-        )
-        if not sp.issparse(X):
-            X = sp.csr_matrix(X)
-        dtype = X.dtype if X.dtype in FLOAT_DTYPES else np.float64
-
-        if self.use_idf:
-            n_samples, n_features = X.shape
-            df = _document_frequency(X)
-            df = df.astype(dtype, **_astype_copy_false(df))
-
-            # perform idf smoothing if required
-            df += int(self.smooth_idf)
-            n_samples += int(self.smooth_idf)
-
-            # log+1 instead of log makes sure terms with zero idf don't get
-            # suppressed entirely.
-            idf = np.log(n_samples / df) + 1
-            self._idf_diag = sp.diags(
-                idf,
-                offsets=0,
-                shape=(n_features, n_features),
-                format="csr",
-                dtype=dtype,
-            )
-
-        return self
-
-    def transform(self, X, copy=True):
-        """Transform a count matrix to a tf or tf-idf representation.
-
-        Parameters
-        ----------
-        X : sparse matrix of (n_samples, n_features)
-            A matrix of term/token counts.
-
-        copy : bool, default=True
-            Whether to copy X and operate on the copy or perform in-place
-            operations.
-
-        Returns
-        -------
-        vectors : sparse matrix of shape (n_samples, n_features)
-            Tf-idf-weighted document-term matrix.
-        """
-        X = self._validate_data(
-            X, accept_sparse="csr", dtype=FLOAT_DTYPES, copy=copy, reset=False
-        )
-        if not sp.issparse(X):
-            X = sp.csr_matrix(X, dtype=np.float64)
-
-        if self.sublinear_tf:
-            np.log(X.data, X.data)
-            X.data += 1
-
-        if self.use_idf:
-            # idf_ being a property, the automatic attributes detection
-            # does not work as usual and we need to specify the attribute
-            # name:
-            check_is_fitted(self, attributes=["idf_"], msg="idf vector is not fitted")
-
-            # *= doesn't work
-            X = X * self._idf_diag
-
-        if self.norm:
-            X = normalize(X, norm=self.norm, copy=False)
-
-        return X
-
-    @property
-    def idf_(self):
-        """Inverse document frequency vector, only defined if `use_idf=True`.
-
-        Returns
-        -------
-        ndarray of shape (n_features,)
-        """
-        # if _idf_diag is not set, this will raise an attribute error,
-        # which means hasattr(self, "idf_") is False
-        return np.ravel(self._idf_diag.sum(axis=0))
-
-    @idf_.setter
-    def idf_(self, value):
-        value = np.asarray(value, dtype=np.float64)
-        n_features = value.shape[0]
-        self._idf_diag = sp.spdiags(
-            value, diags=0, m=n_features, n=n_features, format="csr"
-        )
-
-    def _more_tags(self):
-        return {"X_types": ["2darray", "sparse"]}
-
-
-class TfidfVectorizer(CountVectorizer):
-    r"""Convert a collection of raw documents to a matrix of TF-IDF features.
-
-    Equivalent to :class:`CountVectorizer` followed by
-    :class:`TfidfTransformer`.
-
-    Read more in the :ref:`User Guide <text_feature_extraction>`.
-
-    Parameters
-    ----------
-    input : {'filename', 'file', 'content'}, default='content'
-        - If `'filename'`, the sequence passed as an argument to fit is
-          expected to be a list of filenames that need reading to fetch
-          the raw content to analyze.
-
-        - If `'file'`, the sequence items must have a 'read' method (file-like
-          object) that is called to fetch the bytes in memory.
-
-        - If `'content'`, the input is expected to be a sequence of items that
-          can be of type string or byte.
-
-    encoding : str, default='utf-8'
-        If bytes or files are given to analyze, this encoding is used to
-        decode.
-
-    decode_error : {'strict', 'ignore', 'replace'}, default='strict'
-        Instruction on what to do if a byte sequence is given to analyze that
-        contains characters not of the given `encoding`. By default, it is
-        'strict', meaning that a UnicodeDecodeError will be raised. Other
-        values are 'ignore' and 'replace'.
-
-    strip_accents : {'ascii', 'unicode'}, default=None
-        Remove accents and perform other character normalization
-        during the preprocessing step.
-        'ascii' is a fast method that only works on characters that have
-        an direct ASCII mapping.
-        'unicode' is a slightly slower method that works on any characters.
-        None (default) does nothing.
-
-        Both 'ascii' and 'unicode' use NFKD normalization from
-        :func:`unicodedata.normalize`.
-
-    lowercase : bool, default=True
-        Convert all characters to lowercase before tokenizing.
-
-    preprocessor : callable, default=None
-        Override the preprocessing (string transformation) stage while
-        preserving the tokenizing and n-grams generation steps.
-        Only applies if ``analyzer`` is not callable.
-
-    tokenizer : callable, default=None
-        Override the string tokenization step while preserving the
-        preprocessing and n-grams generation steps.
-        Only applies if ``analyzer == 'word'``.
-
-    analyzer : {'word', 'char', 'char_wb'} or callable, default='word'
-        Whether the feature should be made of word or character n-grams.
-        Option 'char_wb' creates character n-grams only from text inside
-        word boundaries; n-grams at the edges of words are padded with space.
-
-        If a callable is passed it is used to extract the sequence of features
-        out of the raw, unprocessed input.
-
-        .. versionchanged:: 0.21
-            Since v0.21, if ``input`` is ``'filename'`` or ``'file'``, the data
-            is first read from the file and then passed to the given callable
-            analyzer.
-
-    stop_words : {'english'}, list, default=None
-        If a string, it is passed to _check_stop_list and the appropriate stop
-        list is returned. 'english' is currently the only supported string
-        value.
-        There are several known issues with 'english' and you should
-        consider an alternative (see :ref:`stop_words`).
-
-        If a list, that list is assumed to contain stop words, all of which
-        will be removed from the resulting tokens.
-        Only applies if ``analyzer == 'word'``.
-
-        If None, no stop words will be used. max_df can be set to a value
-        in the range [0.7, 1.0) to automatically detect and filter stop
-        words based on intra corpus document frequency of terms.
-
-    token_pattern : str, default=r"(?u)\\b\\w\\w+\\b"
-        Regular expression denoting what constitutes a "token", only used
-        if ``analyzer == 'word'``. The default regexp selects tokens of 2
-        or more alphanumeric characters (punctuation is completely ignored
-        and always treated as a token separator).
-
-        If there is a capturing group in token_pattern then the
-        captured group content, not the entire match, becomes the token.
-        At most one capturing group is permitted.
-
-    ngram_range : tuple (min_n, max_n), default=(1, 1)
-        The lower and upper boundary of the range of n-values for different
-        n-grams to be extracted. All values of n such that min_n <= n <= max_n
-        will be used. For example an ``ngram_range`` of ``(1, 1)`` means only
-        unigrams, ``(1, 2)`` means unigrams and bigrams, and ``(2, 2)`` means
-        only bigrams.
-        Only applies if ``analyzer`` is not callable.
-
-    max_df : float or int, default=1.0
-        When building the vocabulary ignore terms that have a document
-        frequency strictly higher than the given threshold (corpus-specific
-        stop words).
-        If float in range [0.0, 1.0], the parameter represents a proportion of
-        documents, integer absolute counts.
-        This parameter is ignored if vocabulary is not None.
-
-    min_df : float or int, default=1
-        When building the vocabulary ignore terms that have a document
-        frequency strictly lower than the given threshold. This value is also
-        called cut-off in the literature.
-        If float in range of [0.0, 1.0], the parameter represents a proportion
-        of documents, integer absolute counts.
-        This parameter is ignored if vocabulary is not None.
-
-    max_features : int, default=None
-        If not None, build a vocabulary that only consider the top
-        max_features ordered by term frequency across the corpus.
-
-        This parameter is ignored if vocabulary is not None.
-
-    vocabulary : Mapping or iterable, default=None
-        Either a Mapping (e.g., a dict) where keys are terms and values are
-        indices in the feature matrix, or an iterable over terms. If not
-        given, a vocabulary is determined from the input documents.
-
-    binary : bool, default=False
-        If True, all non-zero term counts are set to 1. This does not mean
-        outputs will have only 0/1 values, only that the tf term in tf-idf
-        is binary. (Set idf and normalization to False to get 0/1 outputs).
-
-    dtype : dtype, default=float64
-        Type of the matrix returned by fit_transform() or transform().
-
-    norm : {'l1', 'l2'}, default='l2'
-        Each output row will have unit norm, either:
-
-        - 'l2': Sum of squares of vector elements is 1. The cosine
-          similarity between two vectors is their dot product when l2 norm has
-          been applied.
-        - 'l1': Sum of absolute values of vector elements is 1.
-          See :func:`preprocessing.normalize`.
-
-    use_idf : bool, default=True
-        Enable inverse-document-frequency reweighting. If False, idf(t) = 1.
-
-    smooth_idf : bool, default=True
-        Smooth idf weights by adding one to document frequencies, as if an
-        extra document was seen containing every term in the collection
-        exactly once. Prevents zero divisions.
-
-    sublinear_tf : bool, default=False
-        Apply sublinear tf scaling, i.e. replace tf with 1 + log(tf).
-
-    Attributes
-    ----------
-    vocabulary_ : dict
-        A mapping of terms to feature indices.
-
-    fixed_vocabulary_ : bool
-        True if a fixed vocabulary of term to indices mapping
-        is provided by the user.
-
-    idf_ : array of shape (n_features,)
-        The inverse document frequency (IDF) vector; only defined
-        if ``use_idf`` is True.
-
-    stop_words_ : set
-        Terms that were ignored because they either:
-
-          - occurred in too many documents (`max_df`)
-          - occurred in too few documents (`min_df`)
-          - were cut off by feature selection (`max_features`).
-
-        This is only available if no vocabulary was given.
-
-    See Also
-    --------
-    CountVectorizer : Transforms text into a sparse matrix of n-gram counts.
-
-    TfidfTransformer : Performs the TF-IDF transformation from a provided
-        matrix of counts.
-
-    Notes
-    -----
-    The ``stop_words_`` attribute can get large and increase the model size
-    when pickling. This attribute is provided only for introspection and can
-    be safely removed using delattr or set to None before pickling.
-
-    Examples
-    --------
-    >>> from sklearn.feature_extraction.text import TfidfVectorizer
-    >>> corpus = [
-    ...     'This is the first document.',
-    ...     'This document is the second document.',
-    ...     'And this is the third one.',
-    ...     'Is this the first document?',
-    ... ]
-    >>> vectorizer = TfidfVectorizer()
-    >>> X = vectorizer.fit_transform(corpus)
-    >>> vectorizer.get_feature_names_out()
-    array(['and', 'document', 'first', 'is', 'one', 'second', 'the', 'third',
-           'this'], ...)
-    >>> print(X.shape)
-    (4, 9)
-    """
-
-    def __init__(
+    def truncate(
         self,
+        max_width: int,
         *,
-        input="content",
-        encoding="utf-8",
-        decode_error="strict",
-        strip_accents=None,
-        lowercase=True,
-        preprocessor=None,
-        tokenizer=None,
-        analyzer="word",
-        stop_words=None,
-        token_pattern=r"(?u)\b\w\w+\b",
-        ngram_range=(1, 1),
-        max_df=1.0,
-        min_df=1,
-        max_features=None,
-        vocabulary=None,
-        binary=False,
-        dtype=np.float64,
-        norm="l2",
-        use_idf=True,
-        smooth_idf=True,
-        sublinear_tf=False,
-    ):
+        overflow: Optional["OverflowMethod"] = None,
+        pad: bool = False,
+    ) -> None:
+        """Truncate text if it is longer that a given width.
 
-        super().__init__(
-            input=input,
-            encoding=encoding,
-            decode_error=decode_error,
-            strip_accents=strip_accents,
-            lowercase=lowercase,
-            preprocessor=preprocessor,
-            tokenizer=tokenizer,
-            analyzer=analyzer,
-            stop_words=stop_words,
-            token_pattern=token_pattern,
-            ngram_range=ngram_range,
-            max_df=max_df,
-            min_df=min_df,
-            max_features=max_features,
-            vocabulary=vocabulary,
-            binary=binary,
-            dtype=dtype,
-        )
-
-        self._tfidf = TfidfTransformer(
-            norm=norm, use_idf=use_idf, smooth_idf=smooth_idf, sublinear_tf=sublinear_tf
-        )
-
-    # Broadcast the TF-IDF parameters to the underlying transformer instance
-    # for easy grid search and repr
-
-    @property
-    def norm(self):
-        """Norm of each row output, can be either "l1" or "l2"."""
-        return self._tfidf.norm
-
-    @norm.setter
-    def norm(self, value):
-        self._tfidf.norm = value
-
-    @property
-    def use_idf(self):
-        """Whether or not IDF re-weighting is used."""
-        return self._tfidf.use_idf
-
-    @use_idf.setter
-    def use_idf(self, value):
-        self._tfidf.use_idf = value
-
-    @property
-    def smooth_idf(self):
-        """Whether or not IDF weights are smoothed."""
-        return self._tfidf.smooth_idf
-
-    @smooth_idf.setter
-    def smooth_idf(self, value):
-        self._tfidf.smooth_idf = value
-
-    @property
-    def sublinear_tf(self):
-        """Whether or not sublinear TF scaling is applied."""
-        return self._tfidf.sublinear_tf
-
-    @sublinear_tf.setter
-    def sublinear_tf(self, value):
-        self._tfidf.sublinear_tf = value
-
-    @property
-    def idf_(self):
-        """Inverse document frequency vector, only defined if `use_idf=True`.
-
-        Returns
-        -------
-        ndarray of shape (n_features,)
+        Args:
+            max_width (int): Maximum number of characters in text.
+            overflow (str, optional): Overflow method: "crop", "fold", or "ellipsis". Defaults to None, to use self.overflow.
+            pad (bool, optional): Pad with spaces if the length is less than max_width. Defaults to False.
         """
-        return self._tfidf.idf_
+        _overflow = overflow or self.overflow or DEFAULT_OVERFLOW
+        if _overflow != "ignore":
+            length = cell_len(self.plain)
+            if length > max_width:
+                if _overflow == "ellipsis":
+                    self.plain = set_cell_size(self.plain, max_width - 1) + "…"
+                else:
+                    self.plain = set_cell_size(self.plain, max_width)
+            if pad and length < max_width:
+                spaces = max_width - length
+                self._text = [f"{self.plain}{' ' * spaces}"]
+                self._length = len(self.plain)
 
-    @idf_.setter
-    def idf_(self, value):
-        self._validate_vocabulary()
-        if hasattr(self, "vocabulary_"):
-            if len(self.vocabulary_) != len(value):
-                raise ValueError(
-                    "idf length = %d must be equal to vocabulary size = %d"
-                    % (len(value), len(self.vocabulary))
-                )
-        self._tfidf.idf_ = value
-
-    def _check_params(self):
-        if self.dtype not in FLOAT_DTYPES:
-            warnings.warn(
-                "Only {} 'dtype' should be used. {} 'dtype' will "
-                "be converted to np.float64.".format(FLOAT_DTYPES, self.dtype),
-                UserWarning,
+    def _trim_spans(self) -> None:
+        """Remove or modify any spans that are over the end of the text."""
+        max_offset = len(self.plain)
+        _Span = Span
+        self._spans[:] = [
+            (
+                span
+                if span.end < max_offset
+                else _Span(span.start, min(max_offset, span.end), span.style)
             )
+            for span in self._spans
+            if span.start < max_offset
+        ]
 
-    def fit(self, raw_documents, y=None):
-        """Learn vocabulary and idf from training set.
+    def pad(self, count: int, character: str = " ") -> None:
+        """Pad left and right with a given number of characters.
 
-        Parameters
-        ----------
-        raw_documents : iterable
-            An iterable which generates either str, unicode or file objects.
-
-        y : None
-            This parameter is not needed to compute tfidf.
-
-        Returns
-        -------
-        self : object
-            Fitted vectorizer.
+        Args:
+            count (int): Width of padding.
+            character (str): The character to pad with. Must be a string of length 1.
         """
-        self._check_params()
-        self._warn_for_unused_params()
-        X = super().fit_transform(raw_documents)
-        self._tfidf.fit(X)
+        assert len(character) == 1, "Character must be a string of length 1"
+        if count:
+            pad_characters = character * count
+            self.plain = f"{pad_characters}{self.plain}{pad_characters}"
+            _Span = Span
+            self._spans[:] = [
+                _Span(start + count, end + count, style)
+                for start, end, style in self._spans
+            ]
+
+    def pad_left(self, count: int, character: str = " ") -> None:
+        """Pad the left with a given character.
+
+        Args:
+            count (int): Number of characters to pad.
+            character (str, optional): Character to pad with. Defaults to " ".
+        """
+        assert len(character) == 1, "Character must be a string of length 1"
+        if count:
+            self.plain = f"{character * count}{self.plain}"
+            _Span = Span
+            self._spans[:] = [
+                _Span(start + count, end + count, style)
+                for start, end, style in self._spans
+            ]
+
+    def pad_right(self, count: int, character: str = " ") -> None:
+        """Pad the right with a given character.
+
+        Args:
+            count (int): Number of characters to pad.
+            character (str, optional): Character to pad with. Defaults to " ".
+        """
+        assert len(character) == 1, "Character must be a string of length 1"
+        if count:
+            self.plain = f"{self.plain}{character * count}"
+
+    def align(self, align: AlignMethod, width: int, character: str = " ") -> None:
+        """Align text to a given width.
+
+        Args:
+            align (AlignMethod): One of "left", "center", or "right".
+            width (int): Desired width.
+            character (str, optional): Character to pad with. Defaults to " ".
+        """
+        self.truncate(width)
+        excess_space = width - cell_len(self.plain)
+        if excess_space:
+            if align == "left":
+                self.pad_right(excess_space, character)
+            elif align == "center":
+                left = excess_space // 2
+                self.pad_left(left, character)
+                self.pad_right(excess_space - left, character)
+            else:
+                self.pad_left(excess_space, character)
+
+    def append(
+        self, text: Union["Text", str], style: Optional[Union[str, "Style"]] = None
+    ) -> "Text":
+        """Add text with an optional style.
+
+        Args:
+            text (Union[Text, str]): A str or Text to append.
+            style (str, optional): A style name. Defaults to None.
+
+        Returns:
+            Text: Returns self for chaining.
+        """
+
+        if not isinstance(text, (str, Text)):
+            raise TypeError("Only str or Text can be appended to Text")
+
+        if len(text):
+            if isinstance(text, str):
+                sanitized_text = strip_control_codes(text)
+                self._text.append(sanitized_text)
+                offset = len(self)
+                text_length = len(sanitized_text)
+                if style:
+                    self._spans.append(Span(offset, offset + text_length, style))
+                self._length += text_length
+            elif isinstance(text, Text):
+                _Span = Span
+                if style is not None:
+                    raise ValueError(
+                        "style must not be set when appending Text instance"
+                    )
+                text_length = self._length
+                if text.style:
+                    self._spans.append(
+                        _Span(text_length, text_length + len(text), text.style)
+                    )
+                self._text.append(text.plain)
+                self._spans.extend(
+                    _Span(start + text_length, end + text_length, style)
+                    for start, end, style in text._spans.copy()
+                )
+                self._length += len(text)
         return self
 
-    def fit_transform(self, raw_documents, y=None):
-        """Learn vocabulary and idf, return document-term matrix.
+    def append_text(self, text: "Text") -> "Text":
+        """Append another Text instance. This method is more performant that Text.append, but
+        only works for Text.
 
-        This is equivalent to fit followed by transform, but more efficiently
-        implemented.
+        Args:
+            text (Text): The Text instance to append to this instance.
 
-        Parameters
-        ----------
-        raw_documents : iterable
-            An iterable which generates either str, unicode or file objects.
-
-        y : None
-            This parameter is ignored.
-
-        Returns
-        -------
-        X : sparse matrix of (n_samples, n_features)
-            Tf-idf-weighted document-term matrix.
+        Returns:
+            Text: Returns self for chaining.
         """
-        self._check_params()
-        X = super().fit_transform(raw_documents)
-        self._tfidf.fit(X)
-        # X is already a transformed view of raw_documents so
-        # we set copy to False
-        return self._tfidf.transform(X, copy=False)
+        _Span = Span
+        text_length = self._length
+        if text.style:
+            self._spans.append(_Span(text_length, text_length + len(text), text.style))
+        self._text.append(text.plain)
+        self._spans.extend(
+            _Span(start + text_length, end + text_length, style)
+            for start, end, style in text._spans.copy()
+        )
+        self._length += len(text)
+        return self
 
-    def transform(self, raw_documents):
-        """Transform documents to document-term matrix.
+    def append_tokens(
+        self, tokens: Iterable[Tuple[str, Optional[StyleType]]]
+    ) -> "Text":
+        """Append iterable of str and style. Style may be a Style instance or a str style definition.
 
-        Uses the vocabulary and document frequencies (df) learned by fit (or
-        fit_transform).
+        Args:
+            tokens (Iterable[Tuple[str, Optional[StyleType]]]): An iterable of tuples containing str content and style.
 
-        Parameters
-        ----------
-        raw_documents : iterable
-            An iterable which generates either str, unicode or file objects.
-
-        Returns
-        -------
-        X : sparse matrix of (n_samples, n_features)
-            Tf-idf-weighted document-term matrix.
+        Returns:
+            Text: Returns self for chaining.
         """
-        check_is_fitted(self, msg="The TF-IDF vectorizer is not fitted")
+        append_text = self._text.append
+        append_span = self._spans.append
+        _Span = Span
+        offset = len(self)
+        for content, style in tokens:
+            content = strip_control_codes(content)
+            append_text(content)
+            if style:
+                append_span(_Span(offset, offset + len(content), style))
+            offset += len(content)
+        self._length = offset
+        return self
 
-        X = super().transform(raw_documents)
-        return self._tfidf.transform(X, copy=False)
+    def copy_styles(self, text: "Text") -> None:
+        """Copy styles from another Text instance.
 
-    def _more_tags(self):
-        return {"X_types": ["string"], "_skip_test": True}
+        Args:
+            text (Text): A Text instance to copy styles from, must be the same length.
+        """
+        self._spans.extend(text._spans)
+
+    def split(
+        self,
+        separator: str = "\n",
+        *,
+        include_separator: bool = False,
+        allow_blank: bool = False,
+    ) -> Lines:
+        """Split rich text in to lines, preserving styles.
+
+        Args:
+            separator (str, optional): String to split on. Defaults to "\\\\n".
+            include_separator (bool, optional): Include the separator in the lines. Defaults to False.
+            allow_blank (bool, optional): Return a blank line if the text ends with a separator. Defaults to False.
+
+        Returns:
+            List[RichText]: A list of rich text, one per line of the original.
+        """
+        assert separator, "separator must not be empty"
+
+        text = self.plain
+        if separator not in text:
+            return Lines([self.copy()])
+
+        if include_separator:
+            lines = self.divide(
+                match.end() for match in re.finditer(re.escape(separator), text)
+            )
+        else:
+
+            def flatten_spans() -> Iterable[int]:
+                for match in re.finditer(re.escape(separator), text):
+                    start, end = match.span()
+                    yield start
+                    yield end
+
+            lines = Lines(
+                line for line in self.divide(flatten_spans()) if line.plain != separator
+            )
+
+        if not allow_blank and text.endswith(separator):
+            lines.pop()
+
+        return lines
+
+    def divide(self, offsets: Iterable[int]) -> Lines:
+        """Divide text in to a number of lines at given offsets.
+
+        Args:
+            offsets (Iterable[int]): Offsets used to divide text.
+
+        Returns:
+            Lines: New RichText instances between offsets.
+        """
+        _offsets = list(offsets)
+
+        if not _offsets:
+            return Lines([self.copy()])
+
+        text = self.plain
+        text_length = len(text)
+        divide_offsets = [0, *_offsets, text_length]
+        line_ranges = list(zip(divide_offsets, divide_offsets[1:]))
+
+        style = self.style
+        justify = self.justify
+        overflow = self.overflow
+        _Text = Text
+        new_lines = Lines(
+            _Text(
+                text[start:end],
+                style=style,
+                justify=justify,
+                overflow=overflow,
+            )
+            for start, end in line_ranges
+        )
+        if not self._spans:
+            return new_lines
+
+        _line_appends = [line._spans.append for line in new_lines._lines]
+        line_count = len(line_ranges)
+        _Span = Span
+
+        for span_start, span_end, style in self._spans:
+            lower_bound = 0
+            upper_bound = line_count
+            start_line_no = (lower_bound + upper_bound) // 2
+
+            while True:
+                line_start, line_end = line_ranges[start_line_no]
+                if span_start < line_start:
+                    upper_bound = start_line_no - 1
+                elif span_start > line_end:
+                    lower_bound = start_line_no + 1
+                else:
+                    break
+                start_line_no = (lower_bound + upper_bound) // 2
+
+            if span_end < line_end:
+                end_line_no = start_line_no
+            else:
+                end_line_no = lower_bound = start_line_no
+                upper_bound = line_count
+
+                while True:
+                    line_start, line_end = line_ranges[end_line_no]
+                    if span_end < line_start:
+                        upper_bound = end_line_no - 1
+                    elif span_end > line_end:
+                        lower_bound = end_line_no + 1
+                    else:
+                        break
+                    end_line_no = (lower_bound + upper_bound) // 2
+
+            for line_no in range(start_line_no, end_line_no + 1):
+                line_start, line_end = line_ranges[line_no]
+                new_start = max(0, span_start - line_start)
+                new_end = min(span_end - line_start, line_end - line_start)
+                if new_end > new_start:
+                    _line_appends[line_no](_Span(new_start, new_end, style))
+
+        return new_lines
+
+    def right_crop(self, amount: int = 1) -> None:
+        """Remove a number of characters from the end of the text."""
+        max_offset = len(self.plain) - amount
+        _Span = Span
+        self._spans[:] = [
+            (
+                span
+                if span.end < max_offset
+                else _Span(span.start, min(max_offset, span.end), span.style)
+            )
+            for span in self._spans
+            if span.start < max_offset
+        ]
+        self._text = [self.plain[:-amount]]
+        self._length -= amount
+
+    def wrap(
+        self,
+        console: "Console",
+        width: int,
+        *,
+        justify: Optional["JustifyMethod"] = None,
+        overflow: Optional["OverflowMethod"] = None,
+        tab_size: int = 8,
+        no_wrap: Optional[bool] = None,
+    ) -> Lines:
+        """Word wrap the text.
+
+        Args:
+            console (Console): Console instance.
+            width (int): Number of cells available per line.
+            justify (str, optional): Justify method: "default", "left", "center", "full", "right". Defaults to "default".
+            overflow (str, optional): Overflow method: "crop", "fold", or "ellipsis". Defaults to None.
+            tab_size (int, optional): Default tab size. Defaults to 8.
+            no_wrap (bool, optional): Disable wrapping, Defaults to False.
+
+        Returns:
+            Lines: Number of lines.
+        """
+        wrap_justify = justify or self.justify or DEFAULT_JUSTIFY
+        wrap_overflow = overflow or self.overflow or DEFAULT_OVERFLOW
+
+        no_wrap = pick_bool(no_wrap, self.no_wrap, False) or overflow == "ignore"
+
+        lines = Lines()
+        for line in self.split(allow_blank=True):
+            if "\t" in line:
+                line.expand_tabs(tab_size)
+            if no_wrap:
+                new_lines = Lines([line])
+            else:
+                offsets = divide_line(str(line), width, fold=wrap_overflow == "fold")
+                new_lines = line.divide(offsets)
+            for line in new_lines:
+                line.rstrip_end(width)
+            if wrap_justify:
+                new_lines.justify(
+                    console, width, justify=wrap_justify, overflow=wrap_overflow
+                )
+            for line in new_lines:
+                line.truncate(width, overflow=wrap_overflow)
+            lines.extend(new_lines)
+        return lines
+
+    def fit(self, width: int) -> Lines:
+        """Fit the text in to given width by chopping in to lines.
+
+        Args:
+            width (int): Maximum characters in a line.
+
+        Returns:
+            Lines: Lines container.
+        """
+        lines: Lines = Lines()
+        append = lines.append
+        for line in self.split():
+            line.set_length(width)
+            append(line)
+        return lines
+
+    def detect_indentation(self) -> int:
+        """Auto-detect indentation of code.
+
+        Returns:
+            int: Number of spaces used to indent code.
+        """
+
+        _indentations = {
+            len(match.group(1))
+            for match in re.finditer(r"^( *)(.*)$", self.plain, flags=re.MULTILINE)
+        }
+
+        try:
+            indentation = (
+                reduce(gcd, [indent for indent in _indentations if not indent % 2]) or 1
+            )
+        except TypeError:
+            indentation = 1
+
+        return indentation
+
+    def with_indent_guides(
+        self,
+        indent_size: Optional[int] = None,
+        *,
+        character: str = "│",
+        style: StyleType = "dim green",
+    ) -> "Text":
+        """Adds indent guide lines to text.
+
+        Args:
+            indent_size (Optional[int]): Size of indentation, or None to auto detect. Defaults to None.
+            character (str, optional): Character to use for indentation. Defaults to "│".
+            style (Union[Style, str], optional): Style of indent guides.
+
+        Returns:
+            Text: New text with indentation guides.
+        """
+
+        _indent_size = self.detect_indentation() if indent_size is None else indent_size
+
+        text = self.copy()
+        text.expand_tabs()
+        indent_line = f"{character}{' ' * (_indent_size - 1)}"
+
+        re_indent = re.compile(r"^( *)(.*)$")
+        new_lines: List[Text] = []
+        add_line = new_lines.append
+        blank_lines = 0
+        for line in text.split(allow_blank=True):
+            match = re_indent.match(line.plain)
+            if not match or not match.group(2):
+                blank_lines += 1
+                continue
+            indent = match.group(1)
+            full_indents, remaining_space = divmod(len(indent), _indent_size)
+            new_indent = f"{indent_line * full_indents}{' ' * remaining_space}"
+            line.plain = new_indent + line.plain[len(new_indent) :]
+            line.stylize(style, 0, len(new_indent))
+            if blank_lines:
+                new_lines.extend([Text(new_indent, style=style)] * blank_lines)
+                blank_lines = 0
+            add_line(line)
+        if blank_lines:
+            new_lines.extend([Text("", style=style)] * blank_lines)
+
+        new_text = text.blank_copy("\n").join(new_lines)
+        return new_text
+
+
+if __name__ == "__main__":  # pragma: no cover
+    from pip._vendor.rich.console import Console
+
+    text = Text(
+        """\nLorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.\n"""
+    )
+    text.highlight_words(["Lorem"], "bold")
+    text.highlight_words(["ipsum"], "italic")
+
+    console = Console()
+
+    console.rule("justify='left'")
+    console.print(text, style="red")
+    console.print()
+
+    console.rule("justify='center'")
+    console.print(text, style="green", justify="center")
+    console.print()
+
+    console.rule("justify='right'")
+    console.print(text, style="blue", justify="right")
+    console.print()
+
+    console.rule("justify='full'")
+    console.print(text, style="magenta", justify="full")
+    console.print()

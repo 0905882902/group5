@@ -1,177 +1,82 @@
-"""Rich text and beautiful formatting in the terminal."""
+"""
+    Pygments
+    ~~~~~~~~
 
-import os
-from typing import IO, TYPE_CHECKING, Any, Callable, Optional, Union
+    Pygments is a syntax highlighting package written in Python.
 
-from ._extension import load_ipython_extension  # noqa: F401
+    It is a generic syntax highlighter for general use in all kinds of software
+    such as forum systems, wikis or other applications that need to prettify
+    source code. Highlights are:
 
-__all__ = ["get_console", "reconfigure", "print", "inspect", "print_json"]
+    * a wide range of common languages and markup formats is supported
+    * special attention is paid to details, increasing quality by a fair amount
+    * support for new languages and formats are added easily
+    * a number of output formats, presently HTML, LaTeX, RTF, SVG, all image
+      formats that PIL supports, and ANSI sequences
+    * it is usable as a command-line tool and as a library
+    * ... and it highlights even Brainfuck!
 
-if TYPE_CHECKING:
-    from .console import Console
+    The `Pygments master branch`_ is installable with ``easy_install Pygments==dev``.
 
-# Global console used by alternative print
-_console: Optional["Console"] = None
+    .. _Pygments master branch:
+       https://github.com/pygments/pygments/archive/master.zip#egg=Pygments-dev
 
-try:
-    _IMPORT_CWD = os.path.abspath(os.getcwd())
-except FileNotFoundError:
-    # Can happen if the cwd has been deleted
-    _IMPORT_CWD = ""
+    :copyright: Copyright 2006-2025 by the Pygments team, see AUTHORS.
+    :license: BSD, see LICENSE for details.
+"""
+from io import StringIO, BytesIO
+
+__version__ = '2.19.2'
+__docformat__ = 'restructuredtext'
+
+__all__ = ['lex', 'format', 'highlight']
 
 
-def get_console() -> "Console":
-    """Get a global :class:`~rich.console.Console` instance. This function is used when Rich requires a Console,
-    and hasn't been explicitly given one.
-
-    Returns:
-        Console: A console instance.
+def lex(code, lexer):
     """
-    global _console
-    if _console is None:
-        from .console import Console
-
-        _console = Console()
-
-    return _console
-
-
-def reconfigure(*args: Any, **kwargs: Any) -> None:
-    """Reconfigures the global console by replacing it with another.
-
-    Args:
-        *args (Any): Positional arguments for the replacement :class:`~rich.console.Console`.
-        **kwargs (Any): Keyword arguments for the replacement :class:`~rich.console.Console`.
+    Lex `code` with the `lexer` (must be a `Lexer` instance)
+    and return an iterable of tokens. Currently, this only calls
+    `lexer.get_tokens()`.
     """
-    from pip._vendor.rich.console import Console
+    try:
+        return lexer.get_tokens(code)
+    except TypeError:
+        # Heuristic to catch a common mistake.
+        from pip._vendor.pygments.lexer import RegexLexer
+        if isinstance(lexer, type) and issubclass(lexer, RegexLexer):
+            raise TypeError('lex() argument must be a lexer instance, '
+                            'not a class')
+        raise
 
-    new_console = Console(*args, **kwargs)
-    _console = get_console()
-    _console.__dict__ = new_console.__dict__
 
-
-def print(
-    *objects: Any,
-    sep: str = " ",
-    end: str = "\n",
-    file: Optional[IO[str]] = None,
-    flush: bool = False,
-) -> None:
-    r"""Print object(s) supplied via positional arguments.
-    This function has an identical signature to the built-in print.
-    For more advanced features, see the :class:`~rich.console.Console` class.
-
-    Args:
-        sep (str, optional): Separator between printed objects. Defaults to " ".
-        end (str, optional): Character to write at end of output. Defaults to "\\n".
-        file (IO[str], optional): File to write to, or None for stdout. Defaults to None.
-        flush (bool, optional): Has no effect as Rich always flushes output. Defaults to False.
-
+def format(tokens, formatter, outfile=None):  # pylint: disable=redefined-builtin
     """
-    from .console import Console
+    Format ``tokens`` (an iterable of tokens) with the formatter ``formatter``
+    (a `Formatter` instance).
 
-    write_console = get_console() if file is None else Console(file=file)
-    return write_console.print(*objects, sep=sep, end=end)
-
-
-def print_json(
-    json: Optional[str] = None,
-    *,
-    data: Any = None,
-    indent: Union[None, int, str] = 2,
-    highlight: bool = True,
-    skip_keys: bool = False,
-    ensure_ascii: bool = False,
-    check_circular: bool = True,
-    allow_nan: bool = True,
-    default: Optional[Callable[[Any], Any]] = None,
-    sort_keys: bool = False,
-) -> None:
-    """Pretty prints JSON. Output will be valid JSON.
-
-    Args:
-        json (str): A string containing JSON.
-        data (Any): If json is not supplied, then encode this data.
-        indent (int, optional): Number of spaces to indent. Defaults to 2.
-        highlight (bool, optional): Enable highlighting of output: Defaults to True.
-        skip_keys (bool, optional): Skip keys not of a basic type. Defaults to False.
-        ensure_ascii (bool, optional): Escape all non-ascii characters. Defaults to False.
-        check_circular (bool, optional): Check for circular references. Defaults to True.
-        allow_nan (bool, optional): Allow NaN and Infinity values. Defaults to True.
-        default (Callable, optional): A callable that converts values that can not be encoded
-            in to something that can be JSON encoded. Defaults to None.
-        sort_keys (bool, optional): Sort dictionary keys. Defaults to False.
+    If ``outfile`` is given and a valid file object (an object with a
+    ``write`` method), the result will be written to it, otherwise it
+    is returned as a string.
     """
+    try:
+        if not outfile:
+            realoutfile = getattr(formatter, 'encoding', None) and BytesIO() or StringIO()
+            formatter.format(tokens, realoutfile)
+            return realoutfile.getvalue()
+        else:
+            formatter.format(tokens, outfile)
+    except TypeError:
+        # Heuristic to catch a common mistake.
+        from pip._vendor.pygments.formatter import Formatter
+        if isinstance(formatter, type) and issubclass(formatter, Formatter):
+            raise TypeError('format() argument must be a formatter instance, '
+                            'not a class')
+        raise
 
-    get_console().print_json(
-        json,
-        data=data,
-        indent=indent,
-        highlight=highlight,
-        skip_keys=skip_keys,
-        ensure_ascii=ensure_ascii,
-        check_circular=check_circular,
-        allow_nan=allow_nan,
-        default=default,
-        sort_keys=sort_keys,
-    )
 
-
-def inspect(
-    obj: Any,
-    *,
-    console: Optional["Console"] = None,
-    title: Optional[str] = None,
-    help: bool = False,
-    methods: bool = False,
-    docs: bool = True,
-    private: bool = False,
-    dunder: bool = False,
-    sort: bool = True,
-    all: bool = False,
-    value: bool = True,
-) -> None:
-    """Inspect any Python object.
-
-    * inspect(<OBJECT>) to see summarized info.
-    * inspect(<OBJECT>, methods=True) to see methods.
-    * inspect(<OBJECT>, help=True) to see full (non-abbreviated) help.
-    * inspect(<OBJECT>, private=True) to see private attributes (single underscore).
-    * inspect(<OBJECT>, dunder=True) to see attributes beginning with double underscore.
-    * inspect(<OBJECT>, all=True) to see all attributes.
-
-    Args:
-        obj (Any): An object to inspect.
-        title (str, optional): Title to display over inspect result, or None use type. Defaults to None.
-        help (bool, optional): Show full help text rather than just first paragraph. Defaults to False.
-        methods (bool, optional): Enable inspection of callables. Defaults to False.
-        docs (bool, optional): Also render doc strings. Defaults to True.
-        private (bool, optional): Show private attributes (beginning with underscore). Defaults to False.
-        dunder (bool, optional): Show attributes starting with double underscore. Defaults to False.
-        sort (bool, optional): Sort attributes alphabetically. Defaults to True.
-        all (bool, optional): Show all attributes. Defaults to False.
-        value (bool, optional): Pretty print value. Defaults to True.
+def highlight(code, lexer, formatter, outfile=None):
     """
-    _console = console or get_console()
-    from pip._vendor.rich._inspect import Inspect
-
-    # Special case for inspect(inspect)
-    is_inspect = obj is inspect
-
-    _inspect = Inspect(
-        obj,
-        title=title,
-        help=is_inspect or help,
-        methods=is_inspect or methods,
-        docs=is_inspect or docs,
-        private=private,
-        dunder=dunder,
-        sort=sort,
-        all=all,
-        value=value,
-    )
-    _console.print(_inspect)
-
-
-if __name__ == "__main__":  # pragma: no cover
-    print("Hello, **World**")
+    This is the most high-level highlighting function. It combines `lex` and
+    `format` in one function.
+    """
+    return format(lex(code, lexer), formatter, outfile)
