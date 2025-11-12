@@ -1,121 +1,76 @@
 import numpy as np
-import pytest
 
-import pandas as pd
+from pandas import (
+    Categorical,
+    IntervalIndex,
+    Series,
+    date_range,
+)
 import pandas._testing as tm
-from pandas.tests.base.common import allow_na_ops
 
 
-@pytest.mark.filterwarnings(r"ignore:PeriodDtype\[B\] is deprecated:FutureWarning")
-def test_unique(index_or_series_obj):
-    obj = index_or_series_obj
-    obj = np.repeat(obj, range(1, len(obj) + 1))
-    result = obj.unique()
+class TestUnique:
+    def test_unique_uint64(self):
+        ser = Series([1, 2, 2**63, 2**63], dtype=np.uint64)
+        res = ser.unique()
+        exp = np.array([1, 2, 2**63], dtype=np.uint64)
+        tm.assert_numpy_array_equal(res, exp)
 
-    # dict.fromkeys preserves the order
-    unique_values = list(dict.fromkeys(obj.values))
-    if isinstance(obj, pd.MultiIndex):
-        expected = pd.MultiIndex.from_tuples(unique_values)
-        expected.names = obj.names
-        tm.assert_index_equal(result, expected, exact=True)
-    elif isinstance(obj, pd.Index):
-        expected = pd.Index(unique_values, dtype=obj.dtype)
-        if isinstance(obj.dtype, pd.DatetimeTZDtype):
-            expected = expected.normalize()
-        tm.assert_index_equal(result, expected, exact=True)
-    else:
-        expected = np.array(unique_values)
+    def test_unique_data_ownership(self):
+        # it works! GH#1807
+        Series(Series(["a", "c", "b"]).unique()).sort_values()
+
+    def test_unique(self):
+        # GH#714 also, dtype=float
+        ser = Series([1.2345] * 100)
+        ser[::2] = np.nan
+        result = ser.unique()
+        assert len(result) == 2
+
+        # explicit f4 dtype
+        ser = Series([1.2345] * 100, dtype="f4")
+        ser[::2] = np.nan
+        result = ser.unique()
+        assert len(result) == 2
+
+    def test_unique_nan_object_dtype(self):
+        # NAs in object arrays GH#714
+        ser = Series(["foo"] * 100, dtype="O")
+        ser[::2] = np.nan
+        result = ser.unique()
+        assert len(result) == 2
+
+    def test_unique_none(self):
+        # decision about None
+        ser = Series([1, 2, 3, None, None, None], dtype=object)
+        result = ser.unique()
+        expected = np.array([1, 2, 3, None], dtype=object)
         tm.assert_numpy_array_equal(result, expected)
 
+    def test_unique_categorical(self):
+        # GH#18051
+        cat = Categorical([])
+        ser = Series(cat)
+        result = ser.unique()
+        tm.assert_categorical_equal(result, cat)
 
-@pytest.mark.filterwarnings(r"ignore:PeriodDtype\[B\] is deprecated:FutureWarning")
-@pytest.mark.parametrize("null_obj", [np.nan, None])
-def test_unique_null(null_obj, index_or_series_obj):
-    obj = index_or_series_obj
+        cat = Categorical([np.nan])
+        ser = Series(cat)
+        result = ser.unique()
+        tm.assert_categorical_equal(result, cat)
 
-    if not allow_na_ops(obj):
-        pytest.skip("type doesn't allow for NA operations")
-    elif len(obj) < 1:
-        pytest.skip("Test doesn't make sense on empty data")
-    elif isinstance(obj, pd.MultiIndex):
-        pytest.skip(f"MultiIndex can't hold '{null_obj}'")
+    def test_tz_unique(self):
+        # GH 46128
+        dti1 = date_range("2016-01-01", periods=3)
+        ii1 = IntervalIndex.from_breaks(dti1)
+        ser1 = Series(ii1)
+        uni1 = ser1.unique()
+        tm.assert_interval_array_equal(ser1.array, uni1)
 
-    values = obj._values
-    values[0:2] = null_obj
+        dti2 = date_range("2016-01-01", periods=3, tz="US/Eastern")
+        ii2 = IntervalIndex.from_breaks(dti2)
+        ser2 = Series(ii2)
+        uni2 = ser2.unique()
+        tm.assert_interval_array_equal(ser2.array, uni2)
 
-    klass = type(obj)
-    repeated_values = np.repeat(values, range(1, len(values) + 1))
-    obj = klass(repeated_values, dtype=obj.dtype)
-    result = obj.unique()
-
-    unique_values_raw = dict.fromkeys(obj.values)
-    # because np.nan == np.nan is False, but None == None is True
-    # np.nan would be duplicated, whereas None wouldn't
-    unique_values_not_null = [val for val in unique_values_raw if not pd.isnull(val)]
-    unique_values = [null_obj] + unique_values_not_null
-
-    if isinstance(obj, pd.Index):
-        expected = pd.Index(unique_values, dtype=obj.dtype)
-        if isinstance(obj.dtype, pd.DatetimeTZDtype):
-            result = result.normalize()
-            expected = expected.normalize()
-        tm.assert_index_equal(result, expected, exact=True)
-    else:
-        expected = np.array(unique_values, dtype=obj.dtype)
-        tm.assert_numpy_array_equal(result, expected)
-
-
-def test_nunique(index_or_series_obj):
-    obj = index_or_series_obj
-    obj = np.repeat(obj, range(1, len(obj) + 1))
-    expected = len(obj.unique())
-    assert obj.nunique(dropna=False) == expected
-
-
-@pytest.mark.parametrize("null_obj", [np.nan, None])
-def test_nunique_null(null_obj, index_or_series_obj):
-    obj = index_or_series_obj
-
-    if not allow_na_ops(obj):
-        pytest.skip("type doesn't allow for NA operations")
-    elif isinstance(obj, pd.MultiIndex):
-        pytest.skip(f"MultiIndex can't hold '{null_obj}'")
-
-    values = obj._values
-    values[0:2] = null_obj
-
-    klass = type(obj)
-    repeated_values = np.repeat(values, range(1, len(values) + 1))
-    obj = klass(repeated_values, dtype=obj.dtype)
-
-    if isinstance(obj, pd.CategoricalIndex):
-        assert obj.nunique() == len(obj.categories)
-        assert obj.nunique(dropna=False) == len(obj.categories) + 1
-    else:
-        num_unique_values = len(obj.unique())
-        assert obj.nunique() == max(0, num_unique_values - 1)
-        assert obj.nunique(dropna=False) == max(0, num_unique_values)
-
-
-@pytest.mark.single_cpu
-def test_unique_bad_unicode(index_or_series):
-    # regression test for #34550
-    uval = "\ud83d"  # smiley emoji
-
-    obj = index_or_series([uval] * 2, dtype=object)
-    result = obj.unique()
-
-    if isinstance(obj, pd.Index):
-        expected = pd.Index(["\ud83d"], dtype=object)
-        tm.assert_index_equal(result, expected, exact=True)
-    else:
-        expected = np.array(["\ud83d"], dtype=object)
-        tm.assert_numpy_array_equal(result, expected)
-
-
-@pytest.mark.parametrize("dropna", [True, False])
-def test_nunique_dropna(dropna):
-    # GH37566
-    ser = pd.Series(["yes", "yes", pd.NA, np.nan, None, pd.NaT])
-    res = ser.nunique(dropna)
-    assert res == 1 if dropna else 5
+        assert uni1.dtype != uni2.dtype

@@ -3,225 +3,250 @@ import pytest
 
 import pandas as pd
 from pandas import (
-    DataFrame,
-    MultiIndex,
     Series,
+    date_range,
 )
 import pandas._testing as tm
+from pandas.core import algorithms
+from pandas.core.arrays import PeriodArray
 
 
-class TestDataFrameIsIn:
+class TestSeriesIsIn:
     def test_isin(self):
-        # GH#4211
-        df = DataFrame(
-            {
-                "vals": [1, 2, 3, 4],
-                "ids": ["a", "b", "f", "n"],
-                "ids2": ["a", "n", "c", "n"],
-            },
-            index=["foo", "bar", "baz", "qux"],
-        )
-        other = ["a", "b", "c"]
+        s = Series(["A", "B", "C", "a", "B", "B", "A", "C"])
 
-        result = df.isin(other)
-        expected = DataFrame([df.loc[s].isin(other) for s in df.index])
-        tm.assert_frame_equal(result, expected)
+        result = s.isin(["A", "C"])
+        expected = Series([True, False, True, False, False, False, True, True])
+        tm.assert_series_equal(result, expected)
 
-    @pytest.mark.parametrize("empty", [[], Series(dtype=object), np.array([])])
-    def test_isin_empty(self, empty):
-        # GH#16991
-        df = DataFrame({"A": ["a", "b", "c"], "B": ["a", "e", "f"]})
-        expected = DataFrame(False, df.index, df.columns)
+        # GH#16012
+        # This specific issue has to have a series over 1e6 in len, but the
+        # comparison array (in_list) must be large enough so that numpy doesn't
+        # do a manual masking trick that will avoid this issue altogether
+        s = Series(list("abcdefghijk" * 10**5))
+        # If numpy doesn't do the manual comparison/mask, these
+        # unorderable mixed types are what cause the exception in numpy
+        in_list = [-1, "a", "b", "G", "Y", "Z", "E", "K", "E", "S", "I", "R", "R"] * 6
 
-        result = df.isin(empty)
-        tm.assert_frame_equal(result, expected)
-
-    def test_isin_dict(self):
-        df = DataFrame({"A": ["a", "b", "c"], "B": ["a", "e", "f"]})
-        d = {"A": ["a"]}
-
-        expected = DataFrame(False, df.index, df.columns)
-        expected.loc[0, "A"] = True
-
-        result = df.isin(d)
-        tm.assert_frame_equal(result, expected)
-
-        # non unique columns
-        df = DataFrame({"A": ["a", "b", "c"], "B": ["a", "e", "f"]})
-        df.columns = ["A", "A"]
-        expected = DataFrame(False, df.index, df.columns)
-        expected.loc[0, "A"] = True
-        result = df.isin(d)
-        tm.assert_frame_equal(result, expected)
+        assert s.isin(in_list).sum() == 200000
 
     def test_isin_with_string_scalar(self):
         # GH#4763
-        df = DataFrame(
-            {
-                "vals": [1, 2, 3, 4],
-                "ids": ["a", "b", "f", "n"],
-                "ids2": ["a", "n", "c", "n"],
-            },
-            index=["foo", "bar", "baz", "qux"],
-        )
+        s = Series(["A", "B", "C", "a", "B", "B", "A", "C"])
         msg = (
-            r"only list-like or dict-like objects are allowed "
-            r"to be passed to DataFrame.isin\(\), you passed a 'str'"
+            r"only list-like objects are allowed to be passed to isin\(\), "
+            r"you passed a `str`"
         )
         with pytest.raises(TypeError, match=msg):
-            df.isin("a")
+            s.isin("a")
 
+        s = Series(["aaa", "b", "c"])
         with pytest.raises(TypeError, match=msg):
-            df.isin("aaa")
+            s.isin("aaa")
 
-    def test_isin_df(self):
-        df1 = DataFrame({"A": [1, 2, 3, 4], "B": [2, np.nan, 4, 4]})
-        df2 = DataFrame({"A": [0, 2, 12, 4], "B": [2, np.nan, 4, 5]})
-        expected = DataFrame(False, df1.index, df1.columns)
-        result = df1.isin(df2)
-        expected.loc[[1, 3], "A"] = True
-        expected.loc[[0, 2], "B"] = True
-        tm.assert_frame_equal(result, expected)
+    def test_isin_datetimelike_mismatched_reso(self):
+        expected = Series([True, True, False, False, False])
 
-        # partial overlapping columns
-        df2.columns = ["A", "C"]
-        result = df1.isin(df2)
-        expected["B"] = False
-        tm.assert_frame_equal(result, expected)
+        ser = Series(date_range("jan-01-2013", "jan-05-2013"))
 
-    def test_isin_tuples(self):
-        # GH#16394
-        df = DataFrame({"A": [1, 2, 3], "B": ["a", "b", "f"]})
-        df["C"] = list(zip(df["A"], df["B"]))
-        result = df["C"].isin([(1, "a")])
-        tm.assert_series_equal(result, Series([True, False, False], name="C"))
+        # fails on dtype conversion in the first place
+        day_values = np.asarray(ser[0:2].values).astype("datetime64[D]")
+        result = ser.isin(day_values)
+        tm.assert_series_equal(result, expected)
 
-    def test_isin_df_dupe_values(self):
-        df1 = DataFrame({"A": [1, 2, 3, 4], "B": [2, np.nan, 4, 4]})
-        # just cols duped
-        df2 = DataFrame([[0, 2], [12, 4], [2, np.nan], [4, 5]], columns=["B", "B"])
-        msg = r"cannot compute isin with a duplicate axis\."
-        with pytest.raises(ValueError, match=msg):
-            df1.isin(df2)
+        dta = ser[:2]._values.astype("M8[s]")
+        result = ser.isin(dta)
+        tm.assert_series_equal(result, expected)
 
-        # just index duped
-        df2 = DataFrame(
-            [[0, 2], [12, 4], [2, np.nan], [4, 5]],
-            columns=["A", "B"],
-            index=[0, 0, 1, 1],
-        )
-        with pytest.raises(ValueError, match=msg):
-            df1.isin(df2)
+    def test_isin_datetimelike_mismatched_reso_list(self):
+        expected = Series([True, True, False, False, False])
 
-        # cols and index:
-        df2.columns = ["B", "B"]
-        with pytest.raises(ValueError, match=msg):
-            df1.isin(df2)
+        ser = Series(date_range("jan-01-2013", "jan-05-2013"))
 
-    def test_isin_dupe_self(self):
-        other = DataFrame({"A": [1, 0, 1, 0], "B": [1, 1, 0, 0]})
-        df = DataFrame([[1, 1], [1, 0], [0, 0]], columns=["A", "A"])
-        result = df.isin(other)
-        expected = DataFrame(False, index=df.index, columns=df.columns)
-        expected.loc[0] = True
-        expected.iloc[1, 1] = True
-        tm.assert_frame_equal(result, expected)
+        dta = ser[:2]._values.astype("M8[s]")
+        result = ser.isin(list(dta))
+        tm.assert_series_equal(result, expected)
 
-    def test_isin_against_series(self):
-        df = DataFrame(
-            {"A": [1, 2, 3, 4], "B": [2, np.nan, 4, 4]}, index=["a", "b", "c", "d"]
-        )
-        s = Series([1, 3, 11, 4], index=["a", "b", "c", "d"])
-        expected = DataFrame(False, index=df.index, columns=df.columns)
-        expected.loc["a", "A"] = True
-        expected.loc["d"] = True
-        result = df.isin(s)
-        tm.assert_frame_equal(result, expected)
+    def test_isin_with_i8(self):
+        # GH#5021
 
-    def test_isin_multiIndex(self):
-        idx = MultiIndex.from_tuples(
-            [
-                (0, "a", "foo"),
-                (0, "a", "bar"),
-                (0, "b", "bar"),
-                (0, "b", "baz"),
-                (2, "a", "foo"),
-                (2, "a", "bar"),
-                (2, "c", "bar"),
-                (2, "c", "baz"),
-                (1, "b", "foo"),
-                (1, "b", "bar"),
-                (1, "c", "bar"),
-                (1, "c", "baz"),
-            ]
-        )
-        df1 = DataFrame({"A": np.ones(12), "B": np.zeros(12)}, index=idx)
-        df2 = DataFrame(
-            {
-                "A": [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1],
-                "B": [1, 1, 0, 1, 1, 0, 0, 1, 1, 1, 1, 1],
-            }
-        )
-        # against regular index
-        expected = DataFrame(False, index=df1.index, columns=df1.columns)
-        result = df1.isin(df2)
-        tm.assert_frame_equal(result, expected)
+        expected = Series([True, True, False, False, False])
+        expected2 = Series([False, True, False, False, False])
 
-        df2.index = idx
-        expected = df2.values.astype(bool)
-        expected[:, 1] = ~expected[:, 1]
-        expected = DataFrame(expected, columns=["A", "B"], index=idx)
+        # datetime64[ns]
+        s = Series(date_range("jan-01-2013", "jan-05-2013"))
 
-        result = df1.isin(df2)
-        tm.assert_frame_equal(result, expected)
+        result = s.isin(s[0:2])
+        tm.assert_series_equal(result, expected)
 
-    def test_isin_empty_datetimelike(self):
-        # GH#15473
-        df1_ts = DataFrame({"date": pd.to_datetime(["2014-01-01", "2014-01-02"])})
-        df1_td = DataFrame({"date": [pd.Timedelta(1, "s"), pd.Timedelta(2, "s")]})
-        df2 = DataFrame({"date": []})
-        df3 = DataFrame()
+        result = s.isin(s[0:2].values)
+        tm.assert_series_equal(result, expected)
 
-        expected = DataFrame({"date": [False, False]})
+        result = s.isin([s[1]])
+        tm.assert_series_equal(result, expected2)
 
-        result = df1_ts.isin(df2)
-        tm.assert_frame_equal(result, expected)
-        result = df1_ts.isin(df3)
-        tm.assert_frame_equal(result, expected)
+        result = s.isin([np.datetime64(s[1])])
+        tm.assert_series_equal(result, expected2)
 
-        result = df1_td.isin(df2)
-        tm.assert_frame_equal(result, expected)
-        result = df1_td.isin(df3)
-        tm.assert_frame_equal(result, expected)
+        result = s.isin(set(s[0:2]))
+        tm.assert_series_equal(result, expected)
 
-    @pytest.mark.parametrize(
-        "values",
-        [
-            DataFrame({"a": [1, 2, 3]}, dtype="category"),
-            Series([1, 2, 3], dtype="category"),
-        ],
-    )
-    def test_isin_category_frame(self, values):
-        # GH#34256
-        df = DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]})
-        expected = DataFrame({"a": [True, True, True], "b": [False, False, False]})
+        # timedelta64[ns]
+        s = Series(pd.to_timedelta(range(5), unit="d"))
+        result = s.isin(s[0:2])
+        tm.assert_series_equal(result, expected)
 
-        result = df.isin(values)
-        tm.assert_frame_equal(result, expected)
+    @pytest.mark.parametrize("empty", [[], Series(dtype=object), np.array([])])
+    def test_isin_empty(self, empty):
+        # see GH#16991
+        s = Series(["a", "b"])
+        expected = Series([False, False])
+
+        result = s.isin(empty)
+        tm.assert_series_equal(expected, result)
 
     def test_isin_read_only(self):
         # https://github.com/pandas-dev/pandas/issues/37174
         arr = np.array([1, 2, 3])
         arr.setflags(write=False)
-        df = DataFrame([1, 2, 3])
-        result = df.isin(arr)
-        expected = DataFrame([True, True, True])
-        tm.assert_frame_equal(result, expected)
+        s = Series([1, 2, 3])
+        result = s.isin(arr)
+        expected = Series([True, True, True])
+        tm.assert_series_equal(result, expected)
 
-    def test_isin_not_lossy(self):
-        # GH 53514
-        val = 1666880195890293744
-        df = DataFrame({"a": [val], "b": [1.0]})
-        result = df.isin([val])
-        expected = DataFrame({"a": [True], "b": [False]})
-        tm.assert_frame_equal(result, expected)
+    @pytest.mark.parametrize("dtype", [object, None])
+    def test_isin_dt64_values_vs_ints(self, dtype):
+        # GH#36621 dont cast integers to datetimes for isin
+        dti = date_range("2013-01-01", "2013-01-05")
+        ser = Series(dti)
+
+        comps = np.asarray([1356998400000000000], dtype=dtype)
+
+        res = dti.isin(comps)
+        expected = np.array([False] * len(dti), dtype=bool)
+        tm.assert_numpy_array_equal(res, expected)
+
+        res = ser.isin(comps)
+        tm.assert_series_equal(res, Series(expected))
+
+        res = pd.core.algorithms.isin(ser, comps)
+        tm.assert_numpy_array_equal(res, expected)
+
+    def test_isin_tzawareness_mismatch(self):
+        dti = date_range("2013-01-01", "2013-01-05")
+        ser = Series(dti)
+
+        other = dti.tz_localize("UTC")
+
+        res = dti.isin(other)
+        expected = np.array([False] * len(dti), dtype=bool)
+        tm.assert_numpy_array_equal(res, expected)
+
+        res = ser.isin(other)
+        tm.assert_series_equal(res, Series(expected))
+
+        res = pd.core.algorithms.isin(ser, other)
+        tm.assert_numpy_array_equal(res, expected)
+
+    def test_isin_period_freq_mismatch(self):
+        dti = date_range("2013-01-01", "2013-01-05")
+        pi = dti.to_period("M")
+        ser = Series(pi)
+
+        # We construct another PeriodIndex with the same i8 values
+        #  but different dtype
+        dtype = dti.to_period("Y").dtype
+        other = PeriodArray._simple_new(pi.asi8, dtype=dtype)
+
+        res = pi.isin(other)
+        expected = np.array([False] * len(pi), dtype=bool)
+        tm.assert_numpy_array_equal(res, expected)
+
+        res = ser.isin(other)
+        tm.assert_series_equal(res, Series(expected))
+
+        res = pd.core.algorithms.isin(ser, other)
+        tm.assert_numpy_array_equal(res, expected)
+
+    @pytest.mark.parametrize("values", [[-9.0, 0.0], [-9, 0]])
+    def test_isin_float_in_int_series(self, values):
+        # GH#19356 GH#21804
+        ser = Series(values)
+        result = ser.isin([-9, -0.5])
+        expected = Series([True, False])
+        tm.assert_series_equal(result, expected)
+
+    @pytest.mark.parametrize("dtype", ["boolean", "Int64", "Float64"])
+    @pytest.mark.parametrize(
+        "data,values,expected",
+        [
+            ([0, 1, 0], [1], [False, True, False]),
+            ([0, 1, 0], [1, pd.NA], [False, True, False]),
+            ([0, pd.NA, 0], [1, 0], [True, False, True]),
+            ([0, 1, pd.NA], [1, pd.NA], [False, True, True]),
+            ([0, 1, pd.NA], [1, np.nan], [False, True, False]),
+            ([0, pd.NA, pd.NA], [np.nan, pd.NaT, None], [False, False, False]),
+        ],
+    )
+    def test_isin_masked_types(self, dtype, data, values, expected):
+        # GH#42405
+        ser = Series(data, dtype=dtype)
+
+        result = ser.isin(values)
+        expected = Series(expected, dtype="boolean")
+
+        tm.assert_series_equal(result, expected)
+
+
+def test_isin_large_series_mixed_dtypes_and_nan(monkeypatch):
+    # https://github.com/pandas-dev/pandas/issues/37094
+    # combination of object dtype for the values
+    # and > _MINIMUM_COMP_ARR_LEN elements
+    min_isin_comp = 5
+    ser = Series([1, 2, np.nan] * min_isin_comp)
+    with monkeypatch.context() as m:
+        m.setattr(algorithms, "_MINIMUM_COMP_ARR_LEN", min_isin_comp)
+        result = ser.isin({"foo", "bar"})
+    expected = Series([False] * 3 * min_isin_comp)
+    tm.assert_series_equal(result, expected)
+
+
+@pytest.mark.parametrize(
+    "array,expected",
+    [
+        (
+            [0, 1j, 1j, 1, 1 + 1j, 1 + 2j, 1 + 1j],
+            Series([False, True, True, False, True, True, True], dtype=bool),
+        )
+    ],
+)
+def test_isin_complex_numbers(array, expected):
+    # GH 17927
+    result = Series(array).isin([1j, 1 + 1j, 1 + 2j])
+    tm.assert_series_equal(result, expected)
+
+
+@pytest.mark.parametrize(
+    "data,is_in",
+    [([1, [2]], [1]), (["simple str", [{"values": 3}]], ["simple str"])],
+)
+def test_isin_filtering_with_mixed_object_types(data, is_in):
+    # GH 20883
+
+    ser = Series(data)
+    result = ser.isin(is_in)
+    expected = Series([True, False])
+
+    tm.assert_series_equal(result, expected)
+
+
+@pytest.mark.parametrize("data", [[1, 2, 3], [1.0, 2.0, 3.0]])
+@pytest.mark.parametrize("isin", [[1, 2], [1.0, 2.0]])
+def test_isin_filtering_on_iterable(data, isin):
+    # GH 50234
+
+    ser = Series(data)
+    result = ser.isin(i for i in isin)
+    expected_result = Series([True, True, False])
+
+    tm.assert_series_equal(result, expected_result)

@@ -1,204 +1,143 @@
 import numpy as np
 import pytest
 
+from pandas.compat import WARNING_CHECK_DISABLED
 import pandas.util._test_decorators as td
 
-import pandas as pd
 from pandas import (
+    CategoricalDtype,
     DataFrame,
+    NaT,
     Series,
-    date_range,
+    Timestamp,
 )
 import pandas._testing as tm
 
 
-class TestDataFrameUpdate:
-    def test_update_nan(self):
-        # #15593 #15617
-        # test 1
-        df1 = DataFrame({"A": [1.0, 2, 3], "B": date_range("2000", periods=3)})
-        df2 = DataFrame({"A": [None, 2, 3]})
-        expected = df1.copy()
-        df1.update(df2, overwrite=False)
+class TestUpdate:
+    def test_update(self, using_copy_on_write):
+        s = Series([1.5, np.nan, 3.0, 4.0, np.nan])
+        s2 = Series([np.nan, 3.5, np.nan, 5.0])
+        s.update(s2)
 
-        tm.assert_frame_equal(df1, expected)
+        expected = Series([1.5, 3.5, 3.0, 5.0, np.nan])
+        tm.assert_series_equal(s, expected)
 
-        # test 2
-        df1 = DataFrame({"A": [1.0, None, 3], "B": date_range("2000", periods=3)})
-        df2 = DataFrame({"A": [None, 2, 3]})
-        expected = DataFrame({"A": [1.0, 2, 3], "B": date_range("2000", periods=3)})
-        df1.update(df2, overwrite=False)
+        # GH 3217
+        df = DataFrame([{"a": 1}, {"a": 3, "b": 2}])
+        df["c"] = np.nan
+        # Cast to object to avoid upcast when setting "foo"
+        df["c"] = df["c"].astype(object)
+        df_orig = df.copy()
 
-        tm.assert_frame_equal(df1, expected)
-
-    def test_update(self):
-        df = DataFrame(
-            [[1.5, np.nan, 3.0], [1.5, np.nan, 3.0], [1.5, np.nan, 3], [1.5, np.nan, 3]]
-        )
-
-        other = DataFrame([[3.6, 2.0, np.nan], [np.nan, np.nan, 7]], index=[1, 3])
-
-        df.update(other)
-
-        expected = DataFrame(
-            [[1.5, np.nan, 3], [3.6, 2, 3], [1.5, np.nan, 3], [1.5, np.nan, 7.0]]
-        )
-        tm.assert_frame_equal(df, expected)
-
-    def test_update_dtypes(self):
-        # gh 3016
-        df = DataFrame(
-            [[1.0, 2.0, 1, False, True], [4.0, 5.0, 2, True, False]],
-            columns=["A", "B", "int", "bool1", "bool2"],
-        )
-
-        other = DataFrame(
-            [[45, 45, 3, True]], index=[0], columns=["A", "B", "int", "bool1"]
-        )
-        df.update(other)
-
-        expected = DataFrame(
-            [[45.0, 45.0, 3, True, True], [4.0, 5.0, 2, True, False]],
-            columns=["A", "B", "int", "bool1", "bool2"],
-        )
-        tm.assert_frame_equal(df, expected)
-
-    def test_update_nooverwrite(self):
-        df = DataFrame(
-            [[1.5, np.nan, 3.0], [1.5, np.nan, 3.0], [1.5, np.nan, 3], [1.5, np.nan, 3]]
-        )
-
-        other = DataFrame([[3.6, 2.0, np.nan], [np.nan, np.nan, 7]], index=[1, 3])
-
-        df.update(other, overwrite=False)
-
-        expected = DataFrame(
-            [[1.5, np.nan, 3], [1.5, 2, 3], [1.5, np.nan, 3], [1.5, np.nan, 3.0]]
-        )
-        tm.assert_frame_equal(df, expected)
-
-    def test_update_filtered(self):
-        df = DataFrame(
-            [[1.5, np.nan, 3.0], [1.5, np.nan, 3.0], [1.5, np.nan, 3], [1.5, np.nan, 3]]
-        )
-
-        other = DataFrame([[3.6, 2.0, np.nan], [np.nan, np.nan, 7]], index=[1, 3])
-
-        df.update(other, filter_func=lambda x: x > 2)
-
-        expected = DataFrame(
-            [[1.5, np.nan, 3], [1.5, np.nan, 3], [1.5, np.nan, 3], [1.5, np.nan, 7.0]]
-        )
+        if using_copy_on_write:
+            with tm.raises_chained_assignment_error():
+                df["c"].update(Series(["foo"], index=[0]))
+            expected = df_orig
+        else:
+            with tm.assert_produces_warning(
+                FutureWarning if not WARNING_CHECK_DISABLED else None,
+                match="inplace method",
+            ):
+                df["c"].update(Series(["foo"], index=[0]))
+            expected = DataFrame(
+                [[1, np.nan, "foo"], [3, 2.0, np.nan]], columns=["a", "b", "c"]
+            )
+            expected["c"] = expected["c"].astype(object)
         tm.assert_frame_equal(df, expected)
 
     @pytest.mark.parametrize(
-        "bad_kwarg, exception, msg",
+        "other, dtype, expected, warn",
         [
-            # errors must be 'ignore' or 'raise'
-            ({"errors": "something"}, ValueError, "The parameter errors must.*"),
-            ({"join": "inner"}, NotImplementedError, "Only left join is supported"),
+            # other is int
+            ([61, 63], "int32", Series([10, 61, 12], dtype="int32"), None),
+            ([61, 63], "int64", Series([10, 61, 12]), None),
+            ([61, 63], float, Series([10.0, 61.0, 12.0]), None),
+            ([61, 63], object, Series([10, 61, 12], dtype=object), None),
+            # other is float, but can be cast to int
+            ([61.0, 63.0], "int32", Series([10, 61, 12], dtype="int32"), None),
+            ([61.0, 63.0], "int64", Series([10, 61, 12]), None),
+            ([61.0, 63.0], float, Series([10.0, 61.0, 12.0]), None),
+            ([61.0, 63.0], object, Series([10, 61.0, 12], dtype=object), None),
+            # others is float, cannot be cast to int
+            ([61.1, 63.1], "int32", Series([10.0, 61.1, 12.0]), FutureWarning),
+            ([61.1, 63.1], "int64", Series([10.0, 61.1, 12.0]), FutureWarning),
+            ([61.1, 63.1], float, Series([10.0, 61.1, 12.0]), None),
+            ([61.1, 63.1], object, Series([10, 61.1, 12], dtype=object), None),
+            # other is object, cannot be cast
+            ([(61,), (63,)], "int32", Series([10, (61,), 12]), FutureWarning),
+            ([(61,), (63,)], "int64", Series([10, (61,), 12]), FutureWarning),
+            ([(61,), (63,)], float, Series([10.0, (61,), 12.0]), FutureWarning),
+            ([(61,), (63,)], object, Series([10, (61,), 12]), None),
         ],
     )
-    def test_update_raise_bad_parameter(self, bad_kwarg, exception, msg):
-        df = DataFrame([[1.5, 1, 3.0]])
-        with pytest.raises(exception, match=msg):
-            df.update(df, **bad_kwarg)
+    def test_update_dtypes(self, other, dtype, expected, warn):
+        ser = Series([10, 11, 12], dtype=dtype)
+        other = Series(other, index=[1, 3])
+        with tm.assert_produces_warning(warn, match="item of incompatible dtype"):
+            ser.update(other)
 
-    def test_update_raise_on_overlap(self):
-        df = DataFrame(
-            [[1.5, 1, 3.0], [1.5, np.nan, 3.0], [1.5, np.nan, 3], [1.5, np.nan, 3]]
-        )
+        tm.assert_series_equal(ser, expected)
 
-        other = DataFrame([[2.0, np.nan], [np.nan, 7]], index=[1, 3], columns=[1, 2])
-        with pytest.raises(ValueError, match="Data overlaps"):
-            df.update(other, errors="raise")
+    @pytest.mark.parametrize(
+        "series, other, expected",
+        [
+            # update by key
+            (
+                Series({"a": 1, "b": 2, "c": 3, "d": 4}),
+                {"b": 5, "c": np.nan},
+                Series({"a": 1, "b": 5, "c": 3, "d": 4}),
+            ),
+            # update by position
+            (Series([1, 2, 3, 4]), [np.nan, 5, 1], Series([1, 5, 1, 4])),
+        ],
+    )
+    def test_update_from_non_series(self, series, other, expected):
+        # GH 33215
+        series.update(other)
+        tm.assert_series_equal(series, expected)
 
-    def test_update_from_non_df(self):
-        d = {"a": Series([1, 2, 3, 4]), "b": Series([5, 6, 7, 8])}
-        df = DataFrame(d)
+    @pytest.mark.parametrize(
+        "data, other, expected, dtype",
+        [
+            (["a", None], [None, "b"], ["a", "b"], "string[python]"),
+            pytest.param(
+                ["a", None],
+                [None, "b"],
+                ["a", "b"],
+                "string[pyarrow]",
+                marks=td.skip_if_no("pyarrow"),
+            ),
+            ([1, None], [None, 2], [1, 2], "Int64"),
+            ([True, None], [None, False], [True, False], "boolean"),
+            (
+                ["a", None],
+                [None, "b"],
+                ["a", "b"],
+                CategoricalDtype(categories=["a", "b"]),
+            ),
+            (
+                [Timestamp(year=2020, month=1, day=1, tz="Europe/London"), NaT],
+                [NaT, Timestamp(year=2020, month=1, day=1, tz="Europe/London")],
+                [Timestamp(year=2020, month=1, day=1, tz="Europe/London")] * 2,
+                "datetime64[ns, Europe/London]",
+            ),
+        ],
+    )
+    def test_update_extension_array_series(self, data, other, expected, dtype):
+        result = Series(data, dtype=dtype)
+        other = Series(other, dtype=dtype)
+        expected = Series(expected, dtype=dtype)
 
-        d["a"] = Series([5, 6, 7, 8])
-        df.update(d)
+        result.update(other)
+        tm.assert_series_equal(result, expected)
 
-        expected = DataFrame(d)
-
-        tm.assert_frame_equal(df, expected)
-
-        d = {"a": [1, 2, 3, 4], "b": [5, 6, 7, 8]}
-        df = DataFrame(d)
-
-        d["a"] = [5, 6, 7, 8]
-        df.update(d)
-
-        expected = DataFrame(d)
-
-        tm.assert_frame_equal(df, expected)
-
-    def test_update_datetime_tz(self):
-        # GH 25807
-        result = DataFrame([pd.Timestamp("2019", tz="UTC")])
-        with tm.assert_produces_warning(None):
-            result.update(result)
-        expected = DataFrame([pd.Timestamp("2019", tz="UTC")])
-        tm.assert_frame_equal(result, expected)
-
-    def test_update_datetime_tz_in_place(self, using_copy_on_write, warn_copy_on_write):
-        # https://github.com/pandas-dev/pandas/issues/56227
-        result = DataFrame([pd.Timestamp("2019", tz="UTC")])
-        orig = result.copy()
-        view = result[:]
-        with tm.assert_produces_warning(
-            FutureWarning if warn_copy_on_write else None, match="Setting a value"
-        ):
-            result.update(result + pd.Timedelta(days=1))
-        expected = DataFrame([pd.Timestamp("2019-01-02", tz="UTC")])
-        tm.assert_frame_equal(result, expected)
-        if not using_copy_on_write:
-            tm.assert_frame_equal(view, expected)
-        else:
-            tm.assert_frame_equal(view, orig)
-
-    def test_update_with_different_dtype(self, using_copy_on_write):
-        # GH#3217
-        df = DataFrame({"a": [1, 3], "b": [np.nan, 2]})
-        df["c"] = np.nan
-        with tm.assert_produces_warning(FutureWarning, match="incompatible dtype"):
-            df.update({"c": Series(["foo"], index=[0])})
-
-        expected = DataFrame(
-            {
-                "a": [1, 3],
-                "b": [np.nan, 2],
-                "c": Series(["foo", np.nan]),
-            }
-        )
-        tm.assert_frame_equal(df, expected)
-
-    @td.skip_array_manager_invalid_test
-    def test_update_modify_view(
-        self, using_copy_on_write, warn_copy_on_write, using_infer_string
-    ):
-        # GH#47188
-        df = DataFrame({"A": ["1", np.nan], "B": ["100", np.nan]})
-        df2 = DataFrame({"A": ["a", "x"], "B": ["100", "200"]})
-        df2_orig = df2.copy()
-        result_view = df2[:]
-        # TODO(CoW-warn) better warning message
-        with tm.assert_cow_warning(warn_copy_on_write):
-            df2.update(df)
-        expected = DataFrame({"A": ["1", "x"], "B": ["100", "200"]})
-        tm.assert_frame_equal(df2, expected)
-        if using_copy_on_write or using_infer_string:
-            tm.assert_frame_equal(result_view, df2_orig)
-        else:
-            tm.assert_frame_equal(result_view, expected)
-
-    def test_update_dt_column_with_NaT_create_column(self):
-        # GH#16713
-        df = DataFrame({"A": [1, None], "B": [pd.NaT, pd.to_datetime("2016-01-01")]})
-        df2 = DataFrame({"A": [2, 3]})
-        df.update(df2, overwrite=False)
-        expected = DataFrame(
-            {"A": [1.0, 3.0], "B": [pd.NaT, pd.to_datetime("2016-01-01")]}
-        )
-        tm.assert_frame_equal(df, expected)
+    def test_update_with_categorical_type(self):
+        # GH 25744
+        dtype = CategoricalDtype(["a", "b", "c", "d"])
+        s1 = Series(["a", "b", "c"], index=[1, 2, 3], dtype=dtype)
+        s2 = Series(["b", "a"], index=[1, 2], dtype=dtype)
+        s1.update(s2)
+        result = s1
+        expected = Series(["b", "a", "c"], index=[1, 2, 3], dtype=dtype)
+        tm.assert_series_equal(result, expected)

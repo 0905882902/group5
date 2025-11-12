@@ -1,42 +1,56 @@
-from datetime import datetime
+import numpy as np
 
-from pandas import DataFrame
+from pandas import (
+    Series,
+    interval_range,
+)
 import pandas._testing as tm
 
 
 class TestInferObjects:
-    def test_infer_objects(self):
+    def test_copy(self, index_or_series):
+        # GH#50096
+        # case where we don't need to do inference because it is already non-object
+        obj = index_or_series(np.array([1, 2, 3], dtype="int64"))
+
+        result = obj.infer_objects(copy=False)
+        assert tm.shares_memory(result, obj)
+
+        # case where we try to do inference but can't do better than object
+        obj2 = index_or_series(np.array(["foo", 2], dtype=object))
+        result2 = obj2.infer_objects(copy=False)
+        assert tm.shares_memory(result2, obj2)
+
+    def test_infer_objects_series(self, index_or_series):
         # GH#11221
-        df = DataFrame(
-            {
-                "a": ["a", 1, 2, 3],
-                "b": ["b", 2.0, 3.0, 4.1],
-                "c": [
-                    "c",
-                    datetime(2016, 1, 1),
-                    datetime(2016, 1, 2),
-                    datetime(2016, 1, 3),
-                ],
-                "d": [1, 2, 3, "d"],
-            },
-            columns=["a", "b", "c", "d"],
-        )
-        df = df.iloc[1:].infer_objects()
+        actual = index_or_series(np.array([1, 2, 3], dtype="O")).infer_objects()
+        expected = index_or_series([1, 2, 3])
+        tm.assert_equal(actual, expected)
 
-        assert df["a"].dtype == "int64"
-        assert df["b"].dtype == "float64"
-        assert df["c"].dtype == "M8[ns]"
-        assert df["d"].dtype == "object"
+        actual = index_or_series(np.array([1, 2, 3, None], dtype="O")).infer_objects()
+        expected = index_or_series([1.0, 2.0, 3.0, np.nan])
+        tm.assert_equal(actual, expected)
 
-        expected = DataFrame(
-            {
-                "a": [1, 2, 3],
-                "b": [2.0, 3.0, 4.1],
-                "c": [datetime(2016, 1, 1), datetime(2016, 1, 2), datetime(2016, 1, 3)],
-                "d": [2, 3, "d"],
-            },
-            columns=["a", "b", "c", "d"],
-        )
-        # reconstruct frame to verify inference is same
-        result = df.reset_index(drop=True)
-        tm.assert_frame_equal(result, expected)
+        # only soft conversions, unconvertible pass thru unchanged
+
+        obj = index_or_series(np.array([1, 2, 3, None, "a"], dtype="O"))
+        actual = obj.infer_objects()
+        expected = index_or_series([1, 2, 3, None, "a"], dtype=object)
+
+        assert actual.dtype == "object"
+        tm.assert_equal(actual, expected)
+
+    def test_infer_objects_interval(self, index_or_series):
+        # GH#50090
+        ii = interval_range(1, 10)
+        obj = index_or_series(ii)
+
+        result = obj.astype(object).infer_objects()
+        tm.assert_equal(result, obj)
+
+    def test_infer_objects_bytes(self):
+        # GH#49650
+        ser = Series([b"a"], dtype="bytes")
+        expected = ser.copy()
+        result = ser.infer_objects()
+        tm.assert_series_equal(result, expected)
