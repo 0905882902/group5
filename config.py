@@ -1,516 +1,948 @@
-# Added Fortran compiler support to config. Currently useful only for
-# try_compile call. try_run works but is untested for most of Fortran
-# compilers (they must define linker_exe first).
-# Pearu Peterson
-import os
-import signal
-import subprocess
-import sys
-import textwrap
+"""
+The config module holds package-wide configurables and provides
+a uniform API for working with them.
+
+Overview
+========
+
+This module supports the following requirements:
+- options are referenced using keys in dot.notation, e.g. "x.y.option - z".
+- keys are case-insensitive.
+- functions should accept partial/regex keys, when unambiguous.
+- options can be registered by modules at import time.
+- options can be registered at init-time (via core.config_init)
+- options have a default value, and (optionally) a description and
+  validation function associated with them.
+- options can be deprecated, in which case referencing them
+  should produce a warning.
+- deprecated options can optionally be rerouted to a replacement
+  so that accessing a deprecated option reroutes to a differently
+  named option.
+- options can be reset to their default value.
+- all option can be reset to their default value at once.
+- all options in a certain sub - namespace can be reset at once.
+- the user can set / get / reset or ask for the description of an option.
+- a developer can register and mark an option as deprecated.
+- you can register a callback to be invoked when the option value
+  is set or reset. Changing the stored value is considered misuse, but
+  is not verboten.
+
+Implementation
+==============
+
+- Data is stored using nested dictionaries, and should be accessed
+  through the provided API.
+
+- "Registered options" and "Deprecated options" have metadata associated
+  with them, which are stored in auxiliary dictionaries keyed on the
+  fully-qualified key, e.g. "x.y.z.option".
+
+- the config_init module is imported by the package's __init__.py file.
+  placing any register_option() calls there will ensure those options
+  are available as soon as pandas is loaded. If you use register_option
+  in a module, it will only be available after that module is imported,
+  which you should be aware of.
+
+- `config_prefix` is a context_manager (for use with the `with` keyword)
+  which can save developers some typing, see the docstring.
+
+"""
+
+from __future__ import annotations
+
+from contextlib import (
+    ContextDecorator,
+    contextmanager,
+)
+import re
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Generic,
+    NamedTuple,
+    cast,
+)
 import warnings
 
-from distutils.command.config import config as old_config
-from distutils.command.config import LANG_EXT
-from distutils import log
-from distutils.file_util import copy_file
-from distutils.ccompiler import CompileError, LinkError
-import distutils
-from numpy.distutils.exec_command import filepath_from_subprocess_output
-from numpy.distutils.mingw32ccompiler import generate_manifest
-from numpy.distutils.command.autodist import (check_gcc_function_attribute,
-                                              check_gcc_function_attribute_with_intrinsics,
-                                              check_gcc_variable_attribute,
-                                              check_gcc_version_at_least,
-                                              check_inline,
-                                              check_restrict,
-                                              check_compiler_gcc)
+from pandas._typing import (
+    F,
+    T,
+)
+from pandas.util._exceptions import find_stack_level
 
-LANG_EXT['f77'] = '.f'
-LANG_EXT['f90'] = '.f90'
+if TYPE_CHECKING:
+    from collections.abc import (
+        Generator,
+        Iterable,
+    )
 
-class config(old_config):
-    old_config.user_options += [
-        ('fcompiler=', None, "specify the Fortran compiler type"),
-        ]
 
-    def initialize_options(self):
-        self.fcompiler = None
-        old_config.initialize_options(self)
+class DeprecatedOption(NamedTuple):
+    key: str
+    msg: str | None
+    rkey: str | None
+    removal_ver: str | None
 
-    def _check_compiler (self):
-        old_config._check_compiler(self)
-        from numpy.distutils.fcompiler import FCompiler, new_fcompiler
 
-        if sys.platform == 'win32' and (self.compiler.compiler_type in
-                                        ('msvc', 'intelw', 'intelemw')):
-            # XXX: hack to circumvent a python 2.6 bug with msvc9compiler:
-            # initialize call query_vcvarsall, which throws an OSError, and
-            # causes an error along the way without much information. We try to
-            # catch it here, hoping it is early enough, and print a helpful
-            # message instead of Error: None.
-            if not self.compiler.initialized:
-                try:
-                    self.compiler.initialize()
-                except OSError as e:
-                    msg = textwrap.dedent("""\
-                        Could not initialize compiler instance: do you have Visual Studio
-                        installed?  If you are trying to build with MinGW, please use "python setup.py
-                        build -c mingw32" instead.  If you have Visual Studio installed, check it is
-                        correctly installed, and the right version (VS 2015 as of this writing).
+class RegisteredOption(NamedTuple):
+    key: str
+    defval: object
+    doc: str
+    validator: Callable[[object], Any] | None
+    cb: Callable[[str], Any] | None
 
-                        Original exception was: %s, and the Compiler class was %s
-                        ============================================================================""") \
-                        % (e, self.compiler.__class__.__name__)
-                    print(textwrap.dedent("""\
-                        ============================================================================"""))
-                    raise distutils.errors.DistutilsPlatformError(msg) from e
 
-            # After MSVC is initialized, add an explicit /MANIFEST to linker
-            # flags.  See issues gh-4245 and gh-4101 for details.  Also
-            # relevant are issues 4431 and 16296 on the Python bug tracker.
-            from distutils import msvc9compiler
-            if msvc9compiler.get_build_version() >= 10:
-                for ldflags in [self.compiler.ldflags_shared,
-                                self.compiler.ldflags_shared_debug]:
-                    if '/MANIFEST' not in ldflags:
-                        ldflags.append('/MANIFEST')
+# holds deprecated option metadata
+_deprecated_options: dict[str, DeprecatedOption] = {}
 
-        if not isinstance(self.fcompiler, FCompiler):
-            self.fcompiler = new_fcompiler(compiler=self.fcompiler,
-                                           dry_run=self.dry_run, force=1,
-                                           c_compiler=self.compiler)
-            if self.fcompiler is not None:
-                self.fcompiler.customize(self.distribution)
-                if self.fcompiler.get_version():
-                    self.fcompiler.customize_cmd(self)
-                    self.fcompiler.show_customization()
+# holds registered option metadata
+_registered_options: dict[str, RegisteredOption] = {}
 
-    def _wrap_method(self, mth, lang, args):
-        from distutils.ccompiler import CompileError
-        from distutils.errors import DistutilsExecError
-        save_compiler = self.compiler
-        if lang in ['f77', 'f90']:
-            self.compiler = self.fcompiler
-        if self.compiler is None:
-            raise CompileError('%s compiler is not set' % (lang,))
-        try:
-            ret = mth(*((self,)+args))
-        except (DistutilsExecError, CompileError) as e:
-            self.compiler = save_compiler
-            raise CompileError from e
-        self.compiler = save_compiler
-        return ret
+# holds the current values for registered options
+_global_config: dict[str, Any] = {}
 
-    def _compile (self, body, headers, include_dirs, lang):
-        src, obj = self._wrap_method(old_config._compile, lang,
-                                     (body, headers, include_dirs, lang))
-        # _compile in unixcompiler.py sometimes creates .d dependency files.
-        # Clean them up.
-        self.temp_files.append(obj + '.d')
-        return src, obj
+# keys which have a special meaning
+_reserved_keys: list[str] = ["all"]
 
-    def _link (self, body,
-               headers, include_dirs,
-               libraries, library_dirs, lang):
-        if self.compiler.compiler_type=='msvc':
-            libraries = (libraries or [])[:]
-            library_dirs = (library_dirs or [])[:]
-            if lang in ['f77', 'f90']:
-                lang = 'c' # always use system linker when using MSVC compiler
-                if self.fcompiler:
-                    for d in self.fcompiler.library_dirs or []:
-                        # correct path when compiling in Cygwin but with
-                        # normal Win Python
-                        if d.startswith('/usr/lib'):
-                            try:
-                                d = subprocess.check_output(['cygpath',
-                                                             '-w', d])
-                            except (OSError, subprocess.CalledProcessError):
-                                pass
-                            else:
-                                d = filepath_from_subprocess_output(d)
-                        library_dirs.append(d)
-                    for libname in self.fcompiler.libraries or []:
-                        if libname not in libraries:
-                            libraries.append(libname)
-            for libname in libraries:
-                if libname.startswith('msvc'): continue
-                fileexists = False
-                for libdir in library_dirs or []:
-                    libfile = os.path.join(libdir, '%s.lib' % (libname))
-                    if os.path.isfile(libfile):
-                        fileexists = True
-                        break
-                if fileexists: continue
-                # make g77-compiled static libs available to MSVC
-                fileexists = False
-                for libdir in library_dirs:
-                    libfile = os.path.join(libdir, 'lib%s.a' % (libname))
-                    if os.path.isfile(libfile):
-                        # copy libname.a file to name.lib so that MSVC linker
-                        # can find it
-                        libfile2 = os.path.join(libdir, '%s.lib' % (libname))
-                        copy_file(libfile, libfile2)
-                        self.temp_files.append(libfile2)
-                        fileexists = True
-                        break
-                if fileexists: continue
-                log.warn('could not find library %r in directories %s' \
-                         % (libname, library_dirs))
-        elif self.compiler.compiler_type == 'mingw32':
-            generate_manifest(self)
-        return self._wrap_method(old_config._link, lang,
-                                 (body, headers, include_dirs,
-                                  libraries, library_dirs, lang))
 
-    def check_header(self, header, include_dirs=None, library_dirs=None, lang='c'):
-        self._check_compiler()
-        return self.try_compile(
-                "/* we need a dummy line to make distutils happy */",
-                [header], include_dirs)
+class OptionError(AttributeError, KeyError):
+    """
+    Exception raised for pandas.options.
 
-    def check_decl(self, symbol,
-                   headers=None, include_dirs=None):
-        self._check_compiler()
-        body = textwrap.dedent("""
-            int main(void)
-            {
-            #ifndef %s
-                (void) %s;
-            #endif
-                ;
-                return 0;
-            }""") % (symbol, symbol)
+    Backwards compatible with KeyError checks.
 
-        return self.try_compile(body, headers, include_dirs)
+    Examples
+    --------
+    >>> pd.options.context
+    Traceback (most recent call last):
+    OptionError: No such option
+    """
 
-    def check_macro_true(self, symbol,
-                         headers=None, include_dirs=None):
-        self._check_compiler()
-        body = textwrap.dedent("""
-            int main(void)
-            {
-            #if %s
-            #else
-            #error false or undefined macro
-            #endif
-                ;
-                return 0;
-            }""") % (symbol,)
 
-        return self.try_compile(body, headers, include_dirs)
+#
+# User API
 
-    def check_type(self, type_name, headers=None, include_dirs=None,
-            library_dirs=None):
-        """Check type availability. Return True if the type can be compiled,
-        False otherwise"""
-        self._check_compiler()
 
-        # First check the type can be compiled
-        body = textwrap.dedent(r"""
-            int main(void) {
-              if ((%(name)s *) 0)
-                return 0;
-              if (sizeof (%(name)s))
-                return 0;
-            }
-            """) % {'name': type_name}
+def _get_single_key(pat: str, silent: bool) -> str:
+    keys = _select_options(pat)
+    if len(keys) == 0:
+        if not silent:
+            _warn_if_deprecated(pat)
+        raise OptionError(f"No such keys(s): {repr(pat)}")
+    if len(keys) > 1:
+        raise OptionError("Pattern matched multiple keys")
+    key = keys[0]
 
-        st = False
-        try:
-            try:
-                self._compile(body % {'type': type_name},
-                        headers, include_dirs, 'c')
-                st = True
-            except distutils.errors.CompileError:
-                st = False
-        finally:
-            self._clean()
+    if not silent:
+        _warn_if_deprecated(key)
 
-        return st
+    key = _translate_key(key)
 
-    def check_type_size(self, type_name, headers=None, include_dirs=None, library_dirs=None, expected=None):
-        """Check size of a given type."""
-        self._check_compiler()
+    return key
 
-        # First check the type can be compiled
-        body = textwrap.dedent(r"""
-            typedef %(type)s npy_check_sizeof_type;
-            int main (void)
-            {
-                static int test_array [1 - 2 * !(((long) (sizeof (npy_check_sizeof_type))) >= 0)];
-                test_array [0] = 0
 
-                ;
-                return 0;
-            }
-            """)
-        self._compile(body % {'type': type_name},
-                headers, include_dirs, 'c')
-        self._clean()
+def _get_option(pat: str, silent: bool = False) -> Any:
+    key = _get_single_key(pat, silent)
 
-        if expected:
-            body = textwrap.dedent(r"""
-                typedef %(type)s npy_check_sizeof_type;
-                int main (void)
-                {
-                    static int test_array [1 - 2 * !(((long) (sizeof (npy_check_sizeof_type))) == %(size)s)];
-                    test_array [0] = 0
+    # walk the nested dict
+    root, k = _get_root(key)
+    return root[k]
 
-                    ;
-                    return 0;
-                }
-                """)
-            for size in expected:
-                try:
-                    self._compile(body % {'type': type_name, 'size': size},
-                            headers, include_dirs, 'c')
-                    self._clean()
-                    return size
-                except CompileError:
-                    pass
 
-        # this fails to *compile* if size > sizeof(type)
-        body = textwrap.dedent(r"""
-            typedef %(type)s npy_check_sizeof_type;
-            int main (void)
-            {
-                static int test_array [1 - 2 * !(((long) (sizeof (npy_check_sizeof_type))) <= %(size)s)];
-                test_array [0] = 0
+def _set_option(*args, **kwargs) -> None:
+    # must at least 1 arg deal with constraints later
+    nargs = len(args)
+    if not nargs or nargs % 2 != 0:
+        raise ValueError("Must provide an even number of non-keyword arguments")
 
-                ;
-                return 0;
-            }
-            """)
+    # default to false
+    silent = kwargs.pop("silent", False)
 
-        # The principle is simple: we first find low and high bounds of size
-        # for the type, where low/high are looked up on a log scale. Then, we
-        # do a binary search to find the exact size between low and high
-        low = 0
-        mid = 0
-        while True:
-            try:
-                self._compile(body % {'type': type_name, 'size': mid},
-                        headers, include_dirs, 'c')
-                self._clean()
-                break
-            except CompileError:
-                #log.info("failure to test for bound %d" % mid)
-                low = mid + 1
-                mid = 2 * mid + 1
+    if kwargs:
+        kwarg = next(iter(kwargs.keys()))
+        raise TypeError(f'_set_option() got an unexpected keyword argument "{kwarg}"')
 
-        high = mid
-        # Binary search:
-        while low != high:
-            mid = (high - low) // 2 + low
-            try:
-                self._compile(body % {'type': type_name, 'size': mid},
-                        headers, include_dirs, 'c')
-                self._clean()
-                high = mid
-            except CompileError:
-                low = mid + 1
-        return low
+    for k, v in zip(args[::2], args[1::2]):
+        key = _get_single_key(k, silent)
 
-    def check_func(self, func,
-                   headers=None, include_dirs=None,
-                   libraries=None, library_dirs=None,
-                   decl=False, call=False, call_args=None):
-        # clean up distutils's config a bit: add void to main(), and
-        # return a value.
-        self._check_compiler()
-        body = []
-        if decl:
-            if type(decl) == str:
-                body.append(decl)
+        o = _get_registered_option(key)
+        if o and o.validator:
+            o.validator(v)
+
+        # walk the nested dict
+        root, k_root = _get_root(key)
+        root[k_root] = v
+
+        if o.cb:
+            if silent:
+                with warnings.catch_warnings(record=True):
+                    o.cb(key)
             else:
-                body.append("int %s (void);" % func)
-        # Handle MSVC intrinsics: force MS compiler to make a function call.
-        # Useful to test for some functions when built with optimization on, to
-        # avoid build error because the intrinsic and our 'fake' test
-        # declaration do not match.
-        body.append("#ifdef _MSC_VER")
-        body.append("#pragma function(%s)" % func)
-        body.append("#endif")
-        body.append("int main (void) {")
-        if call:
-            if call_args is None:
-                call_args = ''
-            body.append("  %s(%s);" % (func, call_args))
+                o.cb(key)
+
+
+def _describe_option(pat: str = "", _print_desc: bool = True) -> str | None:
+    keys = _select_options(pat)
+    if len(keys) == 0:
+        raise OptionError("No such keys(s)")
+
+    s = "\n".join([_build_option_description(k) for k in keys])
+
+    if _print_desc:
+        print(s)
+        return None
+    return s
+
+
+def _reset_option(pat: str, silent: bool = False) -> None:
+    keys = _select_options(pat)
+
+    if len(keys) == 0:
+        raise OptionError("No such keys(s)")
+
+    if len(keys) > 1 and len(pat) < 4 and pat != "all":
+        raise ValueError(
+            "You must specify at least 4 characters when "
+            "resetting multiple keys, use the special keyword "
+            '"all" to reset all the options to their default value'
+        )
+
+    for k in keys:
+        _set_option(k, _registered_options[k].defval, silent=silent)
+
+
+def get_default_val(pat: str):
+    key = _get_single_key(pat, silent=True)
+    return _get_registered_option(key).defval
+
+
+class DictWrapper:
+    """provide attribute-style access to a nested dict"""
+
+    d: dict[str, Any]
+
+    def __init__(self, d: dict[str, Any], prefix: str = "") -> None:
+        object.__setattr__(self, "d", d)
+        object.__setattr__(self, "prefix", prefix)
+
+    def __setattr__(self, key: str, val: Any) -> None:
+        prefix = object.__getattribute__(self, "prefix")
+        if prefix:
+            prefix += "."
+        prefix += key
+        # you can't set new keys
+        # can you can't overwrite subtrees
+        if key in self.d and not isinstance(self.d[key], dict):
+            _set_option(prefix, val)
         else:
-            body.append("  %s;" % func)
-        body.append("  return 0;")
-        body.append("}")
-        body = '\n'.join(body) + "\n"
+            raise OptionError("You can only set the value of existing options")
 
-        return self.try_link(body, headers, include_dirs,
-                             libraries, library_dirs)
-
-    def check_funcs_once(self, funcs,
-                   headers=None, include_dirs=None,
-                   libraries=None, library_dirs=None,
-                   decl=False, call=False, call_args=None):
-        """Check a list of functions at once.
-
-        This is useful to speed up things, since all the functions in the funcs
-        list will be put in one compilation unit.
-
-        Arguments
-        ---------
-        funcs : seq
-            list of functions to test
-        include_dirs : seq
-            list of header paths
-        libraries : seq
-            list of libraries to link the code snippet to
-        library_dirs : seq
-            list of library paths
-        decl : dict
-            for every (key, value), the declaration in the value will be
-            used for function in key. If a function is not in the
-            dictionary, no declaration will be used.
-        call : dict
-            for every item (f, value), if the value is True, a call will be
-            done to the function f.
-        """
-        self._check_compiler()
-        body = []
-        if decl:
-            for f, v in decl.items():
-                if v:
-                    body.append("int %s (void);" % f)
-
-        # Handle MS intrinsics. See check_func for more info.
-        body.append("#ifdef _MSC_VER")
-        for func in funcs:
-            body.append("#pragma function(%s)" % func)
-        body.append("#endif")
-
-        body.append("int main (void) {")
-        if call:
-            for f in funcs:
-                if f in call and call[f]:
-                    if not (call_args and f in call_args and call_args[f]):
-                        args = ''
-                    else:
-                        args = call_args[f]
-                    body.append("  %s(%s);" % (f, args))
-                else:
-                    body.append("  %s;" % f)
-        else:
-            for f in funcs:
-                body.append("  %s;" % f)
-        body.append("  return 0;")
-        body.append("}")
-        body = '\n'.join(body) + "\n"
-
-        return self.try_link(body, headers, include_dirs,
-                             libraries, library_dirs)
-
-    def check_inline(self):
-        """Return the inline keyword recognized by the compiler, empty string
-        otherwise."""
-        return check_inline(self)
-
-    def check_restrict(self):
-        """Return the restrict keyword recognized by the compiler, empty string
-        otherwise."""
-        return check_restrict(self)
-
-    def check_compiler_gcc(self):
-        """Return True if the C compiler is gcc"""
-        return check_compiler_gcc(self)
-
-    def check_gcc_function_attribute(self, attribute, name):
-        return check_gcc_function_attribute(self, attribute, name)
-
-    def check_gcc_function_attribute_with_intrinsics(self, attribute, name,
-                                                     code, include):
-        return check_gcc_function_attribute_with_intrinsics(self, attribute,
-                                                            name, code, include)
-
-    def check_gcc_variable_attribute(self, attribute):
-        return check_gcc_variable_attribute(self, attribute)
-
-    def check_gcc_version_at_least(self, major, minor=0, patchlevel=0):
-        """Return True if the GCC version is greater than or equal to the
-        specified version."""
-        return check_gcc_version_at_least(self, major, minor, patchlevel)
-
-    def get_output(self, body, headers=None, include_dirs=None,
-                   libraries=None, library_dirs=None,
-                   lang="c", use_tee=None):
-        """Try to compile, link to an executable, and run a program
-        built from 'body' and 'headers'. Returns the exit status code
-        of the program and its output.
-        """
-        # 2008-11-16, RemoveMe
-        warnings.warn("\n+++++++++++++++++++++++++++++++++++++++++++++++++\n"
-                      "Usage of get_output is deprecated: please do not \n"
-                      "use it anymore, and avoid configuration checks \n"
-                      "involving running executable on the target machine.\n"
-                      "+++++++++++++++++++++++++++++++++++++++++++++++++\n",
-                      DeprecationWarning, stacklevel=2)
-        self._check_compiler()
-        exitcode, output = 255, ''
+    def __getattr__(self, key: str):
+        prefix = object.__getattribute__(self, "prefix")
+        if prefix:
+            prefix += "."
+        prefix += key
         try:
-            grabber = GrabStdout()
-            try:
-                src, obj, exe = self._link(body, headers, include_dirs,
-                                           libraries, library_dirs, lang)
-                grabber.restore()
-            except Exception:
-                output = grabber.data
-                grabber.restore()
-                raise
-            exe = os.path.join('.', exe)
-            try:
-                # specify cwd arg for consistency with
-                # historic usage pattern of exec_command()
-                # also, note that exe appears to be a string,
-                # which exec_command() handled, but we now
-                # use a list for check_output() -- this assumes
-                # that exe is always a single command
-                output = subprocess.check_output([exe], cwd='.')
-            except subprocess.CalledProcessError as exc:
-                exitstatus = exc.returncode
-                output = ''
-            except OSError:
-                # preserve the EnvironmentError exit status
-                # used historically in exec_command()
-                exitstatus = 127
-                output = ''
+            v = object.__getattribute__(self, "d")[key]
+        except KeyError as err:
+            raise OptionError("No such option") from err
+        if isinstance(v, dict):
+            return DictWrapper(v, prefix)
+        else:
+            return _get_option(prefix)
+
+    def __dir__(self) -> list[str]:
+        return list(self.d.keys())
+
+
+# For user convenience,  we'd like to have the available options described
+# in the docstring. For dev convenience we'd like to generate the docstrings
+# dynamically instead of maintaining them by hand. To this, we use the
+# class below which wraps functions inside a callable, and converts
+# __doc__ into a property function. The doctsrings below are templates
+# using the py2.6+ advanced formatting syntax to plug in a concise list
+# of options, and option descriptions.
+
+
+class CallableDynamicDoc(Generic[T]):
+    def __init__(self, func: Callable[..., T], doc_tmpl: str) -> None:
+        self.__doc_tmpl__ = doc_tmpl
+        self.__func__ = func
+
+    def __call__(self, *args, **kwds) -> T:
+        return self.__func__(*args, **kwds)
+
+    # error: Signature of "__doc__" incompatible with supertype "object"
+    @property
+    def __doc__(self) -> str:  # type: ignore[override]
+        opts_desc = _describe_option("all", _print_desc=False)
+        opts_list = pp_options_list(list(_registered_options.keys()))
+        return self.__doc_tmpl__.format(opts_desc=opts_desc, opts_list=opts_list)
+
+
+_get_option_tmpl = """
+get_option(pat)
+
+Retrieves the value of the specified option.
+
+Available options:
+
+{opts_list}
+
+Parameters
+----------
+pat : str
+    Regexp which should match a single option.
+    Note: partial matches are supported for convenience, but unless you use the
+    full option name (e.g. x.y.z.option_name), your code may break in future
+    versions if new options with similar names are introduced.
+
+Returns
+-------
+result : the value of the option
+
+Raises
+------
+OptionError : if no such option exists
+
+Notes
+-----
+Please reference the :ref:`User Guide <options>` for more information.
+
+The available options with its descriptions:
+
+{opts_desc}
+
+Examples
+--------
+>>> pd.get_option('display.max_columns')  # doctest: +SKIP
+4
+"""
+
+_set_option_tmpl = """
+set_option(pat, value)
+
+Sets the value of the specified option.
+
+Available options:
+
+{opts_list}
+
+Parameters
+----------
+pat : str
+    Regexp which should match a single option.
+    Note: partial matches are supported for convenience, but unless you use the
+    full option name (e.g. x.y.z.option_name), your code may break in future
+    versions if new options with similar names are introduced.
+value : object
+    New value of option.
+
+Returns
+-------
+None
+
+Raises
+------
+OptionError if no such option exists
+
+Notes
+-----
+Please reference the :ref:`User Guide <options>` for more information.
+
+The available options with its descriptions:
+
+{opts_desc}
+
+Examples
+--------
+>>> pd.set_option('display.max_columns', 4)
+>>> df = pd.DataFrame([[1, 2, 3, 4, 5], [6, 7, 8, 9, 10]])
+>>> df
+   0  1  ...  3   4
+0  1  2  ...  4   5
+1  6  7  ...  9  10
+[2 rows x 5 columns]
+>>> pd.reset_option('display.max_columns')
+"""
+
+_describe_option_tmpl = """
+describe_option(pat, _print_desc=False)
+
+Prints the description for one or more registered options.
+
+Call with no arguments to get a listing for all registered options.
+
+Available options:
+
+{opts_list}
+
+Parameters
+----------
+pat : str
+    Regexp pattern. All matching keys will have their description displayed.
+_print_desc : bool, default True
+    If True (default) the description(s) will be printed to stdout.
+    Otherwise, the description(s) will be returned as a unicode string
+    (for testing).
+
+Returns
+-------
+None by default, the description(s) as a unicode string if _print_desc
+is False
+
+Notes
+-----
+Please reference the :ref:`User Guide <options>` for more information.
+
+The available options with its descriptions:
+
+{opts_desc}
+
+Examples
+--------
+>>> pd.describe_option('display.max_columns')  # doctest: +SKIP
+display.max_columns : int
+    If max_cols is exceeded, switch to truncate view...
+"""
+
+_reset_option_tmpl = """
+reset_option(pat)
+
+Reset one or more options to their default value.
+
+Pass "all" as argument to reset all options.
+
+Available options:
+
+{opts_list}
+
+Parameters
+----------
+pat : str/regex
+    If specified only options matching `prefix*` will be reset.
+    Note: partial matches are supported for convenience, but unless you
+    use the full option name (e.g. x.y.z.option_name), your code may break
+    in future versions if new options with similar names are introduced.
+
+Returns
+-------
+None
+
+Notes
+-----
+Please reference the :ref:`User Guide <options>` for more information.
+
+The available options with its descriptions:
+
+{opts_desc}
+
+Examples
+--------
+>>> pd.reset_option('display.max_columns')  # doctest: +SKIP
+"""
+
+# bind the functions with their docstrings into a Callable
+# and use that as the functions exposed in pd.api
+get_option = CallableDynamicDoc(_get_option, _get_option_tmpl)
+set_option = CallableDynamicDoc(_set_option, _set_option_tmpl)
+reset_option = CallableDynamicDoc(_reset_option, _reset_option_tmpl)
+describe_option = CallableDynamicDoc(_describe_option, _describe_option_tmpl)
+options = DictWrapper(_global_config)
+
+#
+# Functions for use by pandas developers, in addition to User - api
+
+
+class option_context(ContextDecorator):
+    """
+    Context manager to temporarily set options in the `with` statement context.
+
+    You need to invoke as ``option_context(pat, val, [(pat, val), ...])``.
+
+    Examples
+    --------
+    >>> from pandas import option_context
+    >>> with option_context('display.max_rows', 10, 'display.max_columns', 5):
+    ...     pass
+    """
+
+    def __init__(self, *args) -> None:
+        if len(args) % 2 != 0 or len(args) < 2:
+            raise ValueError(
+                "Need to invoke as option_context(pat, val, [(pat, val), ...])."
+            )
+
+        self.ops = list(zip(args[::2], args[1::2]))
+
+    def __enter__(self) -> None:
+        self.undo = [(pat, _get_option(pat)) for pat, val in self.ops]
+
+        for pat, val in self.ops:
+            _set_option(pat, val, silent=True)
+
+    def __exit__(self, *args) -> None:
+        if self.undo:
+            for pat, val in self.undo:
+                _set_option(pat, val, silent=True)
+
+
+def register_option(
+    key: str,
+    defval: object,
+    doc: str = "",
+    validator: Callable[[object], Any] | None = None,
+    cb: Callable[[str], Any] | None = None,
+) -> None:
+    """
+    Register an option in the package-wide pandas config object
+
+    Parameters
+    ----------
+    key : str
+        Fully-qualified key, e.g. "x.y.option - z".
+    defval : object
+        Default value of the option.
+    doc : str
+        Description of the option.
+    validator : Callable, optional
+        Function of a single argument, should raise `ValueError` if
+        called with a value which is not a legal value for the option.
+    cb
+        a function of a single argument "key", which is called
+        immediately after an option value is set/reset. key is
+        the full name of the option.
+
+    Raises
+    ------
+    ValueError if `validator` is specified and `defval` is not a valid value.
+
+    """
+    import keyword
+    import tokenize
+
+    key = key.lower()
+
+    if key in _registered_options:
+        raise OptionError(f"Option '{key}' has already been registered")
+    if key in _reserved_keys:
+        raise OptionError(f"Option '{key}' is a reserved key")
+
+    # the default value should be legal
+    if validator:
+        validator(defval)
+
+    # walk the nested dict, creating dicts as needed along the path
+    path = key.split(".")
+
+    for k in path:
+        if not re.match("^" + tokenize.Name + "$", k):
+            raise ValueError(f"{k} is not a valid identifier")
+        if keyword.iskeyword(k):
+            raise ValueError(f"{k} is a python keyword")
+
+    cursor = _global_config
+    msg = "Path prefix to option '{option}' is already an option"
+
+    for i, p in enumerate(path[:-1]):
+        if not isinstance(cursor, dict):
+            raise OptionError(msg.format(option=".".join(path[:i])))
+        if p not in cursor:
+            cursor[p] = {}
+        cursor = cursor[p]
+
+    if not isinstance(cursor, dict):
+        raise OptionError(msg.format(option=".".join(path[:-1])))
+
+    cursor[path[-1]] = defval  # initialize
+
+    # save the option metadata
+    _registered_options[key] = RegisteredOption(
+        key=key, defval=defval, doc=doc, validator=validator, cb=cb
+    )
+
+
+def deprecate_option(
+    key: str,
+    msg: str | None = None,
+    rkey: str | None = None,
+    removal_ver: str | None = None,
+) -> None:
+    """
+    Mark option `key` as deprecated, if code attempts to access this option,
+    a warning will be produced, using `msg` if given, or a default message
+    if not.
+    if `rkey` is given, any access to the key will be re-routed to `rkey`.
+
+    Neither the existence of `key` nor that if `rkey` is checked. If they
+    do not exist, any subsequence access will fail as usual, after the
+    deprecation warning is given.
+
+    Parameters
+    ----------
+    key : str
+        Name of the option to be deprecated.
+        must be a fully-qualified option name (e.g "x.y.z.rkey").
+    msg : str, optional
+        Warning message to output when the key is referenced.
+        if no message is given a default message will be emitted.
+    rkey : str, optional
+        Name of an option to reroute access to.
+        If specified, any referenced `key` will be
+        re-routed to `rkey` including set/get/reset.
+        rkey must be a fully-qualified option name (e.g "x.y.z.rkey").
+        used by the default message if no `msg` is specified.
+    removal_ver : str, optional
+        Specifies the version in which this option will
+        be removed. used by the default message if no `msg` is specified.
+
+    Raises
+    ------
+    OptionError
+        If the specified key has already been deprecated.
+    """
+    key = key.lower()
+
+    if key in _deprecated_options:
+        raise OptionError(f"Option '{key}' has already been defined as deprecated.")
+
+    _deprecated_options[key] = DeprecatedOption(key, msg, rkey, removal_ver)
+
+
+#
+# functions internal to the module
+
+
+def _select_options(pat: str) -> list[str]:
+    """
+    returns a list of keys matching `pat`
+
+    if pat=="all", returns all registered options
+    """
+    # short-circuit for exact key
+    if pat in _registered_options:
+        return [pat]
+
+    # else look through all of them
+    keys = sorted(_registered_options.keys())
+    if pat == "all":  # reserved key
+        return keys
+
+    return [k for k in keys if re.search(pat, k, re.I)]
+
+
+def _get_root(key: str) -> tuple[dict[str, Any], str]:
+    path = key.split(".")
+    cursor = _global_config
+    for p in path[:-1]:
+        cursor = cursor[p]
+    return cursor, path[-1]
+
+
+def _is_deprecated(key: str) -> bool:
+    """Returns True if the given option has been deprecated"""
+    key = key.lower()
+    return key in _deprecated_options
+
+
+def _get_deprecated_option(key: str):
+    """
+    Retrieves the metadata for a deprecated option, if `key` is deprecated.
+
+    Returns
+    -------
+    DeprecatedOption (namedtuple) if key is deprecated, None otherwise
+    """
+    try:
+        d = _deprecated_options[key]
+    except KeyError:
+        return None
+    else:
+        return d
+
+
+def _get_registered_option(key: str):
+    """
+    Retrieves the option metadata if `key` is a registered option.
+
+    Returns
+    -------
+    RegisteredOption (namedtuple) if key is deprecated, None otherwise
+    """
+    return _registered_options.get(key)
+
+
+def _translate_key(key: str) -> str:
+    """
+    if key id deprecated and a replacement key defined, will return the
+    replacement key, otherwise returns `key` as - is
+    """
+    d = _get_deprecated_option(key)
+    if d:
+        return d.rkey or key
+    else:
+        return key
+
+
+def _warn_if_deprecated(key: str) -> bool:
+    """
+    Checks if `key` is a deprecated option and if so, prints a warning.
+
+    Returns
+    -------
+    bool - True if `key` is deprecated, False otherwise.
+    """
+    d = _get_deprecated_option(key)
+    if d:
+        if d.msg:
+            warnings.warn(
+                d.msg,
+                FutureWarning,
+                stacklevel=find_stack_level(),
+            )
+        else:
+            msg = f"'{key}' is deprecated"
+            if d.removal_ver:
+                msg += f" and will be removed in {d.removal_ver}"
+            if d.rkey:
+                msg += f", please use '{d.rkey}' instead."
             else:
-                output = filepath_from_subprocess_output(output)
-            if hasattr(os, 'WEXITSTATUS'):
-                exitcode = os.WEXITSTATUS(exitstatus)
-                if os.WIFSIGNALED(exitstatus):
-                    sig = os.WTERMSIG(exitstatus)
-                    log.error('subprocess exited with signal %d' % (sig,))
-                    if sig == signal.SIGINT:
-                        # control-C
-                        raise KeyboardInterrupt
-            else:
-                exitcode = exitstatus
-            log.info("success!")
-        except (CompileError, LinkError):
-            log.info("failure.")
-        self._clean()
-        return exitcode, output
+                msg += ", please refrain from using it."
 
-class GrabStdout:
+            warnings.warn(msg, FutureWarning, stacklevel=find_stack_level())
+        return True
+    return False
 
-    def __init__(self):
-        self.sys_stdout = sys.stdout
-        self.data = ''
-        sys.stdout = self
 
-    def write (self, data):
-        self.sys_stdout.write(data)
-        self.data += data
+def _build_option_description(k: str) -> str:
+    """Builds a formatted description of a registered option and prints it"""
+    o = _get_registered_option(k)
+    d = _get_deprecated_option(k)
 
-    def flush (self):
-        self.sys_stdout.flush()
+    s = f"{k} "
 
-    def restore(self):
-        sys.stdout = self.sys_stdout
+    if o.doc:
+        s += "\n".join(o.doc.strip().split("\n"))
+    else:
+        s += "No description available."
+
+    if o:
+        s += f"\n    [default: {o.defval}] [currently: {_get_option(k, True)}]"
+
+    if d:
+        rkey = d.rkey or ""
+        s += "\n    (Deprecated"
+        s += f", use `{rkey}` instead."
+        s += ")"
+
+    return s
+
+
+def pp_options_list(keys: Iterable[str], width: int = 80, _print: bool = False):
+    """Builds a concise listing of available options, grouped by prefix"""
+    from itertools import groupby
+    from textwrap import wrap
+
+    def pp(name: str, ks: Iterable[str]) -> list[str]:
+        pfx = "- " + name + ".[" if name else ""
+        ls = wrap(
+            ", ".join(ks),
+            width,
+            initial_indent=pfx,
+            subsequent_indent="  ",
+            break_long_words=False,
+        )
+        if ls and ls[-1] and name:
+            ls[-1] = ls[-1] + "]"
+        return ls
+
+    ls: list[str] = []
+    singles = [x for x in sorted(keys) if x.find(".") < 0]
+    if singles:
+        ls += pp("", singles)
+    keys = [x for x in keys if x.find(".") >= 0]
+
+    for k, g in groupby(sorted(keys), lambda x: x[: x.rfind(".")]):
+        ks = [x[len(k) + 1 :] for x in list(g)]
+        ls += pp(k, ks)
+    s = "\n".join(ls)
+    if _print:
+        print(s)
+    else:
+        return s
+
+
+#
+# helpers
+
+
+@contextmanager
+def config_prefix(prefix: str) -> Generator[None, None, None]:
+    """
+    contextmanager for multiple invocations of API with a common prefix
+
+    supported API functions: (register / get / set )__option
+
+    Warning: This is not thread - safe, and won't work properly if you import
+    the API functions into your module using the "from x import y" construct.
+
+    Example
+    -------
+    import pandas._config.config as cf
+    with cf.config_prefix("display.font"):
+        cf.register_option("color", "red")
+        cf.register_option("size", " 5 pt")
+        cf.set_option(size, " 6 pt")
+        cf.get_option(size)
+        ...
+
+        etc'
+
+    will register options "display.font.color", "display.font.size", set the
+    value of "display.font.size"... and so on.
+    """
+    # Note: reset_option relies on set_option, and on key directly
+    # it does not fit in to this monkey-patching scheme
+
+    global register_option, get_option, set_option
+
+    def wrap(func: F) -> F:
+        def inner(key: str, *args, **kwds):
+            pkey = f"{prefix}.{key}"
+            return func(pkey, *args, **kwds)
+
+        return cast(F, inner)
+
+    _register_option = register_option
+    _get_option = get_option
+    _set_option = set_option
+    set_option = wrap(set_option)
+    get_option = wrap(get_option)
+    register_option = wrap(register_option)
+    try:
+        yield
+    finally:
+        set_option = _set_option
+        get_option = _get_option
+        register_option = _register_option
+
+
+# These factories and methods are handy for use as the validator
+# arg in register_option
+
+
+def is_type_factory(_type: type[Any]) -> Callable[[Any], None]:
+    """
+
+    Parameters
+    ----------
+    `_type` - a type to be compared against (e.g. type(x) == `_type`)
+
+    Returns
+    -------
+    validator - a function of a single argument x , which raises
+                ValueError if type(x) is not equal to `_type`
+
+    """
+
+    def inner(x) -> None:
+        if type(x) != _type:
+            raise ValueError(f"Value must have type '{_type}'")
+
+    return inner
+
+
+def is_instance_factory(_type) -> Callable[[Any], None]:
+    """
+
+    Parameters
+    ----------
+    `_type` - the type to be checked against
+
+    Returns
+    -------
+    validator - a function of a single argument x , which raises
+                ValueError if x is not an instance of `_type`
+
+    """
+    if isinstance(_type, (tuple, list)):
+        _type = tuple(_type)
+        type_repr = "|".join(map(str, _type))
+    else:
+        type_repr = f"'{_type}'"
+
+    def inner(x) -> None:
+        if not isinstance(x, _type):
+            raise ValueError(f"Value must be an instance of {type_repr}")
+
+    return inner
+
+
+def is_one_of_factory(legal_values) -> Callable[[Any], None]:
+    callables = [c for c in legal_values if callable(c)]
+    legal_values = [c for c in legal_values if not callable(c)]
+
+    def inner(x) -> None:
+        if x not in legal_values:
+            if not any(c(x) for c in callables):
+                uvals = [str(lval) for lval in legal_values]
+                pp_values = "|".join(uvals)
+                msg = f"Value must be one of {pp_values}"
+                if len(callables):
+                    msg += " or a callable"
+                raise ValueError(msg)
+
+    return inner
+
+
+def is_nonnegative_int(value: object) -> None:
+    """
+    Verify that value is None or a positive int.
+
+    Parameters
+    ----------
+    value : None or int
+            The `value` to be checked.
+
+    Raises
+    ------
+    ValueError
+        When the value is not None or is a negative integer
+    """
+    if value is None:
+        return
+
+    elif isinstance(value, int):
+        if value >= 0:
+            return
+
+    msg = "Value must be a nonnegative integer or None"
+    raise ValueError(msg)
+
+
+# common type validators, for convenience
+# usage: register_option(... , validator = is_int)
+is_int = is_type_factory(int)
+is_bool = is_type_factory(bool)
+is_float = is_type_factory(float)
+is_str = is_type_factory(str)
+is_text = is_instance_factory((str, bytes))
+
+
+def is_callable(obj) -> bool:
+    """
+
+    Parameters
+    ----------
+    `obj` - the object to be checked
+
+    Returns
+    -------
+    validator - returns True if object is callable
+        raises ValueError otherwise.
+
+    """
+    if not callable(obj):
+        raise ValueError("Value must be a callable")
+    return True

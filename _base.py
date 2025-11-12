@@ -1,1462 +1,1659 @@
-"""
-Base IO code for all datasets
-"""
-
-# Copyright (c) 2007 David Cournapeau <cournape@gmail.com>
-#               2010 Fabian Pedregosa <fabian.pedregosa@inria.fr>
-#               2010 Olivier Grisel <olivier.grisel@ensta.org>
-# License: BSD 3 clause
-import csv
-import hashlib
-import gzip
-import shutil
-from collections import namedtuple
-from os import environ, listdir, makedirs
-from os.path import expanduser, isdir, join, splitext
-from importlib import resources
-
-from ..utils import Bunch
-from ..utils import check_random_state
-from ..utils import check_pandas_support
-from ..utils.deprecation import deprecated
-
-import numpy as np
-
-from urllib.request import urlretrieve
-
-DATA_MODULE = "sklearn.datasets.data"
-DESCR_MODULE = "sklearn.datasets.descr"
-IMAGES_MODULE = "sklearn.datasets.images"
-
-RemoteFileMetadata = namedtuple("RemoteFileMetadata", ["filename", "url", "checksum"])
-
-
-def get_data_home(data_home=None) -> str:
-    """Return the path of the scikit-learn data dir.
-
-    This folder is used by some large dataset loaders to avoid downloading the
-    data several times.
-
-    By default the data dir is set to a folder named 'scikit_learn_data' in the
-    user home folder.
-
-    Alternatively, it can be set by the 'SCIKIT_LEARN_DATA' environment
-    variable or programmatically by giving an explicit folder path. The '~'
-    symbol is expanded to the user home folder.
-
-    If the folder does not already exist, it is automatically created.
-
-    Parameters
-    ----------
-    data_home : str, default=None
-        The path to scikit-learn data directory. If `None`, the default path
-        is `~/sklearn_learn_data`.
-    """
-    if data_home is None:
-        data_home = environ.get("SCIKIT_LEARN_DATA", join("~", "scikit_learn_data"))
-    data_home = expanduser(data_home)
-    makedirs(data_home, exist_ok=True)
-    return data_home
-
-
-def clear_data_home(data_home=None):
-    """Delete all the content of the data home cache.
-
-    Parameters
-    ----------
-    data_home : str, default=None
-        The path to scikit-learn data directory. If `None`, the default path
-        is `~/sklearn_learn_data`.
-    """
-    data_home = get_data_home(data_home)
-    shutil.rmtree(data_home)
-
-
-def _convert_data_dataframe(
-    caller_name, data, target, feature_names, target_names, sparse_data=False
-):
-    pd = check_pandas_support("{} with as_frame=True".format(caller_name))
-    if not sparse_data:
-        data_df = pd.DataFrame(data, columns=feature_names)
-    else:
-        data_df = pd.DataFrame.sparse.from_spmatrix(data, columns=feature_names)
-
-    target_df = pd.DataFrame(target, columns=target_names)
-    combined_df = pd.concat([data_df, target_df], axis=1)
-    X = combined_df[feature_names]
-    y = combined_df[target_names]
-    if y.shape[1] == 1:
-        y = y.iloc[:, 0]
-    return combined_df, X, y
-
-
-def load_files(
-    container_path,
-    *,
-    description=None,
-    categories=None,
-    load_content=True,
-    shuffle=True,
-    encoding=None,
-    decode_error="strict",
-    random_state=0,
-):
-    """Load text files with categories as subfolder names.
-
-    Individual samples are assumed to be files stored a two levels folder
-    structure such as the following:
-
-        container_folder/
-            category_1_folder/
-                file_1.txt
-                file_2.txt
-                ...
-                file_42.txt
-            category_2_folder/
-                file_43.txt
-                file_44.txt
-                ...
-
-    The folder names are used as supervised signal label names. The individual
-    file names are not important.
-
-    This function does not try to extract features into a numpy array or scipy
-    sparse matrix. In addition, if load_content is false it does not try to
-    load the files in memory.
-
-    To use text files in a scikit-learn classification or clustering algorithm,
-    you will need to use the :mod`~sklearn.feature_extraction.text` module to
-    build a feature extraction transformer that suits your problem.
-
-    If you set load_content=True, you should also specify the encoding of the
-    text using the 'encoding' parameter. For many modern text files, 'utf-8'
-    will be the correct encoding. If you leave encoding equal to None, then the
-    content will be made of bytes instead of Unicode, and you will not be able
-    to use most functions in :mod:`~sklearn.feature_extraction.text`.
-
-    Similar feature extractors should be built for other kind of unstructured
-    data input such as images, audio, video, ...
-
-    Read more in the :ref:`User Guide <datasets>`.
-
-    Parameters
-    ----------
-    container_path : str
-        Path to the main folder holding one subfolder per category.
-
-    description : str, default=None
-        A paragraph describing the characteristic of the dataset: its source,
-        reference, etc.
-
-    categories : list of str, default=None
-        If None (default), load all the categories. If not None, list of
-        category names to load (other categories ignored).
-
-    load_content : bool, default=True
-        Whether to load or not the content of the different files. If true a
-        'data' attribute containing the text information is present in the data
-        structure returned. If not, a filenames attribute gives the path to the
-        files.
-
-    shuffle : bool, default=True
-        Whether or not to shuffle the data: might be important for models that
-        make the assumption that the samples are independent and identically
-        distributed (i.i.d.), such as stochastic gradient descent.
-
-    encoding : str, default=None
-        If None, do not try to decode the content of the files (e.g. for images
-        or other non-text content). If not None, encoding to use to decode text
-        files to Unicode if load_content is True.
-
-    decode_error : {'strict', 'ignore', 'replace'}, default='strict'
-        Instruction on what to do if a byte sequence is given to analyze that
-        contains characters not of the given `encoding`. Passed as keyword
-        argument 'errors' to bytes.decode.
-
-    random_state : int, RandomState instance or None, default=0
-        Determines random number generation for dataset shuffling. Pass an int
-        for reproducible output across multiple function calls.
-        See :term:`Glossary <random_state>`.
-
-    Returns
-    -------
-    data : :class:`~sklearn.utils.Bunch`
-        Dictionary-like object, with the following attributes.
-
-        data : list of str
-            Only present when `load_content=True`.
-            The raw text data to learn.
-        target : ndarray
-            The target labels (integer index).
-        target_names : list
-            The names of target classes.
-        DESCR : str
-            The full description of the dataset.
-        filenames: ndarray
-            The filenames holding the dataset.
-    """
-    target = []
-    target_names = []
-    filenames = []
-
-    folders = [
-        f for f in sorted(listdir(container_path)) if isdir(join(container_path, f))
-    ]
-
-    if categories is not None:
-        folders = [f for f in folders if f in categories]
-
-    for label, folder in enumerate(folders):
-        target_names.append(folder)
-        folder_path = join(container_path, folder)
-        documents = [join(folder_path, d) for d in sorted(listdir(folder_path))]
-        target.extend(len(documents) * [label])
-        filenames.extend(documents)
-
-    # convert to array for fancy indexing
-    filenames = np.array(filenames)
-    target = np.array(target)
-
-    if shuffle:
-        random_state = check_random_state(random_state)
-        indices = np.arange(filenames.shape[0])
-        random_state.shuffle(indices)
-        filenames = filenames[indices]
-        target = target[indices]
-
-    if load_content:
-        data = []
-        for filename in filenames:
-            with open(filename, "rb") as f:
-                data.append(f.read())
-        if encoding is not None:
-            data = [d.decode(encoding, decode_error) for d in data]
-        return Bunch(
-            data=data,
-            filenames=filenames,
-            target_names=target_names,
-            target=target,
-            DESCR=description,
-        )
-
-    return Bunch(
-        filenames=filenames, target_names=target_names, target=target, DESCR=description
-    )
-
-
-def load_csv_data(
-    data_file_name,
-    *,
-    data_module=DATA_MODULE,
-    descr_file_name=None,
-    descr_module=DESCR_MODULE,
-):
-    """Loads `data_file_name` from `data_module with `importlib.resources`.
-
-    Parameters
-    ----------
-    data_file_name : str
-        Name of csv file to be loaded from `data_module/data_file_name`.
-        For example `'wine_data.csv'`.
-
-    data_module : str or module, default='sklearn.datasets.data'
-        Module where data lives. The default is `'sklearn.datasets.data'`.
-
-    descr_file_name : str, default=None
-        Name of rst file to be loaded from `descr_module/descr_file_name`.
-        For example `'wine_data.rst'`. See also :func:`load_descr`.
-        If not None, also returns the corresponding description of
-        the dataset.
-
-    descr_module : str or module, default='sklearn.datasets.descr'
-        Module where `descr_file_name` lives. See also :func:`load_descr`.
-        The default is `'sklearn.datasets.descr'`.
-
-    Returns
-    -------
-    data : ndarray of shape (n_samples, n_features)
-        A 2D array with each row representing one sample and each column
-        representing the features of a given sample.
-
-    target : ndarry of shape (n_samples,)
-        A 1D array holding target variables for all the samples in `data`.
-        For example target[0] is the target variable for data[0].
-
-    target_names : ndarry of shape (n_samples,)
-        A 1D array containing the names of the classifications. For example
-        target_names[0] is the name of the target[0] class.
-
-    descr : str, optional
-        Description of the dataset (the content of `descr_file_name`).
-        Only returned if `descr_file_name` is not None.
-    """
-    with resources.open_text(data_module, data_file_name) as csv_file:
-        data_file = csv.reader(csv_file)
-        temp = next(data_file)
-        n_samples = int(temp[0])
-        n_features = int(temp[1])
-        target_names = np.array(temp[2:])
-        data = np.empty((n_samples, n_features))
-        target = np.empty((n_samples,), dtype=int)
-
-        for i, ir in enumerate(data_file):
-            data[i] = np.asarray(ir[:-1], dtype=np.float64)
-            target[i] = np.asarray(ir[-1], dtype=int)
-
-    if descr_file_name is None:
-        return data, target, target_names
-    else:
-        assert descr_module is not None
-        descr = load_descr(descr_module=descr_module, descr_file_name=descr_file_name)
-        return data, target, target_names, descr
-
-
-def load_gzip_compressed_csv_data(
-    data_file_name,
-    *,
-    data_module=DATA_MODULE,
-    descr_file_name=None,
-    descr_module=DESCR_MODULE,
-    encoding="utf-8",
-    **kwargs,
-):
-    """Loads gzip-compressed `data_file_name` from `data_module` with `importlib.resources`.
-
-    1) Open resource file with `importlib.resources.open_binary`
-    2) Decompress file obj with `gzip.open`
-    3) Load decompressed data with `np.loadtxt`
-
-    Parameters
-    ----------
-    data_file_name : str
-        Name of gzip-compressed csv file  (`'*.csv.gz'`) to be loaded from
-        `data_module/data_file_name`. For example `'diabetes_data.csv.gz'`.
-
-    data_module : str or module, default='sklearn.datasets.data'
-        Module where data lives. The default is `'sklearn.datasets.data'`.
-
-    descr_file_name : str, default=None
-        Name of rst file to be loaded from `descr_module/descr_file_name`.
-        For example `'wine_data.rst'`. See also :func:`load_descr`.
-        If not None, also returns the corresponding description of
-        the dataset.
-
-    descr_module : str or module, default='sklearn.datasets.descr'
-        Module where `descr_file_name` lives. See also :func:`load_descr`.
-        The default  is `'sklearn.datasets.descr'`.
-
-    encoding : str, default="utf-8"
-        Name of the encoding that the gzip-decompressed file will be
-        decoded with. The default is 'utf-8'.
-
-    **kwargs : dict, optional
-        Keyword arguments to be passed to `np.loadtxt`;
-        e.g. delimiter=','.
-
-    Returns
-    -------
-    data : ndarray of shape (n_samples, n_features)
-        A 2D array with each row representing one sample and each column
-        representing the features and/or target of a given sample.
-
-    descr : str, optional
-        Description of the dataset (the content of `descr_file_name`).
-        Only returned if `descr_file_name` is not None.
-    """
-    with resources.open_binary(data_module, data_file_name) as compressed_file:
-        compressed_file = gzip.open(compressed_file, mode="rt", encoding=encoding)
-        data = np.loadtxt(compressed_file, **kwargs)
-
-    if descr_file_name is None:
-        return data
-    else:
-        assert descr_module is not None
-        descr = load_descr(descr_module=descr_module, descr_file_name=descr_file_name)
-        return data, descr
-
-
-def load_descr(descr_file_name, *, descr_module=DESCR_MODULE):
-    """Load `descr_file_name` from `descr_module` with `importlib.resources`.
-
-    Parameters
-    ----------
-    descr_file_name : str, default=None
-        Name of rst file to be loaded from `descr_module/descr_file_name`.
-        For example `'wine_data.rst'`. See also :func:`load_descr`.
-        If not None, also returns the corresponding description of
-        the dataset.
-
-    descr_module : str or module, default='sklearn.datasets.descr'
-        Module where `descr_file_name` lives. See also :func:`load_descr`.
-        The default  is `'sklearn.datasets.descr'`.
-
-    Returns
-    -------
-    fdescr : str
-        Content of `descr_file_name`.
-    """
-    fdescr = resources.read_text(descr_module, descr_file_name)
-
-    return fdescr
-
-
-def load_wine(*, return_X_y=False, as_frame=False):
-    """Load and return the wine dataset (classification).
-
-    .. versionadded:: 0.18
-
-    The wine dataset is a classic and very easy multi-class classification
-    dataset.
-
-    =================   ==============
-    Classes                          3
-    Samples per class        [59,71,48]
-    Samples total                  178
-    Dimensionality                  13
-    Features            real, positive
-    =================   ==============
-
-    Read more in the :ref:`User Guide <wine_dataset>`.
-
-    Parameters
-    ----------
-    return_X_y : bool, default=False
-        If True, returns ``(data, target)`` instead of a Bunch object.
-        See below for more information about the `data` and `target` object.
-
-    as_frame : bool, default=False
-        If True, the data is a pandas DataFrame including columns with
-        appropriate dtypes (numeric). The target is
-        a pandas DataFrame or Series depending on the number of target columns.
-        If `return_X_y` is True, then (`data`, `target`) will be pandas
-        DataFrames or Series as described below.
-
-        .. versionadded:: 0.23
-
-    Returns
-    -------
-    data : :class:`~sklearn.utils.Bunch`
-        Dictionary-like object, with the following attributes.
-
-        data : {ndarray, dataframe} of shape (178, 13)
-            The data matrix. If `as_frame=True`, `data` will be a pandas
-            DataFrame.
-        target: {ndarray, Series} of shape (178,)
-            The classification target. If `as_frame=True`, `target` will be
-            a pandas Series.
-        feature_names: list
-            The names of the dataset columns.
-        target_names: list
-            The names of target classes.
-        frame: DataFrame of shape (178, 14)
-            Only present when `as_frame=True`. DataFrame with `data` and
-            `target`.
-
-            .. versionadded:: 0.23
-        DESCR: str
-            The full description of the dataset.
-
-    (data, target) : tuple if ``return_X_y`` is True
-
-    The copy of UCI ML Wine Data Set dataset is downloaded and modified to fit
-    standard format from:
-    https://archive.ics.uci.edu/ml/machine-learning-databases/wine/wine.data
-
-    Examples
-    --------
-    Let's say you are interested in the samples 10, 80, and 140, and want to
-    know their class name.
-
-    >>> from sklearn.datasets import load_wine
-    >>> data = load_wine()
-    >>> data.target[[10, 80, 140]]
-    array([0, 1, 2])
-    >>> list(data.target_names)
-    ['class_0', 'class_1', 'class_2']
-    """
-
-    data, target, target_names, fdescr = load_csv_data(
-        data_file_name="wine_data.csv", descr_file_name="wine_data.rst"
-    )
-
-    feature_names = [
-        "alcohol",
-        "malic_acid",
-        "ash",
-        "alcalinity_of_ash",
-        "magnesium",
-        "total_phenols",
-        "flavanoids",
-        "nonflavanoid_phenols",
-        "proanthocyanins",
-        "color_intensity",
-        "hue",
-        "od280/od315_of_diluted_wines",
-        "proline",
-    ]
-
-    frame = None
-    target_columns = [
-        "target",
-    ]
-    if as_frame:
-        frame, data, target = _convert_data_dataframe(
-            "load_wine", data, target, feature_names, target_columns
-        )
-
-    if return_X_y:
-        return data, target
-
-    return Bunch(
-        data=data,
-        target=target,
-        frame=frame,
-        target_names=target_names,
-        DESCR=fdescr,
-        feature_names=feature_names,
-    )
-
-
-def load_iris(*, return_X_y=False, as_frame=False):
-    """Load and return the iris dataset (classification).
-
-    The iris dataset is a classic and very easy multi-class classification
-    dataset.
-
-    =================   ==============
-    Classes                          3
-    Samples per class               50
-    Samples total                  150
-    Dimensionality                   4
-    Features            real, positive
-    =================   ==============
-
-    Read more in the :ref:`User Guide <iris_dataset>`.
-
-    Parameters
-    ----------
-    return_X_y : bool, default=False
-        If True, returns ``(data, target)`` instead of a Bunch object. See
-        below for more information about the `data` and `target` object.
-
-        .. versionadded:: 0.18
-
-    as_frame : bool, default=False
-        If True, the data is a pandas DataFrame including columns with
-        appropriate dtypes (numeric). The target is
-        a pandas DataFrame or Series depending on the number of target columns.
-        If `return_X_y` is True, then (`data`, `target`) will be pandas
-        DataFrames or Series as described below.
-
-        .. versionadded:: 0.23
-
-    Returns
-    -------
-    data : :class:`~sklearn.utils.Bunch`
-        Dictionary-like object, with the following attributes.
-
-        data : {ndarray, dataframe} of shape (150, 4)
-            The data matrix. If `as_frame=True`, `data` will be a pandas
-            DataFrame.
-        target: {ndarray, Series} of shape (150,)
-            The classification target. If `as_frame=True`, `target` will be
-            a pandas Series.
-        feature_names: list
-            The names of the dataset columns.
-        target_names: list
-            The names of target classes.
-        frame: DataFrame of shape (150, 5)
-            Only present when `as_frame=True`. DataFrame with `data` and
-            `target`.
-
-            .. versionadded:: 0.23
-        DESCR: str
-            The full description of the dataset.
-        filename: str
-            The path to the location of the data.
-
-            .. versionadded:: 0.20
-
-    (data, target) : tuple if ``return_X_y`` is True
-        A tuple of two ndarray. The first containing a 2D array of shape
-        (n_samples, n_features) with each row representing one sample and
-        each column representing the features. The second ndarray of shape
-        (n_samples,) containing the target samples.
-
-        .. versionadded:: 0.18
-
-    Notes
-    -----
-        .. versionchanged:: 0.20
-            Fixed two wrong data points according to Fisher's paper.
-            The new version is the same as in R, but not as in the UCI
-            Machine Learning Repository.
-
-    Examples
-    --------
-    Let's say you are interested in the samples 10, 25, and 50, and want to
-    know their class name.
-
-    >>> from sklearn.datasets import load_iris
-    >>> data = load_iris()
-    >>> data.target[[10, 25, 50]]
-    array([0, 0, 1])
-    >>> list(data.target_names)
-    ['setosa', 'versicolor', 'virginica']
-    """
-    data_file_name = "iris.csv"
-    data, target, target_names, fdescr = load_csv_data(
-        data_file_name=data_file_name, descr_file_name="iris.rst"
-    )
-
-    feature_names = [
-        "sepal length (cm)",
-        "sepal width (cm)",
-        "petal length (cm)",
-        "petal width (cm)",
-    ]
-
-    frame = None
-    target_columns = [
-        "target",
-    ]
-    if as_frame:
-        frame, data, target = _convert_data_dataframe(
-            "load_iris", data, target, feature_names, target_columns
-        )
-
-    if return_X_y:
-        return data, target
-
-    return Bunch(
-        data=data,
-        target=target,
-        frame=frame,
-        target_names=target_names,
-        DESCR=fdescr,
-        feature_names=feature_names,
-        filename=data_file_name,
-        data_module=DATA_MODULE,
-    )
-
-
-def load_breast_cancer(*, return_X_y=False, as_frame=False):
-    """Load and return the breast cancer wisconsin dataset (classification).
-
-    The breast cancer dataset is a classic and very easy binary classification
-    dataset.
-
-    =================   ==============
-    Classes                          2
-    Samples per class    212(M),357(B)
-    Samples total                  569
-    Dimensionality                  30
-    Features            real, positive
-    =================   ==============
-
-    Read more in the :ref:`User Guide <breast_cancer_dataset>`.
-
-    Parameters
-    ----------
-    return_X_y : bool, default=False
-        If True, returns ``(data, target)`` instead of a Bunch object.
-        See below for more information about the `data` and `target` object.
-
-        .. versionadded:: 0.18
-
-    as_frame : bool, default=False
-        If True, the data is a pandas DataFrame including columns with
-        appropriate dtypes (numeric). The target is
-        a pandas DataFrame or Series depending on the number of target columns.
-        If `return_X_y` is True, then (`data`, `target`) will be pandas
-        DataFrames or Series as described below.
-
-        .. versionadded:: 0.23
-
-    Returns
-    -------
-    data : :class:`~sklearn.utils.Bunch`
-        Dictionary-like object, with the following attributes.
-
-        data : {ndarray, dataframe} of shape (569, 30)
-            The data matrix. If `as_frame=True`, `data` will be a pandas
-            DataFrame.
-        target: {ndarray, Series} of shape (569,)
-            The classification target. If `as_frame=True`, `target` will be
-            a pandas Series.
-        feature_names: list
-            The names of the dataset columns.
-        target_names: list
-            The names of target classes.
-        frame: DataFrame of shape (569, 31)
-            Only present when `as_frame=True`. DataFrame with `data` and
-            `target`.
-
-            .. versionadded:: 0.23
-        DESCR: str
-            The full description of the dataset.
-        filename: str
-            The path to the location of the data.
-
-            .. versionadded:: 0.20
-
-    (data, target) : tuple if ``return_X_y`` is True
-
-        .. versionadded:: 0.18
-
-    The copy of UCI ML Breast Cancer Wisconsin (Diagnostic) dataset is
-    downloaded from:
-    https://goo.gl/U2Uwz2
-
-    Examples
-    --------
-    Let's say you are interested in the samples 10, 50, and 85, and want to
-    know their class name.
-
-    >>> from sklearn.datasets import load_breast_cancer
-    >>> data = load_breast_cancer()
-    >>> data.target[[10, 50, 85]]
-    array([0, 1, 0])
-    >>> list(data.target_names)
-    ['malignant', 'benign']
-    """
-    data_file_name = "breast_cancer.csv"
-    data, target, target_names, fdescr = load_csv_data(
-        data_file_name=data_file_name, descr_file_name="breast_cancer.rst"
-    )
-
-    feature_names = np.array(
-        [
-            "mean radius",
-            "mean texture",
-            "mean perimeter",
-            "mean area",
-            "mean smoothness",
-            "mean compactness",
-            "mean concavity",
-            "mean concave points",
-            "mean symmetry",
-            "mean fractal dimension",
-            "radius error",
-            "texture error",
-            "perimeter error",
-            "area error",
-            "smoothness error",
-            "compactness error",
-            "concavity error",
-            "concave points error",
-            "symmetry error",
-            "fractal dimension error",
-            "worst radius",
-            "worst texture",
-            "worst perimeter",
-            "worst area",
-            "worst smoothness",
-            "worst compactness",
-            "worst concavity",
-            "worst concave points",
-            "worst symmetry",
-            "worst fractal dimension",
-        ]
-    )
-
-    frame = None
-    target_columns = [
-        "target",
-    ]
-    if as_frame:
-        frame, data, target = _convert_data_dataframe(
-            "load_breast_cancer", data, target, feature_names, target_columns
-        )
-
-    if return_X_y:
-        return data, target
-
-    return Bunch(
-        data=data,
-        target=target,
-        frame=frame,
-        target_names=target_names,
-        DESCR=fdescr,
-        feature_names=feature_names,
-        filename=data_file_name,
-        data_module=DATA_MODULE,
-    )
-
-
-def load_digits(*, n_class=10, return_X_y=False, as_frame=False):
-    """Load and return the digits dataset (classification).
-
-    Each datapoint is a 8x8 image of a digit.
-
-    =================   ==============
-    Classes                         10
-    Samples per class             ~180
-    Samples total                 1797
-    Dimensionality                  64
-    Features             integers 0-16
-    =================   ==============
-
-    Read more in the :ref:`User Guide <digits_dataset>`.
-
-    Parameters
-    ----------
-    n_class : int, default=10
-        The number of classes to return. Between 0 and 10.
-
-    return_X_y : bool, default=False
-        If True, returns ``(data, target)`` instead of a Bunch object.
-        See below for more information about the `data` and `target` object.
-
-        .. versionadded:: 0.18
-
-    as_frame : bool, default=False
-        If True, the data is a pandas DataFrame including columns with
-        appropriate dtypes (numeric). The target is
-        a pandas DataFrame or Series depending on the number of target columns.
-        If `return_X_y` is True, then (`data`, `target`) will be pandas
-        DataFrames or Series as described below.
-
-        .. versionadded:: 0.23
-
-    Returns
-    -------
-    data : :class:`~sklearn.utils.Bunch`
-        Dictionary-like object, with the following attributes.
-
-        data : {ndarray, dataframe} of shape (1797, 64)
-            The flattened data matrix. If `as_frame=True`, `data` will be
-            a pandas DataFrame.
-        target: {ndarray, Series} of shape (1797,)
-            The classification target. If `as_frame=True`, `target` will be
-            a pandas Series.
-        feature_names: list
-            The names of the dataset columns.
-        target_names: list
-            The names of target classes.
-
-            .. versionadded:: 0.20
-
-        frame: DataFrame of shape (1797, 65)
-            Only present when `as_frame=True`. DataFrame with `data` and
-            `target`.
-
-            .. versionadded:: 0.23
-        images: {ndarray} of shape (1797, 8, 8)
-            The raw image data.
-        DESCR: str
-            The full description of the dataset.
-
-    (data, target) : tuple if ``return_X_y`` is True
-
-        .. versionadded:: 0.18
-
-    This is a copy of the test set of the UCI ML hand-written digits datasets
-    https://archive.ics.uci.edu/ml/datasets/Optical+Recognition+of+Handwritten+Digits
-
-    Examples
-    --------
-    To load the data and visualize the images::
-
-        >>> from sklearn.datasets import load_digits
-        >>> digits = load_digits()
-        >>> print(digits.data.shape)
-        (1797, 64)
-        >>> import matplotlib.pyplot as plt
-        >>> plt.gray()
-        >>> plt.matshow(digits.images[0])
-        <...>
-        >>> plt.show()
-    """
-
-    data, fdescr = load_gzip_compressed_csv_data(
-        data_file_name="digits.csv.gz", descr_file_name="digits.rst", delimiter=","
-    )
-
-    target = data[:, -1].astype(int, copy=False)
-    flat_data = data[:, :-1]
-    images = flat_data.view()
-    images.shape = (-1, 8, 8)
-
-    if n_class < 10:
-        idx = target < n_class
-        flat_data, target = flat_data[idx], target[idx]
-        images = images[idx]
-
-    feature_names = [
-        "pixel_{}_{}".format(row_idx, col_idx)
-        for row_idx in range(8)
-        for col_idx in range(8)
-    ]
-
-    frame = None
-    target_columns = [
-        "target",
-    ]
-    if as_frame:
-        frame, flat_data, target = _convert_data_dataframe(
-            "load_digits", flat_data, target, feature_names, target_columns
-        )
-
-    if return_X_y:
-        return flat_data, target
-
-    return Bunch(
-        data=flat_data,
-        target=target,
-        frame=frame,
-        feature_names=feature_names,
-        target_names=np.arange(10),
-        images=images,
-        DESCR=fdescr,
-    )
-
-
-def load_diabetes(*, return_X_y=False, as_frame=False):
-    """Load and return the diabetes dataset (regression).
-
-    ==============   ==================
-    Samples total    442
-    Dimensionality   10
-    Features         real, -.2 < x < .2
-    Targets          integer 25 - 346
-    ==============   ==================
-
-    .. note::
-       The meaning of each feature (i.e. `feature_names`) might be unclear
-       (especially for `ltg`) as the documentation of the original dataset is
-       not explicit. We provide information that seems correct in regard with
-       the scientific literature in this field of research.
-
-    Read more in the :ref:`User Guide <diabetes_dataset>`.
-
-    Parameters
-    ----------
-    return_X_y : bool, default=False
-        If True, returns ``(data, target)`` instead of a Bunch object.
-        See below for more information about the `data` and `target` object.
-
-        .. versionadded:: 0.18
-
-    as_frame : bool, default=False
-        If True, the data is a pandas DataFrame including columns with
-        appropriate dtypes (numeric). The target is
-        a pandas DataFrame or Series depending on the number of target columns.
-        If `return_X_y` is True, then (`data`, `target`) will be pandas
-        DataFrames or Series as described below.
-
-        .. versionadded:: 0.23
-
-    Returns
-    -------
-    data : :class:`~sklearn.utils.Bunch`
-        Dictionary-like object, with the following attributes.
-
-        data : {ndarray, dataframe} of shape (442, 10)
-            The data matrix. If `as_frame=True`, `data` will be a pandas
-            DataFrame.
-        target: {ndarray, Series} of shape (442,)
-            The regression target. If `as_frame=True`, `target` will be
-            a pandas Series.
-        feature_names: list
-            The names of the dataset columns.
-        frame: DataFrame of shape (442, 11)
-            Only present when `as_frame=True`. DataFrame with `data` and
-            `target`.
-
-            .. versionadded:: 0.23
-        DESCR: str
-            The full description of the dataset.
-        data_filename: str
-            The path to the location of the data.
-        target_filename: str
-            The path to the location of the target.
-
-    (data, target) : tuple if ``return_X_y`` is True
-        Returns a tuple of two ndarray of shape (n_samples, n_features)
-        A 2D array with each row representing one sample and each column
-        representing the features and/or target of a given sample.
-        .. versionadded:: 0.18
-    """
-    data_filename = "diabetes_data.csv.gz"
-    target_filename = "diabetes_target.csv.gz"
-    data = load_gzip_compressed_csv_data(data_filename)
-    target = load_gzip_compressed_csv_data(target_filename)
-
-    fdescr = load_descr("diabetes.rst")
-
-    feature_names = ["age", "sex", "bmi", "bp", "s1", "s2", "s3", "s4", "s5", "s6"]
-
-    frame = None
-    target_columns = [
-        "target",
-    ]
-    if as_frame:
-        frame, data, target = _convert_data_dataframe(
-            "load_diabetes", data, target, feature_names, target_columns
-        )
-
-    if return_X_y:
-        return data, target
-
-    return Bunch(
-        data=data,
-        target=target,
-        frame=frame,
-        DESCR=fdescr,
-        feature_names=feature_names,
-        data_filename=data_filename,
-        target_filename=target_filename,
-        data_module=DATA_MODULE,
-    )
-
-
-def load_linnerud(*, return_X_y=False, as_frame=False):
-    """Load and return the physical exercise Linnerud dataset.
-
-    This dataset is suitable for multi-ouput regression tasks.
-
-    ==============   ============================
-    Samples total    20
-    Dimensionality   3 (for both data and target)
-    Features         integer
-    Targets          integer
-    ==============   ============================
-
-    Read more in the :ref:`User Guide <linnerrud_dataset>`.
-
-    Parameters
-    ----------
-    return_X_y : bool, default=False
-        If True, returns ``(data, target)`` instead of a Bunch object.
-        See below for more information about the `data` and `target` object.
-
-        .. versionadded:: 0.18
-
-    as_frame : bool, default=False
-        If True, the data is a pandas DataFrame including columns with
-        appropriate dtypes (numeric, string or categorical). The target is
-        a pandas DataFrame or Series depending on the number of target columns.
-        If `return_X_y` is True, then (`data`, `target`) will be pandas
-        DataFrames or Series as described below.
-
-        .. versionadded:: 0.23
-
-    Returns
-    -------
-    data : :class:`~sklearn.utils.Bunch`
-        Dictionary-like object, with the following attributes.
-
-        data : {ndarray, dataframe} of shape (20, 3)
-            The data matrix. If `as_frame=True`, `data` will be a pandas
-            DataFrame.
-        target: {ndarray, dataframe} of shape (20, 3)
-            The regression targets. If `as_frame=True`, `target` will be
-            a pandas DataFrame.
-        feature_names: list
-            The names of the dataset columns.
-        target_names: list
-            The names of the target columns.
-        frame: DataFrame of shape (20, 6)
-            Only present when `as_frame=True`. DataFrame with `data` and
-            `target`.
-
-            .. versionadded:: 0.23
-        DESCR: str
-            The full description of the dataset.
-        data_filename: str
-            The path to the location of the data.
-        target_filename: str
-            The path to the location of the target.
-
-            .. versionadded:: 0.20
-
-    (data, target) : tuple if ``return_X_y`` is True
-
-        .. versionadded:: 0.18
-    """
-    data_filename = "linnerud_exercise.csv"
-    target_filename = "linnerud_physiological.csv"
-
-    # Read header and data
-    with resources.open_text(DATA_MODULE, data_filename) as f:
-        header_exercise = f.readline().split()
-        f.seek(0)  # reset file obj
-        data_exercise = np.loadtxt(f, skiprows=1)
-
-    with resources.open_text(DATA_MODULE, target_filename) as f:
-        header_physiological = f.readline().split()
-        f.seek(0)  # reset file obj
-        data_physiological = np.loadtxt(f, skiprows=1)
-
-    fdescr = load_descr("linnerud.rst")
-
-    frame = None
-    if as_frame:
-        (frame, data_exercise, data_physiological) = _convert_data_dataframe(
-            "load_linnerud",
-            data_exercise,
-            data_physiological,
-            header_exercise,
-            header_physiological,
-        )
-    if return_X_y:
-        return data_exercise, data_physiological
-
-    return Bunch(
-        data=data_exercise,
-        feature_names=header_exercise,
-        target=data_physiological,
-        target_names=header_physiological,
-        frame=frame,
-        DESCR=fdescr,
-        data_filename=data_filename,
-        target_filename=target_filename,
-        data_module=DATA_MODULE,
-    )
-
-
-@deprecated(
-    r"""`load_boston` is deprecated in 1.0 and will be removed in 1.2.
-
-    The Boston housing prices dataset has an ethical problem. You can refer to
-    the documentation of this function for further details.
-
-    The scikit-learn maintainers therefore strongly discourage the use of this
-    dataset unless the purpose of the code is to study and educate about
-    ethical issues in data science and machine learning.
-
-    In this special case, you can fetch the dataset from the original
-    source::
-
-        import pandas as pd
-        import numpy as np
-
-
-        data_url = "http://lib.stat.cmu.edu/datasets/boston"
-        raw_df = pd.read_csv(data_url, sep="\s+", skiprows=22, header=None)
-        data = np.hstack([raw_df.values[::2, :], raw_df.values[1::2, :2]])
-        target = raw_df.values[1::2, 2]
-
-    Alternative datasets include the California housing dataset (i.e.
-    :func:`~sklearn.datasets.fetch_california_housing`) and the Ames housing
-    dataset. You can load the datasets as follows::
-
-        from sklearn.datasets import fetch_california_housing
-        housing = fetch_california_housing()
-
-    for the California housing dataset and::
-
-        from sklearn.datasets import fetch_openml
-        housing = fetch_openml(name="house_prices", as_frame=True)
-
-    for the Ames housing dataset.
-    """
+from __future__ import annotations
+
+from collections.abc import (
+    Hashable,
+    Iterable,
+    Mapping,
+    Sequence,
 )
-def load_boston(*, return_X_y=False):
-    r"""Load and return the boston house-prices dataset (regression).
+import datetime
+from functools import partial
+from io import BytesIO
+import os
+from textwrap import fill
+from typing import (
+    IO,
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Generic,
+    Literal,
+    TypeVar,
+    Union,
+    cast,
+    overload,
+)
+import warnings
+import zipfile
 
-    ==============   ==============
-    Samples total               506
-    Dimensionality               13
-    Features         real, positive
-    Targets           real 5. - 50.
-    ==============   ==============
+from pandas._config import config
 
-    Read more in the :ref:`User Guide <boston_dataset>`.
+from pandas._libs import lib
+from pandas._libs.parsers import STR_NA_VALUES
+from pandas.compat._optional import (
+    get_version,
+    import_optional_dependency,
+)
+from pandas.errors import EmptyDataError
+from pandas.util._decorators import (
+    Appender,
+    doc,
+)
+from pandas.util._exceptions import find_stack_level
+from pandas.util._validators import check_dtype_backend
 
-    .. deprecated:: 1.0
-       This function is deprecated in 1.0 and will be removed in 1.2. See the
-       warning message below for further details regarding the alternative
-       datasets.
+from pandas.core.dtypes.common import (
+    is_bool,
+    is_float,
+    is_integer,
+    is_list_like,
+)
 
-    .. warning::
-        The Boston housing prices dataset has an ethical problem: as
-        investigated in [1]_, the authors of this dataset engineered a
-        non-invertible variable "B" assuming that racial self-segregation had a
-        positive impact on house prices [2]_. Furthermore the goal of the
-        research that led to the creation of this dataset was to study the
-        impact of air quality but it did not give adequate demonstration of the
-        validity of this assumption.
+from pandas.core.frame import DataFrame
+from pandas.core.shared_docs import _shared_docs
+from pandas.util.version import Version
 
-        The scikit-learn maintainers therefore strongly discourage the use of
-        this dataset unless the purpose of the code is to study and educate
-        about ethical issues in data science and machine learning.
+from pandas.io.common import (
+    IOHandles,
+    get_handle,
+    stringify_path,
+    validate_header_arg,
+)
+from pandas.io.excel._util import (
+    fill_mi_header,
+    get_default_engine,
+    get_writer,
+    maybe_convert_usecols,
+    pop_header_name,
+)
+from pandas.io.parsers import TextParser
+from pandas.io.parsers.readers import validate_integer
 
-        In this special case, you can fetch the dataset from the original
-        source::
+if TYPE_CHECKING:
+    from types import TracebackType
 
-            import pandas as pd  # doctest: +SKIP
-            import numpy as np
+    from pandas._typing import (
+        DtypeArg,
+        DtypeBackend,
+        ExcelWriterIfSheetExists,
+        FilePath,
+        IntStrT,
+        ReadBuffer,
+        Self,
+        SequenceNotStr,
+        StorageOptions,
+        WriteExcelBuffer,
+    )
+_read_excel_doc = (
+    """
+Read an Excel file into a ``pandas`` ``DataFrame``.
+
+Supports `xls`, `xlsx`, `xlsm`, `xlsb`, `odf`, `ods` and `odt` file extensions
+read from a local filesystem or URL. Supports an option to read
+a single sheet or a list of sheets.
+
+Parameters
+----------
+io : str, bytes, ExcelFile, xlrd.Book, path object, or file-like object
+    Any valid string path is acceptable. The string could be a URL. Valid
+    URL schemes include http, ftp, s3, and file. For file URLs, a host is
+    expected. A local file could be: ``file://localhost/path/to/table.xlsx``.
+
+    If you want to pass in a path object, pandas accepts any ``os.PathLike``.
+
+    By file-like object, we refer to objects with a ``read()`` method,
+    such as a file handle (e.g. via builtin ``open`` function)
+    or ``StringIO``.
+
+    .. deprecated:: 2.1.0
+        Passing byte strings is deprecated. To read from a
+        byte string, wrap it in a ``BytesIO`` object.
+sheet_name : str, int, list, or None, default 0
+    Strings are used for sheet names. Integers are used in zero-indexed
+    sheet positions (chart sheets do not count as a sheet position).
+    Lists of strings/integers are used to request multiple sheets.
+    Specify ``None`` to get all worksheets.
+
+    Available cases:
+
+    * Defaults to ``0``: 1st sheet as a `DataFrame`
+    * ``1``: 2nd sheet as a `DataFrame`
+    * ``"Sheet1"``: Load sheet with name "Sheet1"
+    * ``[0, 1, "Sheet5"]``: Load first, second and sheet named "Sheet5"
+      as a dict of `DataFrame`
+    * ``None``: All worksheets.
+
+header : int, list of int, default 0
+    Row (0-indexed) to use for the column labels of the parsed
+    DataFrame. If a list of integers is passed those row positions will
+    be combined into a ``MultiIndex``. Use None if there is no header.
+names : array-like, default None
+    List of column names to use. If file contains no header row,
+    then you should explicitly pass header=None.
+index_col : int, str, list of int, default None
+    Column (0-indexed) to use as the row labels of the DataFrame.
+    Pass None if there is no such column.  If a list is passed,
+    those columns will be combined into a ``MultiIndex``.  If a
+    subset of data is selected with ``usecols``, index_col
+    is based on the subset.
+
+    Missing values will be forward filled to allow roundtripping with
+    ``to_excel`` for ``merged_cells=True``. To avoid forward filling the
+    missing values use ``set_index`` after reading the data instead of
+    ``index_col``.
+usecols : str, list-like, or callable, default None
+    * If None, then parse all columns.
+    * If str, then indicates comma separated list of Excel column letters
+      and column ranges (e.g. "A:E" or "A,C,E:F"). Ranges are inclusive of
+      both sides.
+    * If list of int, then indicates list of column numbers to be parsed
+      (0-indexed).
+    * If list of string, then indicates list of column names to be parsed.
+    * If callable, then evaluate each column name against it and parse the
+      column if the callable returns ``True``.
+
+    Returns a subset of the columns according to behavior above.
+dtype : Type name or dict of column -> type, default None
+    Data type for data or columns. E.g. {{'a': np.float64, 'b': np.int32}}
+    Use ``object`` to preserve data as stored in Excel and not interpret dtype,
+    which will necessarily result in ``object`` dtype.
+    If converters are specified, they will be applied INSTEAD
+    of dtype conversion.
+    If you use ``None``, it will infer the dtype of each column based on the data.
+engine : {{'openpyxl', 'calamine', 'odf', 'pyxlsb', 'xlrd'}}, default None
+    If io is not a buffer or path, this must be set to identify io.
+    Engine compatibility :
+
+    - ``openpyxl`` supports newer Excel file formats.
+    - ``calamine`` supports Excel (.xls, .xlsx, .xlsm, .xlsb)
+      and OpenDocument (.ods) file formats.
+    - ``odf`` supports OpenDocument file formats (.odf, .ods, .odt).
+    - ``pyxlsb`` supports Binary Excel files.
+    - ``xlrd`` supports old-style Excel files (.xls).
+
+    When ``engine=None``, the following logic will be used to determine the engine:
+
+    - If ``path_or_buffer`` is an OpenDocument format (.odf, .ods, .odt),
+      then `odf <https://pypi.org/project/odfpy/>`_ will be used.
+    - Otherwise if ``path_or_buffer`` is an xls format, ``xlrd`` will be used.
+    - Otherwise if ``path_or_buffer`` is in xlsb format, ``pyxlsb`` will be used.
+    - Otherwise ``openpyxl`` will be used.
+converters : dict, default None
+    Dict of functions for converting values in certain columns. Keys can
+    either be integers or column labels, values are functions that take one
+    input argument, the Excel cell content, and return the transformed
+    content.
+true_values : list, default None
+    Values to consider as True.
+false_values : list, default None
+    Values to consider as False.
+skiprows : list-like, int, or callable, optional
+    Line numbers to skip (0-indexed) or number of lines to skip (int) at the
+    start of the file. If callable, the callable function will be evaluated
+    against the row indices, returning True if the row should be skipped and
+    False otherwise. An example of a valid callable argument would be ``lambda
+    x: x in [0, 2]``.
+nrows : int, default None
+    Number of rows to parse.
+na_values : scalar, str, list-like, or dict, default None
+    Additional strings to recognize as NA/NaN. If dict passed, specific
+    per-column NA values. By default the following values are interpreted
+    as NaN: '"""
+    + fill("', '".join(sorted(STR_NA_VALUES)), 70, subsequent_indent="    ")
+    + """'.
+keep_default_na : bool, default True
+    Whether or not to include the default NaN values when parsing the data.
+    Depending on whether ``na_values`` is passed in, the behavior is as follows:
+
+    * If ``keep_default_na`` is True, and ``na_values`` are specified,
+      ``na_values`` is appended to the default NaN values used for parsing.
+    * If ``keep_default_na`` is True, and ``na_values`` are not specified, only
+      the default NaN values are used for parsing.
+    * If ``keep_default_na`` is False, and ``na_values`` are specified, only
+      the NaN values specified ``na_values`` are used for parsing.
+    * If ``keep_default_na`` is False, and ``na_values`` are not specified, no
+      strings will be parsed as NaN.
+
+    Note that if `na_filter` is passed in as False, the ``keep_default_na`` and
+    ``na_values`` parameters will be ignored.
+na_filter : bool, default True
+    Detect missing value markers (empty strings and the value of na_values). In
+    data without any NAs, passing ``na_filter=False`` can improve the
+    performance of reading a large file.
+verbose : bool, default False
+    Indicate number of NA values placed in non-numeric columns.
+parse_dates : bool, list-like, or dict, default False
+    The behavior is as follows:
+
+    * ``bool``. If True -> try parsing the index.
+    * ``list`` of int or names. e.g. If [1, 2, 3] -> try parsing columns 1, 2, 3
+      each as a separate date column.
+    * ``list`` of lists. e.g.  If [[1, 3]] -> combine columns 1 and 3 and parse as
+      a single date column.
+    * ``dict``, e.g. {{'foo' : [1, 3]}} -> parse columns 1, 3 as date and call
+      result 'foo'
+
+    If a column or index contains an unparsable date, the entire column or
+    index will be returned unaltered as an object data type. If you don`t want to
+    parse some cells as date just change their type in Excel to "Text".
+    For non-standard datetime parsing, use ``pd.to_datetime`` after ``pd.read_excel``.
+
+    Note: A fast-path exists for iso8601-formatted dates.
+date_parser : function, optional
+    Function to use for converting a sequence of string columns to an array of
+    datetime instances. The default uses ``dateutil.parser.parser`` to do the
+    conversion. Pandas will try to call `date_parser` in three different ways,
+    advancing to the next if an exception occurs: 1) Pass one or more arrays
+    (as defined by `parse_dates`) as arguments; 2) concatenate (row-wise) the
+    string values from the columns defined by `parse_dates` into a single array
+    and pass that; and 3) call `date_parser` once for each row using one or
+    more strings (corresponding to the columns defined by `parse_dates`) as
+    arguments.
+
+    .. deprecated:: 2.0.0
+       Use ``date_format`` instead, or read in as ``object`` and then apply
+       :func:`to_datetime` as-needed.
+date_format : str or dict of column -> format, default ``None``
+   If used in conjunction with ``parse_dates``, will parse dates according to this
+   format. For anything more complex,
+   please read in as ``object`` and then apply :func:`to_datetime` as-needed.
+
+   .. versionadded:: 2.0.0
+thousands : str, default None
+    Thousands separator for parsing string columns to numeric.  Note that
+    this parameter is only necessary for columns stored as TEXT in Excel,
+    any numeric columns will automatically be parsed, regardless of display
+    format.
+decimal : str, default '.'
+    Character to recognize as decimal point for parsing string columns to numeric.
+    Note that this parameter is only necessary for columns stored as TEXT in Excel,
+    any numeric columns will automatically be parsed, regardless of display
+    format.(e.g. use ',' for European data).
+
+    .. versionadded:: 1.4.0
+
+comment : str, default None
+    Comments out remainder of line. Pass a character or characters to this
+    argument to indicate comments in the input file. Any data between the
+    comment string and the end of the current line is ignored.
+skipfooter : int, default 0
+    Rows at the end to skip (0-indexed).
+{storage_options}
+
+dtype_backend : {{'numpy_nullable', 'pyarrow'}}, default 'numpy_nullable'
+    Back-end data type applied to the resultant :class:`DataFrame`
+    (still experimental). Behaviour is as follows:
+
+    * ``"numpy_nullable"``: returns nullable-dtype-backed :class:`DataFrame`
+      (default).
+    * ``"pyarrow"``: returns pyarrow-backed nullable :class:`ArrowDtype`
+      DataFrame.
+
+    .. versionadded:: 2.0
+
+engine_kwargs : dict, optional
+    Arbitrary keyword arguments passed to excel engine.
+
+Returns
+-------
+DataFrame or dict of DataFrames
+    DataFrame from the passed in Excel file. See notes in sheet_name
+    argument for more information on when a dict of DataFrames is returned.
+
+See Also
+--------
+DataFrame.to_excel : Write DataFrame to an Excel file.
+DataFrame.to_csv : Write DataFrame to a comma-separated values (csv) file.
+read_csv : Read a comma-separated values (csv) file into DataFrame.
+read_fwf : Read a table of fixed-width formatted lines into DataFrame.
+
+Notes
+-----
+For specific information on the methods used for each Excel engine, refer to the pandas
+:ref:`user guide <io.excel_reader>`
+
+Examples
+--------
+The file can be read using the file name as string or an open file object:
+
+>>> pd.read_excel('tmp.xlsx', index_col=0)  # doctest: +SKIP
+       Name  Value
+0   string1      1
+1   string2      2
+2  #Comment      3
+
+>>> pd.read_excel(open('tmp.xlsx', 'rb'),
+...               sheet_name='Sheet3')  # doctest: +SKIP
+   Unnamed: 0      Name  Value
+0           0   string1      1
+1           1   string2      2
+2           2  #Comment      3
+
+Index and header can be specified via the `index_col` and `header` arguments
+
+>>> pd.read_excel('tmp.xlsx', index_col=None, header=None)  # doctest: +SKIP
+     0         1      2
+0  NaN      Name  Value
+1  0.0   string1      1
+2  1.0   string2      2
+3  2.0  #Comment      3
+
+Column types are inferred but can be explicitly specified
+
+>>> pd.read_excel('tmp.xlsx', index_col=0,
+...               dtype={{'Name': str, 'Value': float}})  # doctest: +SKIP
+       Name  Value
+0   string1    1.0
+1   string2    2.0
+2  #Comment    3.0
+
+True, False, and NA values, and thousands separators have defaults,
+but can be explicitly specified, too. Supply the values you would like
+as strings or lists of strings!
+
+>>> pd.read_excel('tmp.xlsx', index_col=0,
+...               na_values=['string1', 'string2'])  # doctest: +SKIP
+       Name  Value
+0       NaN      1
+1       NaN      2
+2  #Comment      3
+
+Comment lines in the excel input file can be skipped using the
+``comment`` kwarg.
+
+>>> pd.read_excel('tmp.xlsx', index_col=0, comment='#')  # doctest: +SKIP
+      Name  Value
+0  string1    1.0
+1  string2    2.0
+2     None    NaN
+"""
+)
 
 
-            data_url = "http://lib.stat.cmu.edu/datasets/boston"
-            raw_df = pd.read_csv(data_url, sep="s+", skiprows=22, header=None)
-            data = np.hstack([raw_df.values[::2, :], raw_df.values[1::2, :2]])
-            target = raw_df.values[1::2, 2]
+@overload
+def read_excel(
+    io,
+    # sheet name is str or int -> DataFrame
+    sheet_name: str | int = ...,
+    *,
+    header: int | Sequence[int] | None = ...,
+    names: SequenceNotStr[Hashable] | range | None = ...,
+    index_col: int | str | Sequence[int] | None = ...,
+    usecols: int
+    | str
+    | Sequence[int]
+    | Sequence[str]
+    | Callable[[str], bool]
+    | None = ...,
+    dtype: DtypeArg | None = ...,
+    engine: Literal["xlrd", "openpyxl", "odf", "pyxlsb", "calamine"] | None = ...,
+    converters: dict[str, Callable] | dict[int, Callable] | None = ...,
+    true_values: Iterable[Hashable] | None = ...,
+    false_values: Iterable[Hashable] | None = ...,
+    skiprows: Sequence[int] | int | Callable[[int], object] | None = ...,
+    nrows: int | None = ...,
+    na_values=...,
+    keep_default_na: bool = ...,
+    na_filter: bool = ...,
+    verbose: bool = ...,
+    parse_dates: list | dict | bool = ...,
+    date_parser: Callable | lib.NoDefault = ...,
+    date_format: dict[Hashable, str] | str | None = ...,
+    thousands: str | None = ...,
+    decimal: str = ...,
+    comment: str | None = ...,
+    skipfooter: int = ...,
+    storage_options: StorageOptions = ...,
+    dtype_backend: DtypeBackend | lib.NoDefault = ...,
+) -> DataFrame:
+    ...
 
-        Alternative datasets include the California housing dataset [3]_
-        (i.e. :func:`~sklearn.datasets.fetch_california_housing`) and Ames
-        housing dataset [4]_. You can load the datasets as follows::
 
-            from sklearn.datasets import fetch_california_housing
-            housing = fetch_california_housing()
+@overload
+def read_excel(
+    io,
+    # sheet name is list or None -> dict[IntStrT, DataFrame]
+    sheet_name: list[IntStrT] | None,
+    *,
+    header: int | Sequence[int] | None = ...,
+    names: SequenceNotStr[Hashable] | range | None = ...,
+    index_col: int | str | Sequence[int] | None = ...,
+    usecols: int
+    | str
+    | Sequence[int]
+    | Sequence[str]
+    | Callable[[str], bool]
+    | None = ...,
+    dtype: DtypeArg | None = ...,
+    engine: Literal["xlrd", "openpyxl", "odf", "pyxlsb", "calamine"] | None = ...,
+    converters: dict[str, Callable] | dict[int, Callable] | None = ...,
+    true_values: Iterable[Hashable] | None = ...,
+    false_values: Iterable[Hashable] | None = ...,
+    skiprows: Sequence[int] | int | Callable[[int], object] | None = ...,
+    nrows: int | None = ...,
+    na_values=...,
+    keep_default_na: bool = ...,
+    na_filter: bool = ...,
+    verbose: bool = ...,
+    parse_dates: list | dict | bool = ...,
+    date_parser: Callable | lib.NoDefault = ...,
+    date_format: dict[Hashable, str] | str | None = ...,
+    thousands: str | None = ...,
+    decimal: str = ...,
+    comment: str | None = ...,
+    skipfooter: int = ...,
+    storage_options: StorageOptions = ...,
+    dtype_backend: DtypeBackend | lib.NoDefault = ...,
+) -> dict[IntStrT, DataFrame]:
+    ...
 
-        for the California housing dataset and::
 
-            from sklearn.datasets import fetch_openml
-            housing = fetch_openml(name="house_prices", as_frame=True)  # noqa
+@doc(storage_options=_shared_docs["storage_options"])
+@Appender(_read_excel_doc)
+def read_excel(
+    io,
+    sheet_name: str | int | list[IntStrT] | None = 0,
+    *,
+    header: int | Sequence[int] | None = 0,
+    names: SequenceNotStr[Hashable] | range | None = None,
+    index_col: int | str | Sequence[int] | None = None,
+    usecols: int
+    | str
+    | Sequence[int]
+    | Sequence[str]
+    | Callable[[str], bool]
+    | None = None,
+    dtype: DtypeArg | None = None,
+    engine: Literal["xlrd", "openpyxl", "odf", "pyxlsb", "calamine"] | None = None,
+    converters: dict[str, Callable] | dict[int, Callable] | None = None,
+    true_values: Iterable[Hashable] | None = None,
+    false_values: Iterable[Hashable] | None = None,
+    skiprows: Sequence[int] | int | Callable[[int], object] | None = None,
+    nrows: int | None = None,
+    na_values=None,
+    keep_default_na: bool = True,
+    na_filter: bool = True,
+    verbose: bool = False,
+    parse_dates: list | dict | bool = False,
+    date_parser: Callable | lib.NoDefault = lib.no_default,
+    date_format: dict[Hashable, str] | str | None = None,
+    thousands: str | None = None,
+    decimal: str = ".",
+    comment: str | None = None,
+    skipfooter: int = 0,
+    storage_options: StorageOptions | None = None,
+    dtype_backend: DtypeBackend | lib.NoDefault = lib.no_default,
+    engine_kwargs: dict | None = None,
+) -> DataFrame | dict[IntStrT, DataFrame]:
+    check_dtype_backend(dtype_backend)
+    should_close = False
+    if engine_kwargs is None:
+        engine_kwargs = {}
 
-        for the Ames housing dataset.
+    if not isinstance(io, ExcelFile):
+        should_close = True
+        io = ExcelFile(
+            io,
+            storage_options=storage_options,
+            engine=engine,
+            engine_kwargs=engine_kwargs,
+        )
+    elif engine and engine != io.engine:
+        raise ValueError(
+            "Engine should not be specified when passing "
+            "an ExcelFile - ExcelFile already has the engine set"
+        )
+
+    try:
+        data = io.parse(
+            sheet_name=sheet_name,
+            header=header,
+            names=names,
+            index_col=index_col,
+            usecols=usecols,
+            dtype=dtype,
+            converters=converters,
+            true_values=true_values,
+            false_values=false_values,
+            skiprows=skiprows,
+            nrows=nrows,
+            na_values=na_values,
+            keep_default_na=keep_default_na,
+            na_filter=na_filter,
+            verbose=verbose,
+            parse_dates=parse_dates,
+            date_parser=date_parser,
+            date_format=date_format,
+            thousands=thousands,
+            decimal=decimal,
+            comment=comment,
+            skipfooter=skipfooter,
+            dtype_backend=dtype_backend,
+        )
+    finally:
+        # make sure to close opened file handles
+        if should_close:
+            io.close()
+    return data
+
+
+_WorkbookT = TypeVar("_WorkbookT")
+
+
+class BaseExcelReader(Generic[_WorkbookT]):
+    book: _WorkbookT
+
+    def __init__(
+        self,
+        filepath_or_buffer,
+        storage_options: StorageOptions | None = None,
+        engine_kwargs: dict | None = None,
+    ) -> None:
+        if engine_kwargs is None:
+            engine_kwargs = {}
+
+        # First argument can also be bytes, so create a buffer
+        if isinstance(filepath_or_buffer, bytes):
+            filepath_or_buffer = BytesIO(filepath_or_buffer)
+
+        self.handles = IOHandles(
+            handle=filepath_or_buffer, compression={"method": None}
+        )
+        if not isinstance(filepath_or_buffer, (ExcelFile, self._workbook_class)):
+            self.handles = get_handle(
+                filepath_or_buffer, "rb", storage_options=storage_options, is_text=False
+            )
+
+        if isinstance(self.handles.handle, self._workbook_class):
+            self.book = self.handles.handle
+        elif hasattr(self.handles.handle, "read"):
+            # N.B. xlrd.Book has a read attribute too
+            self.handles.handle.seek(0)
+            try:
+                self.book = self.load_workbook(self.handles.handle, engine_kwargs)
+            except Exception:
+                self.close()
+                raise
+        else:
+            raise ValueError(
+                "Must explicitly set engine if not passing in buffer or path for io."
+            )
+
+    @property
+    def _workbook_class(self) -> type[_WorkbookT]:
+        raise NotImplementedError
+
+    def load_workbook(self, filepath_or_buffer, engine_kwargs) -> _WorkbookT:
+        raise NotImplementedError
+
+    def close(self) -> None:
+        if hasattr(self, "book"):
+            if hasattr(self.book, "close"):
+                # pyxlsb: opens a TemporaryFile
+                # openpyxl: https://stackoverflow.com/questions/31416842/
+                #     openpyxl-does-not-close-excel-workbook-in-read-only-mode
+                self.book.close()
+            elif hasattr(self.book, "release_resources"):
+                # xlrd
+                # https://github.com/python-excel/xlrd/blob/2.0.1/xlrd/book.py#L548
+                self.book.release_resources()
+        self.handles.close()
+
+    @property
+    def sheet_names(self) -> list[str]:
+        raise NotImplementedError
+
+    def get_sheet_by_name(self, name: str):
+        raise NotImplementedError
+
+    def get_sheet_by_index(self, index: int):
+        raise NotImplementedError
+
+    def get_sheet_data(self, sheet, rows: int | None = None):
+        raise NotImplementedError
+
+    def raise_if_bad_sheet_by_index(self, index: int) -> None:
+        n_sheets = len(self.sheet_names)
+        if index >= n_sheets:
+            raise ValueError(
+                f"Worksheet index {index} is invalid, {n_sheets} worksheets found"
+            )
+
+    def raise_if_bad_sheet_by_name(self, name: str) -> None:
+        if name not in self.sheet_names:
+            raise ValueError(f"Worksheet named '{name}' not found")
+
+    def _check_skiprows_func(
+        self,
+        skiprows: Callable,
+        rows_to_use: int,
+    ) -> int:
+        """
+        Determine how many file rows are required to obtain `nrows` data
+        rows when `skiprows` is a function.
+
+        Parameters
+        ----------
+        skiprows : function
+            The function passed to read_excel by the user.
+        rows_to_use : int
+            The number of rows that will be needed for the header and
+            the data.
+
+        Returns
+        -------
+        int
+        """
+        i = 0
+        rows_used_so_far = 0
+        while rows_used_so_far < rows_to_use:
+            if not skiprows(i):
+                rows_used_so_far += 1
+            i += 1
+        return i
+
+    def _calc_rows(
+        self,
+        header: int | Sequence[int] | None,
+        index_col: int | Sequence[int] | None,
+        skiprows: Sequence[int] | int | Callable[[int], object] | None,
+        nrows: int | None,
+    ) -> int | None:
+        """
+        If nrows specified, find the number of rows needed from the
+        file, otherwise return None.
+
+
+        Parameters
+        ----------
+        header : int, list of int, or None
+            See read_excel docstring.
+        index_col : int, str, list of int, or None
+            See read_excel docstring.
+        skiprows : list-like, int, callable, or None
+            See read_excel docstring.
+        nrows : int or None
+            See read_excel docstring.
+
+        Returns
+        -------
+        int or None
+        """
+        if nrows is None:
+            return None
+        if header is None:
+            header_rows = 1
+        elif is_integer(header):
+            header = cast(int, header)
+            header_rows = 1 + header
+        else:
+            header = cast(Sequence, header)
+            header_rows = 1 + header[-1]
+        # If there is a MultiIndex header and an index then there is also
+        # a row containing just the index name(s)
+        if is_list_like(header) and index_col is not None:
+            header = cast(Sequence, header)
+            if len(header) > 1:
+                header_rows += 1
+        if skiprows is None:
+            return header_rows + nrows
+        if is_integer(skiprows):
+            skiprows = cast(int, skiprows)
+            return header_rows + nrows + skiprows
+        if is_list_like(skiprows):
+
+            def f(skiprows: Sequence, x: int) -> bool:
+                return x in skiprows
+
+            skiprows = cast(Sequence, skiprows)
+            return self._check_skiprows_func(partial(f, skiprows), header_rows + nrows)
+        if callable(skiprows):
+            return self._check_skiprows_func(
+                skiprows,
+                header_rows + nrows,
+            )
+        # else unexpected skiprows type: read_excel will not optimize
+        # the number of rows read from file
+        return None
+
+    def parse(
+        self,
+        sheet_name: str | int | list[int] | list[str] | None = 0,
+        header: int | Sequence[int] | None = 0,
+        names: SequenceNotStr[Hashable] | range | None = None,
+        index_col: int | Sequence[int] | None = None,
+        usecols=None,
+        dtype: DtypeArg | None = None,
+        true_values: Iterable[Hashable] | None = None,
+        false_values: Iterable[Hashable] | None = None,
+        skiprows: Sequence[int] | int | Callable[[int], object] | None = None,
+        nrows: int | None = None,
+        na_values=None,
+        verbose: bool = False,
+        parse_dates: list | dict | bool = False,
+        date_parser: Callable | lib.NoDefault = lib.no_default,
+        date_format: dict[Hashable, str] | str | None = None,
+        thousands: str | None = None,
+        decimal: str = ".",
+        comment: str | None = None,
+        skipfooter: int = 0,
+        dtype_backend: DtypeBackend | lib.NoDefault = lib.no_default,
+        **kwds,
+    ):
+        validate_header_arg(header)
+        validate_integer("nrows", nrows)
+
+        ret_dict = False
+
+        # Keep sheetname to maintain backwards compatibility.
+        sheets: list[int] | list[str]
+        if isinstance(sheet_name, list):
+            sheets = sheet_name
+            ret_dict = True
+        elif sheet_name is None:
+            sheets = self.sheet_names
+            ret_dict = True
+        elif isinstance(sheet_name, str):
+            sheets = [sheet_name]
+        else:
+            sheets = [sheet_name]
+
+        # handle same-type duplicates.
+        sheets = cast(Union[list[int], list[str]], list(dict.fromkeys(sheets).keys()))
+
+        output = {}
+
+        last_sheetname = None
+        for asheetname in sheets:
+            last_sheetname = asheetname
+            if verbose:
+                print(f"Reading sheet {asheetname}")
+
+            if isinstance(asheetname, str):
+                sheet = self.get_sheet_by_name(asheetname)
+            else:  # assume an integer if not a string
+                sheet = self.get_sheet_by_index(asheetname)
+
+            file_rows_needed = self._calc_rows(header, index_col, skiprows, nrows)
+            data = self.get_sheet_data(sheet, file_rows_needed)
+            if hasattr(sheet, "close"):
+                # pyxlsb opens two TemporaryFiles
+                sheet.close()
+            usecols = maybe_convert_usecols(usecols)
+
+            if not data:
+                output[asheetname] = DataFrame()
+                continue
+
+            is_list_header = False
+            is_len_one_list_header = False
+            if is_list_like(header):
+                assert isinstance(header, Sequence)
+                is_list_header = True
+                if len(header) == 1:
+                    is_len_one_list_header = True
+
+            if is_len_one_list_header:
+                header = cast(Sequence[int], header)[0]
+
+            # forward fill and pull out names for MultiIndex column
+            header_names = None
+            if header is not None and is_list_like(header):
+                assert isinstance(header, Sequence)
+
+                header_names = []
+                control_row = [True] * len(data[0])
+
+                for row in header:
+                    if is_integer(skiprows):
+                        assert isinstance(skiprows, int)
+                        row += skiprows
+
+                    if row > len(data) - 1:
+                        raise ValueError(
+                            f"header index {row} exceeds maximum index "
+                            f"{len(data) - 1} of data.",
+                        )
+
+                    data[row], control_row = fill_mi_header(data[row], control_row)
+
+                    if index_col is not None:
+                        header_name, _ = pop_header_name(data[row], index_col)
+                        header_names.append(header_name)
+
+            # If there is a MultiIndex header and an index then there is also
+            # a row containing just the index name(s)
+            has_index_names = False
+            if is_list_header and not is_len_one_list_header and index_col is not None:
+                index_col_list: Sequence[int]
+                if isinstance(index_col, int):
+                    index_col_list = [index_col]
+                else:
+                    assert isinstance(index_col, Sequence)
+                    index_col_list = index_col
+
+                # We have to handle mi without names. If any of the entries in the data
+                # columns are not empty, this is a regular row
+                assert isinstance(header, Sequence)
+                if len(header) < len(data):
+                    potential_index_names = data[len(header)]
+                    potential_data = [
+                        x
+                        for i, x in enumerate(potential_index_names)
+                        if not control_row[i] and i not in index_col_list
+                    ]
+                    has_index_names = all(x == "" or x is None for x in potential_data)
+
+            if is_list_like(index_col):
+                # Forward fill values for MultiIndex index.
+                if header is None:
+                    offset = 0
+                elif isinstance(header, int):
+                    offset = 1 + header
+                else:
+                    offset = 1 + max(header)
+
+                # GH34673: if MultiIndex names present and not defined in the header,
+                # offset needs to be incremented so that forward filling starts
+                # from the first MI value instead of the name
+                if has_index_names:
+                    offset += 1
+
+                # Check if we have an empty dataset
+                # before trying to collect data.
+                if offset < len(data):
+                    assert isinstance(index_col, Sequence)
+
+                    for col in index_col:
+                        last = data[offset][col]
+
+                        for row in range(offset + 1, len(data)):
+                            if data[row][col] == "" or data[row][col] is None:
+                                data[row][col] = last
+                            else:
+                                last = data[row][col]
+
+            # GH 12292 : error when read one empty column from excel file
+            try:
+                parser = TextParser(
+                    data,
+                    names=names,
+                    header=header,
+                    index_col=index_col,
+                    has_index_names=has_index_names,
+                    dtype=dtype,
+                    true_values=true_values,
+                    false_values=false_values,
+                    skiprows=skiprows,
+                    nrows=nrows,
+                    na_values=na_values,
+                    skip_blank_lines=False,  # GH 39808
+                    parse_dates=parse_dates,
+                    date_parser=date_parser,
+                    date_format=date_format,
+                    thousands=thousands,
+                    decimal=decimal,
+                    comment=comment,
+                    skipfooter=skipfooter,
+                    usecols=usecols,
+                    dtype_backend=dtype_backend,
+                    **kwds,
+                )
+
+                output[asheetname] = parser.read(nrows=nrows)
+
+                if header_names:
+                    output[asheetname].columns = output[asheetname].columns.set_names(
+                        header_names
+                    )
+
+            except EmptyDataError:
+                # No Data, return an empty DataFrame
+                output[asheetname] = DataFrame()
+
+            except Exception as err:
+                err.args = (f"{err.args[0]} (sheet: {asheetname})", *err.args[1:])
+                raise err
+
+        if last_sheetname is None:
+            raise ValueError("Sheet name is an empty list")
+
+        if ret_dict:
+            return output
+        else:
+            return output[last_sheetname]
+
+
+@doc(storage_options=_shared_docs["storage_options"])
+class ExcelWriter(Generic[_WorkbookT]):
+    """
+    Class for writing DataFrame objects into excel sheets.
+
+    Default is to use:
+
+    * `xlsxwriter <https://pypi.org/project/XlsxWriter/>`__ for xlsx files if xlsxwriter
+      is installed otherwise `openpyxl <https://pypi.org/project/openpyxl/>`__
+    * `odswriter <https://pypi.org/project/odswriter/>`__ for ods files
+
+    See ``DataFrame.to_excel`` for typical usage.
+
+    The writer should be used as a context manager. Otherwise, call `close()` to save
+    and close any opened file handles.
 
     Parameters
     ----------
-    return_X_y : bool, default=False
-        If True, returns ``(data, target)`` instead of a Bunch object.
-        See below for more information about the `data` and `target` object.
+    path : str or typing.BinaryIO
+        Path to xls or xlsx or ods file.
+    engine : str (optional)
+        Engine to use for writing. If None, defaults to
+        ``io.excel.<extension>.writer``.  NOTE: can only be passed as a keyword
+        argument.
+    date_format : str, default None
+        Format string for dates written into Excel files (e.g. 'YYYY-MM-DD').
+    datetime_format : str, default None
+        Format string for datetime objects written into Excel files.
+        (e.g. 'YYYY-MM-DD HH:MM:SS').
+    mode : {{'w', 'a'}}, default 'w'
+        File mode to use (write or append). Append does not work with fsspec URLs.
+    {storage_options}
 
-        .. versionadded:: 0.18
+    if_sheet_exists : {{'error', 'new', 'replace', 'overlay'}}, default 'error'
+        How to behave when trying to write to a sheet that already
+        exists (append mode only).
 
-    Returns
-    -------
-    data : :class:`~sklearn.utils.Bunch`
-        Dictionary-like object, with the following attributes.
+        * error: raise a ValueError.
+        * new: Create a new sheet, with a name determined by the engine.
+        * replace: Delete the contents of the sheet before writing to it.
+        * overlay: Write contents to the existing sheet without first removing,
+          but possibly over top of, the existing contents.
 
-        data : ndarray of shape (506, 13)
-            The data matrix.
-        target : ndarray of shape (506,)
-            The regression target.
-        filename : str
-            The physical location of boston csv dataset.
+        .. versionadded:: 1.3.0
 
-            .. versionadded:: 0.20
+        .. versionchanged:: 1.4.0
 
-        DESCR : str
-            The full description of the dataset.
-        feature_names : ndarray
-            The names of features
+           Added ``overlay`` option
 
-    (data, target) : tuple if ``return_X_y`` is True
+    engine_kwargs : dict, optional
+        Keyword arguments to be passed into the engine. These will be passed to
+        the following functions of the respective engines:
 
-        .. versionadded:: 0.18
+        * xlsxwriter: ``xlsxwriter.Workbook(file, **engine_kwargs)``
+        * openpyxl (write mode): ``openpyxl.Workbook(**engine_kwargs)``
+        * openpyxl (append mode): ``openpyxl.load_workbook(file, **engine_kwargs)``
+        * odswriter: ``odf.opendocument.OpenDocumentSpreadsheet(**engine_kwargs)``
+
+        .. versionadded:: 1.3.0
 
     Notes
     -----
-        .. versionchanged:: 0.20
-            Fixed a wrong data point at [445, 0].
-
-    References
-    ----------
-    .. [1] `Racist data destruction? M Carlisle,
-            <https://medium.com/@docintangible/racist-data-destruction-113e3eff54a8>`_
-    .. [2] `Harrison Jr, David, and Daniel L. Rubinfeld.
-           "Hedonic housing prices and the demand for clean air."
-           Journal of environmental economics and management 5.1 (1978): 81-102.
-           <https://www.researchgate.net/publication/4974606_Hedonic_housing_prices_and_the_demand_for_clean_air>`_
-    .. [3] `California housing dataset
-            <https://scikit-learn.org/stable/datasets/real_world.html#california-housing-dataset>`_
-    .. [4] `Ames housing dataset
-            <https://www.openml.org/d/42165>`_
+    For compatibility with CSV writers, ExcelWriter serializes lists
+    and dicts to strings before writing.
 
     Examples
     --------
-    >>> import warnings
-    >>> from sklearn.datasets import load_boston
-    >>> with warnings.catch_warnings():
-    ...     # You should probably not use this dataset.
-    ...     warnings.filterwarnings("ignore")
-    ...     X, y = load_boston(return_X_y=True)
-    >>> print(X.shape)
-    (506, 13)
-    """
-    # TODO: once the deprecation period is over, implement a module level
-    # `__getattr__` function in`sklearn.datasets` to raise an exception with
-    # an informative error message at import time instead of just removing
-    # load_boston. The goal is to avoid having beginners that copy-paste code
-    # from numerous books and tutorials that use this dataset loader get
-    # a confusing ImportError when trying to learn scikit-learn.
-    # See: https://www.python.org/dev/peps/pep-0562/
+    Default usage:
 
-    descr_text = load_descr("boston_house_prices.rst")
+    >>> df = pd.DataFrame([["ABC", "XYZ"]], columns=["Foo", "Bar"])  # doctest: +SKIP
+    >>> with pd.ExcelWriter("path_to_file.xlsx") as writer:
+    ...     df.to_excel(writer)  # doctest: +SKIP
 
-    data_file_name = "boston_house_prices.csv"
-    with resources.open_text(DATA_MODULE, data_file_name) as f:
-        data_file = csv.reader(f)
-        temp = next(data_file)
-        n_samples = int(temp[0])
-        n_features = int(temp[1])
-        data = np.empty((n_samples, n_features))
-        target = np.empty((n_samples,))
-        temp = next(data_file)  # names of features
-        feature_names = np.array(temp)
+    To write to separate sheets in a single file:
 
-        for i, d in enumerate(data_file):
-            data[i] = np.asarray(d[:-1], dtype=np.float64)
-            target[i] = np.asarray(d[-1], dtype=np.float64)
+    >>> df1 = pd.DataFrame([["AAA", "BBB"]], columns=["Spam", "Egg"])  # doctest: +SKIP
+    >>> df2 = pd.DataFrame([["ABC", "XYZ"]], columns=["Foo", "Bar"])  # doctest: +SKIP
+    >>> with pd.ExcelWriter("path_to_file.xlsx") as writer:
+    ...     df1.to_excel(writer, sheet_name="Sheet1")  # doctest: +SKIP
+    ...     df2.to_excel(writer, sheet_name="Sheet2")  # doctest: +SKIP
 
-    if return_X_y:
-        return data, target
+    You can set the date format or datetime format:
 
-    return Bunch(
-        data=data,
-        target=target,
-        # last column is target value
-        feature_names=feature_names[:-1],
-        DESCR=descr_text,
-        filename=data_file_name,
-        data_module=DATA_MODULE,
-    )
+    >>> from datetime import date, datetime  # doctest: +SKIP
+    >>> df = pd.DataFrame(
+    ...     [
+    ...         [date(2014, 1, 31), date(1999, 9, 24)],
+    ...         [datetime(1998, 5, 26, 23, 33, 4), datetime(2014, 2, 28, 13, 5, 13)],
+    ...     ],
+    ...     index=["Date", "Datetime"],
+    ...     columns=["X", "Y"],
+    ... )  # doctest: +SKIP
+    >>> with pd.ExcelWriter(
+    ...     "path_to_file.xlsx",
+    ...     date_format="YYYY-MM-DD",
+    ...     datetime_format="YYYY-MM-DD HH:MM:SS"
+    ... ) as writer:
+    ...     df.to_excel(writer)  # doctest: +SKIP
 
+    You can also append to an existing Excel file:
 
-def load_sample_images():
-    """Load sample images for image manipulation.
+    >>> with pd.ExcelWriter("path_to_file.xlsx", mode="a", engine="openpyxl") as writer:
+    ...     df.to_excel(writer, sheet_name="Sheet3")  # doctest: +SKIP
 
-    Loads both, ``china`` and ``flower``.
+    Here, the `if_sheet_exists` parameter can be set to replace a sheet if it
+    already exists:
 
-    Read more in the :ref:`User Guide <sample_images>`.
+    >>> with ExcelWriter(
+    ...     "path_to_file.xlsx",
+    ...     mode="a",
+    ...     engine="openpyxl",
+    ...     if_sheet_exists="replace",
+    ... ) as writer:
+    ...     df.to_excel(writer, sheet_name="Sheet1")  # doctest: +SKIP
 
-    Returns
-    -------
-    data : :class:`~sklearn.utils.Bunch`
-        Dictionary-like object, with the following attributes.
+    You can also write multiple DataFrames to a single sheet. Note that the
+    ``if_sheet_exists`` parameter needs to be set to ``overlay``:
 
-        images : list of ndarray of shape (427, 640, 3)
-            The two sample image.
-        filenames : list
-            The filenames for the images.
-        DESCR : str
-            The full description of the dataset.
+    >>> with ExcelWriter("path_to_file.xlsx",
+    ...     mode="a",
+    ...     engine="openpyxl",
+    ...     if_sheet_exists="overlay",
+    ... ) as writer:
+    ...     df1.to_excel(writer, sheet_name="Sheet1")
+    ...     df2.to_excel(writer, sheet_name="Sheet1", startcol=3)  # doctest: +SKIP
 
-    Examples
-    --------
-    To load the data and visualize the images:
+    You can store Excel file in RAM:
 
-    >>> from sklearn.datasets import load_sample_images
-    >>> dataset = load_sample_images()     #doctest: +SKIP
-    >>> len(dataset.images)                #doctest: +SKIP
-    2
-    >>> first_img_data = dataset.images[0] #doctest: +SKIP
-    >>> first_img_data.shape               #doctest: +SKIP
-    (427, 640, 3)
-    >>> first_img_data.dtype               #doctest: +SKIP
-    dtype('uint8')
-    """
-    # import PIL only when needed
-    from ..externals._pilutil import imread
+    >>> import io
+    >>> df = pd.DataFrame([["ABC", "XYZ"]], columns=["Foo", "Bar"])
+    >>> buffer = io.BytesIO()
+    >>> with pd.ExcelWriter(buffer) as writer:
+    ...     df.to_excel(writer)
 
-    descr = load_descr("README.txt", descr_module=IMAGES_MODULE)
+    You can pack Excel file into zip archive:
 
-    filenames, images = [], []
-    for filename in sorted(resources.contents(IMAGES_MODULE)):
-        if filename.endswith(".jpg"):
-            filenames.append(filename)
-            with resources.open_binary(IMAGES_MODULE, filename) as image_file:
-                image = imread(image_file)
-            images.append(image)
+    >>> import zipfile  # doctest: +SKIP
+    >>> df = pd.DataFrame([["ABC", "XYZ"]], columns=["Foo", "Bar"])  # doctest: +SKIP
+    >>> with zipfile.ZipFile("path_to_file.zip", "w") as zf:
+    ...     with zf.open("filename.xlsx", "w") as buffer:
+    ...         with pd.ExcelWriter(buffer) as writer:
+    ...             df.to_excel(writer)  # doctest: +SKIP
 
-    return Bunch(images=images, filenames=filenames, DESCR=descr)
+    You can specify additional arguments to the underlying engine:
 
+    >>> with pd.ExcelWriter(
+    ...     "path_to_file.xlsx",
+    ...     engine="xlsxwriter",
+    ...     engine_kwargs={{"options": {{"nan_inf_to_errors": True}}}}
+    ... ) as writer:
+    ...     df.to_excel(writer)  # doctest: +SKIP
 
-def load_sample_image(image_name):
-    """Load the numpy array of a single sample image
+    In append mode, ``engine_kwargs`` are passed through to
+    openpyxl's ``load_workbook``:
 
-    Read more in the :ref:`User Guide <sample_images>`.
-
-    Parameters
-    ----------
-    image_name : {`china.jpg`, `flower.jpg`}
-        The name of the sample image loaded
-
-    Returns
-    -------
-    img : 3D array
-        The image as a numpy array: height x width x color
-
-    Examples
-    --------
-
-    >>> from sklearn.datasets import load_sample_image
-    >>> china = load_sample_image('china.jpg')   # doctest: +SKIP
-    >>> china.dtype                              # doctest: +SKIP
-    dtype('uint8')
-    >>> china.shape                              # doctest: +SKIP
-    (427, 640, 3)
-    >>> flower = load_sample_image('flower.jpg') # doctest: +SKIP
-    >>> flower.dtype                             # doctest: +SKIP
-    dtype('uint8')
-    >>> flower.shape                             # doctest: +SKIP
-    (427, 640, 3)
-    """
-    images = load_sample_images()
-    index = None
-    for i, filename in enumerate(images.filenames):
-        if filename.endswith(image_name):
-            index = i
-            break
-    if index is None:
-        raise AttributeError("Cannot find sample image: %s" % image_name)
-    return images.images[index]
-
-
-def _pkl_filepath(*args, **kwargs):
-    """Return filename for Python 3 pickles
-
-    args[-1] is expected to be the ".pkl" filename. For compatibility with
-    older scikit-learn versions, a suffix is inserted before the extension.
-
-    _pkl_filepath('/path/to/folder', 'filename.pkl') returns
-    '/path/to/folder/filename_py3.pkl'
-
-    """
-    py3_suffix = kwargs.get("py3_suffix", "_py3")
-    basename, ext = splitext(args[-1])
-    basename += py3_suffix
-    new_args = args[:-1] + (basename + ext,)
-    return join(*new_args)
-
-
-def _sha256(path):
-    """Calculate the sha256 hash of the file at path."""
-    sha256hash = hashlib.sha256()
-    chunk_size = 8192
-    with open(path, "rb") as f:
-        while True:
-            buffer = f.read(chunk_size)
-            if not buffer:
-                break
-            sha256hash.update(buffer)
-    return sha256hash.hexdigest()
-
-
-def _fetch_remote(remote, dirname=None):
-    """Helper function to download a remote dataset into path
-
-    Fetch a dataset pointed by remote's url, save into path using remote's
-    filename and ensure its integrity based on the SHA256 Checksum of the
-    downloaded file.
-
-    Parameters
-    ----------
-    remote : RemoteFileMetadata
-        Named tuple containing remote dataset meta information: url, filename
-        and checksum
-
-    dirname : str
-        Directory to save the file to.
-
-    Returns
-    -------
-    file_path: str
-        Full path of the created file.
+    >>> with pd.ExcelWriter(
+    ...     "path_to_file.xlsx",
+    ...     engine="openpyxl",
+    ...     mode="a",
+    ...     engine_kwargs={{"keep_vba": True}}
+    ... ) as writer:
+    ...     df.to_excel(writer, sheet_name="Sheet2")  # doctest: +SKIP
     """
 
-    file_path = remote.filename if dirname is None else join(dirname, remote.filename)
-    urlretrieve(remote.url, file_path)
-    checksum = _sha256(file_path)
-    if remote.checksum != checksum:
-        raise IOError(
-            "{} has an SHA256 checksum ({}) "
-            "differing from expected ({}), "
-            "file may be corrupted.".format(file_path, checksum, remote.checksum)
+    # Defining an ExcelWriter implementation (see abstract methods for more...)
+
+    # - Mandatory
+    #   - ``write_cells(self, cells, sheet_name=None, startrow=0, startcol=0)``
+    #     --> called to write additional DataFrames to disk
+    #   - ``_supported_extensions`` (tuple of supported extensions), used to
+    #      check that engine supports the given extension.
+    #   - ``_engine`` - string that gives the engine name. Necessary to
+    #     instantiate class directly and bypass ``ExcelWriterMeta`` engine
+    #     lookup.
+    #   - ``save(self)`` --> called to save file to disk
+    # - Mostly mandatory (i.e. should at least exist)
+    #   - book, cur_sheet, path
+
+    # - Optional:
+    #   - ``__init__(self, path, engine=None, **kwargs)`` --> always called
+    #     with path as first argument.
+
+    # You also need to register the class with ``register_writer()``.
+    # Technically, ExcelWriter implementations don't need to subclass
+    # ExcelWriter.
+
+    _engine: str
+    _supported_extensions: tuple[str, ...]
+
+    def __new__(
+        cls,
+        path: FilePath | WriteExcelBuffer | ExcelWriter,
+        engine: str | None = None,
+        date_format: str | None = None,
+        datetime_format: str | None = None,
+        mode: str = "w",
+        storage_options: StorageOptions | None = None,
+        if_sheet_exists: ExcelWriterIfSheetExists | None = None,
+        engine_kwargs: dict | None = None,
+    ) -> Self:
+        # only switch class if generic(ExcelWriter)
+        if cls is ExcelWriter:
+            if engine is None or (isinstance(engine, str) and engine == "auto"):
+                if isinstance(path, str):
+                    ext = os.path.splitext(path)[-1][1:]
+                else:
+                    ext = "xlsx"
+
+                try:
+                    engine = config.get_option(f"io.excel.{ext}.writer", silent=True)
+                    if engine == "auto":
+                        engine = get_default_engine(ext, mode="writer")
+                except KeyError as err:
+                    raise ValueError(f"No engine for filetype: '{ext}'") from err
+
+            # for mypy
+            assert engine is not None
+            #  error: Incompatible types in assignment (expression has type
+            #  "type[ExcelWriter[Any]]", variable has type "type[Self]")
+            cls = get_writer(engine)  # type: ignore[assignment]
+
+        return object.__new__(cls)
+
+    # declare external properties you can count on
+    _path = None
+
+    @property
+    def supported_extensions(self) -> tuple[str, ...]:
+        """Extensions that writer engine supports."""
+        return self._supported_extensions
+
+    @property
+    def engine(self) -> str:
+        """Name of engine."""
+        return self._engine
+
+    @property
+    def sheets(self) -> dict[str, Any]:
+        """Mapping of sheet names to sheet objects."""
+        raise NotImplementedError
+
+    @property
+    def book(self) -> _WorkbookT:
+        """
+        Book instance. Class type will depend on the engine used.
+
+        This attribute can be used to access engine-specific features.
+        """
+        raise NotImplementedError
+
+    def _write_cells(
+        self,
+        cells,
+        sheet_name: str | None = None,
+        startrow: int = 0,
+        startcol: int = 0,
+        freeze_panes: tuple[int, int] | None = None,
+    ) -> None:
+        """
+        Write given formatted cells into Excel an excel sheet
+
+        Parameters
+        ----------
+        cells : generator
+            cell of formatted data to save to Excel sheet
+        sheet_name : str, default None
+            Name of Excel sheet, if None, then use self.cur_sheet
+        startrow : upper left cell row to dump data frame
+        startcol : upper left cell column to dump data frame
+        freeze_panes: int tuple of length 2
+            contains the bottom-most row and right-most column to freeze
+        """
+        raise NotImplementedError
+
+    def _save(self) -> None:
+        """
+        Save workbook to disk.
+        """
+        raise NotImplementedError
+
+    def __init__(
+        self,
+        path: FilePath | WriteExcelBuffer | ExcelWriter,
+        engine: str | None = None,
+        date_format: str | None = None,
+        datetime_format: str | None = None,
+        mode: str = "w",
+        storage_options: StorageOptions | None = None,
+        if_sheet_exists: ExcelWriterIfSheetExists | None = None,
+        engine_kwargs: dict[str, Any] | None = None,
+    ) -> None:
+        # validate that this engine can handle the extension
+        if isinstance(path, str):
+            ext = os.path.splitext(path)[-1]
+            self.check_extension(ext)
+
+        # use mode to open the file
+        if "b" not in mode:
+            mode += "b"
+        # use "a" for the user to append data to excel but internally use "r+" to let
+        # the excel backend first read the existing file and then write any data to it
+        mode = mode.replace("a", "r+")
+
+        if if_sheet_exists not in (None, "error", "new", "replace", "overlay"):
+            raise ValueError(
+                f"'{if_sheet_exists}' is not valid for if_sheet_exists. "
+                "Valid options are 'error', 'new', 'replace' and 'overlay'."
+            )
+        if if_sheet_exists and "r+" not in mode:
+            raise ValueError("if_sheet_exists is only valid in append mode (mode='a')")
+        if if_sheet_exists is None:
+            if_sheet_exists = "error"
+        self._if_sheet_exists = if_sheet_exists
+
+        # cast ExcelWriter to avoid adding 'if self._handles is not None'
+        self._handles = IOHandles(
+            cast(IO[bytes], path), compression={"compression": None}
         )
-    return file_path
+        if not isinstance(path, ExcelWriter):
+            self._handles = get_handle(
+                path, mode, storage_options=storage_options, is_text=False
+            )
+        self._cur_sheet = None
+
+        if date_format is None:
+            self._date_format = "YYYY-MM-DD"
+        else:
+            self._date_format = date_format
+        if datetime_format is None:
+            self._datetime_format = "YYYY-MM-DD HH:MM:SS"
+        else:
+            self._datetime_format = datetime_format
+
+        self._mode = mode
+
+    @property
+    def date_format(self) -> str:
+        """
+        Format string for dates written into Excel files (e.g. 'YYYY-MM-DD').
+        """
+        return self._date_format
+
+    @property
+    def datetime_format(self) -> str:
+        """
+        Format string for dates written into Excel files (e.g. 'YYYY-MM-DD').
+        """
+        return self._datetime_format
+
+    @property
+    def if_sheet_exists(self) -> str:
+        """
+        How to behave when writing to a sheet that already exists in append mode.
+        """
+        return self._if_sheet_exists
+
+    def __fspath__(self) -> str:
+        return getattr(self._handles.handle, "name", "")
+
+    def _get_sheet_name(self, sheet_name: str | None) -> str:
+        if sheet_name is None:
+            sheet_name = self._cur_sheet
+        if sheet_name is None:  # pragma: no cover
+            raise ValueError("Must pass explicit sheet_name or set _cur_sheet property")
+        return sheet_name
+
+    def _value_with_fmt(
+        self, val
+    ) -> tuple[
+        int | float | bool | str | datetime.datetime | datetime.date, str | None
+    ]:
+        """
+        Convert numpy types to Python types for the Excel writers.
+
+        Parameters
+        ----------
+        val : object
+            Value to be written into cells
+
+        Returns
+        -------
+        Tuple with the first element being the converted value and the second
+            being an optional format
+        """
+        fmt = None
+
+        if is_integer(val):
+            val = int(val)
+        elif is_float(val):
+            val = float(val)
+        elif is_bool(val):
+            val = bool(val)
+        elif isinstance(val, datetime.datetime):
+            fmt = self._datetime_format
+        elif isinstance(val, datetime.date):
+            fmt = self._date_format
+        elif isinstance(val, datetime.timedelta):
+            val = val.total_seconds() / 86400
+            fmt = "0"
+        else:
+            val = str(val)
+
+        return val, fmt
+
+    @classmethod
+    def check_extension(cls, ext: str) -> Literal[True]:
+        """
+        checks that path's extension against the Writer's supported
+        extensions.  If it isn't supported, raises UnsupportedFiletypeError.
+        """
+        if ext.startswith("."):
+            ext = ext[1:]
+        if not any(ext in extension for extension in cls._supported_extensions):
+            raise ValueError(f"Invalid extension for engine '{cls.engine}': '{ext}'")
+        return True
+
+    # Allow use as a contextmanager
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        self.close()
+
+    def close(self) -> None:
+        """synonym for save, to make it more file-like"""
+        self._save()
+        self._handles.close()
+
+
+XLS_SIGNATURES = (
+    b"\x09\x00\x04\x00\x07\x00\x10\x00",  # BIFF2
+    b"\x09\x02\x06\x00\x00\x00\x10\x00",  # BIFF3
+    b"\x09\x04\x06\x00\x00\x00\x10\x00",  # BIFF4
+    b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1",  # Compound File Binary
+)
+ZIP_SIGNATURE = b"PK\x03\x04"
+PEEK_SIZE = max(map(len, XLS_SIGNATURES + (ZIP_SIGNATURE,)))
+
+
+@doc(storage_options=_shared_docs["storage_options"])
+def inspect_excel_format(
+    content_or_path: FilePath | ReadBuffer[bytes],
+    storage_options: StorageOptions | None = None,
+) -> str | None:
+    """
+    Inspect the path or content of an excel file and get its format.
+
+    Adopted from xlrd: https://github.com/python-excel/xlrd.
+
+    Parameters
+    ----------
+    content_or_path : str or file-like object
+        Path to file or content of file to inspect. May be a URL.
+    {storage_options}
+
+    Returns
+    -------
+    str or None
+        Format of file if it can be determined.
+
+    Raises
+    ------
+    ValueError
+        If resulting stream is empty.
+    BadZipFile
+        If resulting stream does not have an XLS signature and is not a valid zipfile.
+    """
+    if isinstance(content_or_path, bytes):
+        content_or_path = BytesIO(content_or_path)
+
+    with get_handle(
+        content_or_path, "rb", storage_options=storage_options, is_text=False
+    ) as handle:
+        stream = handle.handle
+        stream.seek(0)
+        buf = stream.read(PEEK_SIZE)
+        if buf is None:
+            raise ValueError("stream is empty")
+        assert isinstance(buf, bytes)
+        peek = buf
+        stream.seek(0)
+
+        if any(peek.startswith(sig) for sig in XLS_SIGNATURES):
+            return "xls"
+        elif not peek.startswith(ZIP_SIGNATURE):
+            return None
+
+        with zipfile.ZipFile(stream) as zf:
+            # Workaround for some third party files that use forward slashes and
+            # lower case names.
+            component_names = [
+                name.replace("\\", "/").lower() for name in zf.namelist()
+            ]
+
+        if "xl/workbook.xml" in component_names:
+            return "xlsx"
+        if "xl/workbook.bin" in component_names:
+            return "xlsb"
+        if "content.xml" in component_names:
+            return "ods"
+        return "zip"
+
+
+class ExcelFile:
+    """
+    Class for parsing tabular Excel sheets into DataFrame objects.
+
+    See read_excel for more documentation.
+
+    Parameters
+    ----------
+    path_or_buffer : str, bytes, path object (pathlib.Path or py._path.local.LocalPath),
+        A file-like object, xlrd workbook or openpyxl workbook.
+        If a string or path object, expected to be a path to a
+        .xls, .xlsx, .xlsb, .xlsm, .odf, .ods, or .odt file.
+    engine : str, default None
+        If io is not a buffer or path, this must be set to identify io.
+        Supported engines: ``xlrd``, ``openpyxl``, ``odf``, ``pyxlsb``, ``calamine``
+        Engine compatibility :
+
+        - ``xlrd`` supports old-style Excel files (.xls).
+        - ``openpyxl`` supports newer Excel file formats.
+        - ``odf`` supports OpenDocument file formats (.odf, .ods, .odt).
+        - ``pyxlsb`` supports Binary Excel files.
+        - ``calamine`` supports Excel (.xls, .xlsx, .xlsm, .xlsb)
+          and OpenDocument (.ods) file formats.
+
+        .. versionchanged:: 1.2.0
+
+           The engine `xlrd <https://xlrd.readthedocs.io/en/latest/>`_
+           now only supports old-style ``.xls`` files.
+           When ``engine=None``, the following logic will be
+           used to determine the engine:
+
+           - If ``path_or_buffer`` is an OpenDocument format (.odf, .ods, .odt),
+             then `odf <https://pypi.org/project/odfpy/>`_ will be used.
+           - Otherwise if ``path_or_buffer`` is an xls format,
+             ``xlrd`` will be used.
+           - Otherwise if ``path_or_buffer`` is in xlsb format,
+             `pyxlsb <https://pypi.org/project/pyxlsb/>`_ will be used.
+
+           .. versionadded:: 1.3.0
+
+           - Otherwise if `openpyxl <https://pypi.org/project/openpyxl/>`_ is installed,
+             then ``openpyxl`` will be used.
+           - Otherwise if ``xlrd >= 2.0`` is installed, a ``ValueError`` will be raised.
+
+           .. warning::
+
+            Please do not report issues when using ``xlrd`` to read ``.xlsx`` files.
+            This is not supported, switch to using ``openpyxl`` instead.
+    engine_kwargs : dict, optional
+        Arbitrary keyword arguments passed to excel engine.
+
+    Examples
+    --------
+    >>> file = pd.ExcelFile('myfile.xlsx')  # doctest: +SKIP
+    >>> with pd.ExcelFile("myfile.xls") as xls:  # doctest: +SKIP
+    ...     df1 = pd.read_excel(xls, "Sheet1")  # doctest: +SKIP
+    """
+
+    from pandas.io.excel._calamine import CalamineReader
+    from pandas.io.excel._odfreader import ODFReader
+    from pandas.io.excel._openpyxl import OpenpyxlReader
+    from pandas.io.excel._pyxlsb import PyxlsbReader
+    from pandas.io.excel._xlrd import XlrdReader
+
+    _engines: Mapping[str, Any] = {
+        "xlrd": XlrdReader,
+        "openpyxl": OpenpyxlReader,
+        "odf": ODFReader,
+        "pyxlsb": PyxlsbReader,
+        "calamine": CalamineReader,
+    }
+
+    def __init__(
+        self,
+        path_or_buffer,
+        engine: str | None = None,
+        storage_options: StorageOptions | None = None,
+        engine_kwargs: dict | None = None,
+    ) -> None:
+        if engine_kwargs is None:
+            engine_kwargs = {}
+
+        if engine is not None and engine not in self._engines:
+            raise ValueError(f"Unknown engine: {engine}")
+
+        # First argument can also be bytes, so create a buffer
+        if isinstance(path_or_buffer, bytes):
+            path_or_buffer = BytesIO(path_or_buffer)
+            warnings.warn(
+                "Passing bytes to 'read_excel' is deprecated and "
+                "will be removed in a future version. To read from a "
+                "byte string, wrap it in a `BytesIO` object.",
+                FutureWarning,
+                stacklevel=find_stack_level(),
+            )
+
+        # Could be a str, ExcelFile, Book, etc.
+        self.io = path_or_buffer
+        # Always a string
+        self._io = stringify_path(path_or_buffer)
+
+        # Determine xlrd version if installed
+        if import_optional_dependency("xlrd", errors="ignore") is None:
+            xlrd_version = None
+        else:
+            import xlrd
+
+            xlrd_version = Version(get_version(xlrd))
+
+        if engine is None:
+            # Only determine ext if it is needed
+            ext: str | None
+            if xlrd_version is not None and isinstance(path_or_buffer, xlrd.Book):
+                ext = "xls"
+            else:
+                ext = inspect_excel_format(
+                    content_or_path=path_or_buffer, storage_options=storage_options
+                )
+                if ext is None:
+                    raise ValueError(
+                        "Excel file format cannot be determined, you must specify "
+                        "an engine manually."
+                    )
+
+            engine = config.get_option(f"io.excel.{ext}.reader", silent=True)
+            if engine == "auto":
+                engine = get_default_engine(ext, mode="reader")
+
+        assert engine is not None
+        self.engine = engine
+        self.storage_options = storage_options
+
+        self._reader = self._engines[engine](
+            self._io,
+            storage_options=storage_options,
+            engine_kwargs=engine_kwargs,
+        )
+
+    def __fspath__(self):
+        return self._io
+
+    def parse(
+        self,
+        sheet_name: str | int | list[int] | list[str] | None = 0,
+        header: int | Sequence[int] | None = 0,
+        names: SequenceNotStr[Hashable] | range | None = None,
+        index_col: int | Sequence[int] | None = None,
+        usecols=None,
+        converters=None,
+        true_values: Iterable[Hashable] | None = None,
+        false_values: Iterable[Hashable] | None = None,
+        skiprows: Sequence[int] | int | Callable[[int], object] | None = None,
+        nrows: int | None = None,
+        na_values=None,
+        parse_dates: list | dict | bool = False,
+        date_parser: Callable | lib.NoDefault = lib.no_default,
+        date_format: str | dict[Hashable, str] | None = None,
+        thousands: str | None = None,
+        comment: str | None = None,
+        skipfooter: int = 0,
+        dtype_backend: DtypeBackend | lib.NoDefault = lib.no_default,
+        **kwds,
+    ) -> DataFrame | dict[str, DataFrame] | dict[int, DataFrame]:
+        """
+        Parse specified sheet(s) into a DataFrame.
+
+        Equivalent to read_excel(ExcelFile, ...)  See the read_excel
+        docstring for more info on accepted parameters.
+
+        Returns
+        -------
+        DataFrame or dict of DataFrames
+            DataFrame from the passed in Excel file.
+
+        Examples
+        --------
+        >>> df = pd.DataFrame([[1, 2, 3], [4, 5, 6]], columns=['A', 'B', 'C'])
+        >>> df.to_excel('myfile.xlsx')  # doctest: +SKIP
+        >>> file = pd.ExcelFile('myfile.xlsx')  # doctest: +SKIP
+        >>> file.parse()  # doctest: +SKIP
+        """
+        return self._reader.parse(
+            sheet_name=sheet_name,
+            header=header,
+            names=names,
+            index_col=index_col,
+            usecols=usecols,
+            converters=converters,
+            true_values=true_values,
+            false_values=false_values,
+            skiprows=skiprows,
+            nrows=nrows,
+            na_values=na_values,
+            parse_dates=parse_dates,
+            date_parser=date_parser,
+            date_format=date_format,
+            thousands=thousands,
+            comment=comment,
+            skipfooter=skipfooter,
+            dtype_backend=dtype_backend,
+            **kwds,
+        )
+
+    @property
+    def book(self):
+        return self._reader.book
+
+    @property
+    def sheet_names(self):
+        return self._reader.sheet_names
+
+    def close(self) -> None:
+        """close io if necessary"""
+        self._reader.close()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        self.close()
