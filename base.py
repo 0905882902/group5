@@ -1,583 +1,266 @@
-"""
-Extend pandas with custom array types.
-"""
 from __future__ import annotations
 
+import abc
 from typing import (
     TYPE_CHECKING,
-    Any,
-    TypeVar,
-    cast,
-    overload,
+    Callable,
+    Literal,
 )
 
-import numpy as np
-
-from pandas._libs import missing as libmissing
-from pandas._libs.hashtable import object_hash
-from pandas._libs.properties import cache_readonly
-from pandas.errors import AbstractMethodError
-
-from pandas.core.dtypes.generic import (
-    ABCDataFrame,
-    ABCIndex,
-    ABCSeries,
-)
+from pandas._libs import lib
 
 if TYPE_CHECKING:
-    from pandas._typing import (
-        DtypeObj,
-        Self,
-        Shape,
-        npt,
-        type_t,
-    )
+    from collections.abc import Sequence
+    import re
 
-    from pandas import Index
-    from pandas.core.arrays import ExtensionArray
+    from pandas._typing import Scalar
 
-    # To parameterize on same ExtensionDtype
-    ExtensionDtypeT = TypeVar("ExtensionDtypeT", bound="ExtensionDtype")
+    from pandas import Series
 
 
-class ExtensionDtype:
+class BaseStringArrayMethods(abc.ABC):
     """
-    A custom data type, to be paired with an ExtensionArray.
+    Base class for extension arrays implementing string methods.
 
-    See Also
-    --------
-    extensions.register_extension_dtype: Register an ExtensionType
-        with pandas as class decorator.
-    extensions.ExtensionArray: Abstract base class for custom 1-D array types.
+    This is where our ExtensionArrays can override the implementation of
+    Series.str.<method>. We don't expect this to work with
+    3rd-party extension arrays.
 
-    Notes
-    -----
-    The interface includes the following abstract methods that must
-    be implemented by subclasses:
+    * User calls Series.str.<method>
+    * pandas extracts the extension array from the Series
+    * pandas calls ``extension_array._str_<method>(*args, **kwargs)``
+    * pandas wraps the result, to return to the user.
 
-    * type
-    * name
-    * construct_array_type
-
-    The following attributes and methods influence the behavior of the dtype in
-    pandas operations
-
-    * _is_numeric
-    * _is_boolean
-    * _get_common_dtype
-
-    The `na_value` class attribute can be used to set the default NA value
-    for this type. :attr:`numpy.nan` is used by default.
-
-    ExtensionDtypes are required to be hashable. The base class provides
-    a default implementation, which relies on the ``_metadata`` class
-    attribute. ``_metadata`` should be a tuple containing the strings
-    that define your data type. For example, with ``PeriodDtype`` that's
-    the ``freq`` attribute.
-
-    **If you have a parametrized dtype you should set the ``_metadata``
-    class property**.
-
-    Ideally, the attributes in ``_metadata`` will match the
-    parameters to your ``ExtensionDtype.__init__`` (if any). If any of
-    the attributes in ``_metadata`` don't implement the standard
-    ``__eq__`` or ``__hash__``, the default implementations here will not
-    work.
-
-    Examples
-    --------
-
-    For interaction with Apache Arrow (pyarrow), a ``__from_arrow__`` method
-    can be implemented: this method receives a pyarrow Array or ChunkedArray
-    as only argument and is expected to return the appropriate pandas
-    ExtensionArray for this dtype and the passed values:
-
-    >>> import pyarrow
-    >>> from pandas.api.extensions import ExtensionArray
-    >>> class ExtensionDtype:
-    ...     def __from_arrow__(
-    ...         self,
-    ...         array: pyarrow.Array | pyarrow.ChunkedArray
-    ...     ) -> ExtensionArray:
-    ...         ...
-
-    This class does not inherit from 'abc.ABCMeta' for performance reasons.
-    Methods and properties required by the interface raise
-    ``pandas.errors.AbstractMethodError`` and no ``register`` method is
-    provided for registering virtual subclasses.
+    See :ref:`Series.str` for the docstring of each method.
     """
 
-    _metadata: tuple[str, ...] = ()
-
-    def __str__(self) -> str:
-        return self.name
-
-    def __eq__(self, other: object) -> bool:
-        """
-        Check whether 'other' is equal to self.
-
-        By default, 'other' is considered equal if either
-
-        * it's a string matching 'self.name'.
-        * it's an instance of this type and all of the attributes
-          in ``self._metadata`` are equal between `self` and `other`.
-
-        Parameters
-        ----------
-        other : Any
-
-        Returns
-        -------
-        bool
-        """
-        if isinstance(other, str):
-            try:
-                other = self.construct_from_string(other)
-            except TypeError:
-                return False
-        if isinstance(other, type(self)):
-            return all(
-                getattr(self, attr) == getattr(other, attr) for attr in self._metadata
-            )
-        return False
-
-    def __hash__(self) -> int:
-        # for python>=3.10, different nan objects have different hashes
-        # we need to avoid that and thus use hash function with old behavior
-        return object_hash(tuple(getattr(self, attr) for attr in self._metadata))
-
-    def __ne__(self, other: object) -> bool:
-        return not self.__eq__(other)
-
-    @property
-    def na_value(self) -> object:
-        """
-        Default NA value to use for this type.
-
-        This is used in e.g. ExtensionArray.take. This should be the
-        user-facing "boxed" version of the NA value, not the physical NA value
-        for storage.  e.g. for JSONArray, this is an empty dictionary.
-        """
-        return np.nan
-
-    @property
-    def type(self) -> type_t[Any]:
-        """
-        The scalar type for the array, e.g. ``int``
-
-        It's expected ``ExtensionArray[item]`` returns an instance
-        of ``ExtensionDtype.type`` for scalar ``item``, assuming
-        that value is valid (not NA). NA values do not need to be
-        instances of `type`.
-        """
-        raise AbstractMethodError(self)
-
-    @property
-    def kind(self) -> str:
-        """
-        A character code (one of 'biufcmMOSUV'), default 'O'
-
-        This should match the NumPy dtype used when the array is
-        converted to an ndarray, which is probably 'O' for object if
-        the extension type cannot be represented as a built-in NumPy
-        type.
-
-        See Also
-        --------
-        numpy.dtype.kind
-        """
-        return "O"
-
-    @property
-    def name(self) -> str:
-        """
-        A string identifying the data type.
-
-        Will be used for display in, e.g. ``Series.dtype``
-        """
-        raise AbstractMethodError(self)
-
-    @property
-    def names(self) -> list[str] | None:
-        """
-        Ordered list of field names, or None if there are no fields.
-
-        This is for compatibility with NumPy arrays, and may be removed in the
-        future.
-        """
-        return None
-
-    @classmethod
-    def construct_array_type(cls) -> type_t[ExtensionArray]:
-        """
-        Return the array type associated with this dtype.
-
-        Returns
-        -------
-        type
-        """
-        raise AbstractMethodError(cls)
-
-    def empty(self, shape: Shape) -> ExtensionArray:
-        """
-        Construct an ExtensionArray of this dtype with the given shape.
-
-        Analogous to numpy.empty.
-
-        Parameters
-        ----------
-        shape : int or tuple[int]
-
-        Returns
-        -------
-        ExtensionArray
-        """
-        cls = self.construct_array_type()
-        return cls._empty(shape, dtype=self)
-
-    @classmethod
-    def construct_from_string(cls, string: str) -> Self:
-        r"""
-        Construct this type from a string.
-
-        This is useful mainly for data types that accept parameters.
-        For example, a period dtype accepts a frequency parameter that
-        can be set as ``period[h]`` (where H means hourly frequency).
-
-        By default, in the abstract class, just the name of the type is
-        expected. But subclasses can overwrite this method to accept
-        parameters.
-
-        Parameters
-        ----------
-        string : str
-            The name of the type, for example ``category``.
-
-        Returns
-        -------
-        ExtensionDtype
-            Instance of the dtype.
-
-        Raises
-        ------
-        TypeError
-            If a class cannot be constructed from this 'string'.
-
-        Examples
-        --------
-        For extension dtypes with arguments the following may be an
-        adequate implementation.
-
-        >>> import re
-        >>> @classmethod
-        ... def construct_from_string(cls, string):
-        ...     pattern = re.compile(r"^my_type\[(?P<arg_name>.+)\]$")
-        ...     match = pattern.match(string)
-        ...     if match:
-        ...         return cls(**match.groupdict())
-        ...     else:
-        ...         raise TypeError(
-        ...             f"Cannot construct a '{cls.__name__}' from '{string}'"
-        ...         )
-        """
-        if not isinstance(string, str):
-            raise TypeError(
-                f"'construct_from_string' expects a string, got {type(string)}"
-            )
-        # error: Non-overlapping equality check (left operand type: "str", right
-        #  operand type: "Callable[[ExtensionDtype], str]")  [comparison-overlap]
-        assert isinstance(cls.name, str), (cls, type(cls.name))
-        if string != cls.name:
-            raise TypeError(f"Cannot construct a '{cls.__name__}' from '{string}'")
-        return cls()
-
-    @classmethod
-    def is_dtype(cls, dtype: object) -> bool:
-        """
-        Check if we match 'dtype'.
-
-        Parameters
-        ----------
-        dtype : object
-            The object to check.
-
-        Returns
-        -------
-        bool
-
-        Notes
-        -----
-        The default implementation is True if
-
-        1. ``cls.construct_from_string(dtype)`` is an instance
-           of ``cls``.
-        2. ``dtype`` is an object and is an instance of ``cls``
-        3. ``dtype`` has a ``dtype`` attribute, and any of the above
-           conditions is true for ``dtype.dtype``.
-        """
-        dtype = getattr(dtype, "dtype", dtype)
-
-        if isinstance(dtype, (ABCSeries, ABCIndex, ABCDataFrame, np.dtype)):
-            # https://github.com/pandas-dev/pandas/issues/22960
-            # avoid passing data to `construct_from_string`. This could
-            # cause a FutureWarning from numpy about failing elementwise
-            # comparison from, e.g., comparing DataFrame == 'category'.
-            return False
-        elif dtype is None:
-            return False
-        elif isinstance(dtype, cls):
-            return True
-        if isinstance(dtype, str):
-            try:
-                return cls.construct_from_string(dtype) is not None
-            except TypeError:
-                return False
-        return False
-
-    @property
-    def _is_numeric(self) -> bool:
-        """
-        Whether columns with this dtype should be considered numeric.
-
-        By default ExtensionDtypes are assumed to be non-numeric.
-        They'll be excluded from operations that exclude non-numeric
-        columns, like (groupby) reductions, plotting, etc.
-        """
-        return False
-
-    @property
-    def _is_boolean(self) -> bool:
-        """
-        Whether this dtype should be considered boolean.
-
-        By default, ExtensionDtypes are assumed to be non-numeric.
-        Setting this to True will affect the behavior of several places,
-        e.g.
-
-        * is_bool
-        * boolean indexing
-
-        Returns
-        -------
-        bool
-        """
-        return False
-
-    def _get_common_dtype(self, dtypes: list[DtypeObj]) -> DtypeObj | None:
-        """
-        Return the common dtype, if one exists.
-
-        Used in `find_common_type` implementation. This is for example used
-        to determine the resulting dtype in a concat operation.
-
-        If no common dtype exists, return None (which gives the other dtypes
-        the chance to determine a common dtype). If all dtypes in the list
-        return None, then the common dtype will be "object" dtype (this means
-        it is never needed to return "object" dtype from this method itself).
-
-        Parameters
-        ----------
-        dtypes : list of dtypes
-            The dtypes for which to determine a common dtype. This is a list
-            of np.dtype or ExtensionDtype instances.
-
-        Returns
-        -------
-        Common dtype (np.dtype or ExtensionDtype) or None
-        """
-        if len(set(dtypes)) == 1:
-            # only itself
-            return self
+    def _str_getitem(self, key):
+        if isinstance(key, slice):
+            return self._str_slice(start=key.start, stop=key.stop, step=key.step)
         else:
-            return None
+            return self._str_get(key)
 
-    @property
-    def _can_hold_na(self) -> bool:
-        """
-        Can arrays of this dtype hold NA values?
-        """
-        return True
+    @abc.abstractmethod
+    def _str_count(self, pat, flags: int = 0):
+        pass
 
-    @property
-    def _is_immutable(self) -> bool:
-        """
-        Can arrays with this dtype be modified with __setitem__? If not, return
-        True.
+    @abc.abstractmethod
+    def _str_pad(
+        self,
+        width: int,
+        side: Literal["left", "right", "both"] = "left",
+        fillchar: str = " ",
+    ):
+        pass
 
-        Immutable arrays are expected to raise TypeError on __setitem__ calls.
-        """
-        return False
+    @abc.abstractmethod
+    def _str_contains(
+        self, pat, case: bool = True, flags: int = 0, na=None, regex: bool = True
+    ):
+        pass
 
-    @cache_readonly
-    def index_class(self) -> type_t[Index]:
-        """
-        The Index subclass to return from Index.__new__ when this dtype is
-        encountered.
-        """
-        from pandas import Index
+    @abc.abstractmethod
+    def _str_startswith(self, pat, na=None):
+        pass
 
-        return Index
+    @abc.abstractmethod
+    def _str_endswith(self, pat, na=None):
+        pass
 
-    @property
-    def _supports_2d(self) -> bool:
-        """
-        Do ExtensionArrays with this dtype support 2D arrays?
+    @abc.abstractmethod
+    def _str_replace(
+        self,
+        pat: str | re.Pattern,
+        repl: str | Callable,
+        n: int = -1,
+        case: bool = True,
+        flags: int = 0,
+        regex: bool = True,
+    ):
+        pass
 
-        Historically ExtensionArrays were limited to 1D. By returning True here,
-        authors can indicate that their arrays support 2D instances. This can
-        improve performance in some cases, particularly operations with `axis=1`.
+    @abc.abstractmethod
+    def _str_repeat(self, repeats: int | Sequence[int]):
+        pass
 
-        Arrays that support 2D values should:
+    @abc.abstractmethod
+    def _str_match(
+        self,
+        pat: str,
+        case: bool = True,
+        flags: int = 0,
+        na: Scalar | lib.NoDefault = lib.no_default,
+    ):
+        pass
 
-            - implement Array.reshape
-            - subclass the Dim2CompatTests in tests.extension.base
-            - _concat_same_type should support `axis` keyword
-            - _reduce and reductions should support `axis` keyword
-        """
-        return False
+    @abc.abstractmethod
+    def _str_fullmatch(
+        self,
+        pat: str | re.Pattern,
+        case: bool = True,
+        flags: int = 0,
+        na: Scalar | lib.NoDefault = lib.no_default,
+    ):
+        pass
 
-    @property
-    def _can_fast_transpose(self) -> bool:
-        """
-        Is transposing an array with this dtype zero-copy?
+    @abc.abstractmethod
+    def _str_encode(self, encoding, errors: str = "strict"):
+        pass
 
-        Only relevant for cases where _supports_2d is True.
-        """
-        return False
+    @abc.abstractmethod
+    def _str_find(self, sub, start: int = 0, end=None):
+        pass
 
+    @abc.abstractmethod
+    def _str_rfind(self, sub, start: int = 0, end=None):
+        pass
 
-class StorageExtensionDtype(ExtensionDtype):
-    """ExtensionDtype that may be backed by more than one implementation."""
+    @abc.abstractmethod
+    def _str_findall(self, pat, flags: int = 0):
+        pass
 
-    name: str
-    _metadata = ("storage",)
+    @abc.abstractmethod
+    def _str_get(self, i):
+        pass
 
-    def __init__(self, storage: str | None = None) -> None:
-        self.storage = storage
+    @abc.abstractmethod
+    def _str_index(self, sub, start: int = 0, end=None):
+        pass
 
-    def __repr__(self) -> str:
-        return f"{self.name}[{self.storage}]"
+    @abc.abstractmethod
+    def _str_rindex(self, sub, start: int = 0, end=None):
+        pass
 
-    def __str__(self) -> str:
-        return self.name
+    @abc.abstractmethod
+    def _str_join(self, sep: str):
+        pass
 
-    def __eq__(self, other: object) -> bool:
-        if isinstance(other, str) and other == self.name:
-            return True
-        return super().__eq__(other)
+    @abc.abstractmethod
+    def _str_partition(self, sep: str, expand):
+        pass
 
-    def __hash__(self) -> int:
-        # custom __eq__ so have to override __hash__
-        return super().__hash__()
+    @abc.abstractmethod
+    def _str_rpartition(self, sep: str, expand):
+        pass
 
-    @property
-    def na_value(self) -> libmissing.NAType:
-        return libmissing.NA
+    @abc.abstractmethod
+    def _str_len(self):
+        pass
 
+    @abc.abstractmethod
+    def _str_slice(self, start=None, stop=None, step=None):
+        pass
 
-def register_extension_dtype(cls: type_t[ExtensionDtypeT]) -> type_t[ExtensionDtypeT]:
-    """
-    Register an ExtensionType with pandas as class decorator.
+    @abc.abstractmethod
+    def _str_slice_replace(self, start=None, stop=None, repl=None):
+        pass
 
-    This enables operations like ``.astype(name)`` for the name
-    of the ExtensionDtype.
+    @abc.abstractmethod
+    def _str_translate(self, table):
+        pass
 
-    Returns
-    -------
-    callable
-        A class decorator.
+    @abc.abstractmethod
+    def _str_wrap(self, width: int, **kwargs):
+        pass
 
-    Examples
-    --------
-    >>> from pandas.api.extensions import register_extension_dtype, ExtensionDtype
-    >>> @register_extension_dtype
-    ... class MyExtensionDtype(ExtensionDtype):
-    ...     name = "myextension"
-    """
-    _registry.register(cls)
-    return cls
+    @abc.abstractmethod
+    def _str_get_dummies(self, sep: str = "|"):
+        pass
 
+    @abc.abstractmethod
+    def _str_isalnum(self):
+        pass
 
-class Registry:
-    """
-    Registry for dtype inference.
+    @abc.abstractmethod
+    def _str_isalpha(self):
+        pass
 
-    The registry allows one to map a string repr of a extension
-    dtype to an extension dtype. The string alias can be used in several
-    places, including
+    @abc.abstractmethod
+    def _str_isdecimal(self):
+        pass
 
-    * Series and Index constructors
-    * :meth:`pandas.array`
-    * :meth:`pandas.Series.astype`
+    @abc.abstractmethod
+    def _str_isdigit(self):
+        pass
 
-    Multiple extension types can be registered.
-    These are tried in order.
-    """
+    @abc.abstractmethod
+    def _str_islower(self):
+        pass
 
-    def __init__(self) -> None:
-        self.dtypes: list[type_t[ExtensionDtype]] = []
+    @abc.abstractmethod
+    def _str_isnumeric(self):
+        pass
 
-    def register(self, dtype: type_t[ExtensionDtype]) -> None:
-        """
-        Parameters
-        ----------
-        dtype : ExtensionDtype class
-        """
-        if not issubclass(dtype, ExtensionDtype):
-            raise ValueError("can only register pandas extension dtypes")
+    @abc.abstractmethod
+    def _str_isspace(self):
+        pass
 
-        self.dtypes.append(dtype)
+    @abc.abstractmethod
+    def _str_istitle(self):
+        pass
 
-    @overload
-    def find(self, dtype: type_t[ExtensionDtypeT]) -> type_t[ExtensionDtypeT]:
-        ...
+    @abc.abstractmethod
+    def _str_isupper(self):
+        pass
 
-    @overload
-    def find(self, dtype: ExtensionDtypeT) -> ExtensionDtypeT:
-        ...
+    @abc.abstractmethod
+    def _str_capitalize(self):
+        pass
 
-    @overload
-    def find(self, dtype: str) -> ExtensionDtype | None:
-        ...
+    @abc.abstractmethod
+    def _str_casefold(self):
+        pass
 
-    @overload
-    def find(
-        self, dtype: npt.DTypeLike
-    ) -> type_t[ExtensionDtype] | ExtensionDtype | None:
-        ...
+    @abc.abstractmethod
+    def _str_title(self):
+        pass
 
-    def find(
-        self, dtype: type_t[ExtensionDtype] | ExtensionDtype | npt.DTypeLike
-    ) -> type_t[ExtensionDtype] | ExtensionDtype | None:
-        """
-        Parameters
-        ----------
-        dtype : ExtensionDtype class or instance or str or numpy dtype or python type
+    @abc.abstractmethod
+    def _str_swapcase(self):
+        pass
 
-        Returns
-        -------
-        return the first matching dtype, otherwise return None
-        """
-        if not isinstance(dtype, str):
-            dtype_type: type_t
-            if not isinstance(dtype, type):
-                dtype_type = type(dtype)
-            else:
-                dtype_type = dtype
-            if issubclass(dtype_type, ExtensionDtype):
-                # cast needed here as mypy doesn't know we have figured
-                # out it is an ExtensionDtype or type_t[ExtensionDtype]
-                return cast("ExtensionDtype | type_t[ExtensionDtype]", dtype)
+    @abc.abstractmethod
+    def _str_lower(self):
+        pass
 
-            return None
+    @abc.abstractmethod
+    def _str_upper(self):
+        pass
 
-        for dtype_type in self.dtypes:
-            try:
-                return dtype_type.construct_from_string(dtype)
-            except TypeError:
-                pass
+    @abc.abstractmethod
+    def _str_normalize(self, form):
+        pass
 
-        return None
+    @abc.abstractmethod
+    def _str_strip(self, to_strip=None):
+        pass
 
+    @abc.abstractmethod
+    def _str_lstrip(self, to_strip=None):
+        pass
 
-_registry = Registry()
+    @abc.abstractmethod
+    def _str_rstrip(self, to_strip=None):
+        pass
+
+    @abc.abstractmethod
+    def _str_removeprefix(self, prefix: str) -> Series:
+        pass
+
+    @abc.abstractmethod
+    def _str_removesuffix(self, suffix: str) -> Series:
+        pass
+
+    @abc.abstractmethod
+    def _str_split(
+        self, pat=None, n=-1, expand: bool = False, regex: bool | None = None
+    ):
+        pass
+
+    @abc.abstractmethod
+    def _str_rsplit(self, pat=None, n=-1):
+        pass
+
+    @abc.abstractmethod
+    def _str_extract(self, pat: str, flags: int = 0, expand: bool = True):
+        pass
