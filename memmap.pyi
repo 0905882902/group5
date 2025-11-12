@@ -1,3 +1,5 @@
-from numpy import memmap as memmap
+import numpy as np
 
-__all__: list[str]
+with open("file.txt", "r") as f:
+    np.memmap(f)  # E: No overload variant
+np.memmap("test.txt", shape=[10, 5])  # E: No overload variant

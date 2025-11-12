@@ -1,331 +1,69 @@
-from typing import Any, overload
-
 import numpy as np
-from numpy._typing import (
-    NDArray,
-    _ArrayLikeStr_co as U_co,
-    _ArrayLikeBytes_co as S_co,
-    _ArrayLikeInt_co as i_co,
-    _ArrayLikeBool_co as b_co,
-)
+import numpy.typing as npt
 
-@overload
-def equal(x1: U_co, x2: U_co) -> NDArray[np.bool]: ...
-@overload
-def equal(x1: S_co, x2: S_co) -> NDArray[np.bool]: ...
+AR_U: npt.NDArray[np.str_]
+AR_S: npt.NDArray[np.bytes_]
 
-@overload
-def not_equal(x1: U_co, x2: U_co) -> NDArray[np.bool]: ...
-@overload
-def not_equal(x1: S_co, x2: S_co) -> NDArray[np.bool]: ...
+np.strings.equal(AR_U, AR_S)  # E: incompatible type
 
-@overload
-def greater_equal(x1: U_co, x2: U_co) -> NDArray[np.bool]: ...
-@overload
-def greater_equal(x1: S_co, x2: S_co) -> NDArray[np.bool]: ...
+np.strings.not_equal(AR_U, AR_S)  # E: incompatible type
 
-@overload
-def less_equal(x1: U_co, x2: U_co) -> NDArray[np.bool]: ...
-@overload
-def less_equal(x1: S_co, x2: S_co) -> NDArray[np.bool]: ...
+np.strings.greater_equal(AR_U, AR_S)  # E: incompatible type
 
-@overload
-def greater(x1: U_co, x2: U_co) -> NDArray[np.bool]: ...
-@overload
-def greater(x1: S_co, x2: S_co) -> NDArray[np.bool]: ...
+np.strings.less_equal(AR_U, AR_S)  # E: incompatible type
 
-@overload
-def less(x1: U_co, x2: U_co) -> NDArray[np.bool]: ...
-@overload
-def less(x1: S_co, x2: S_co) -> NDArray[np.bool]: ...
+np.strings.greater(AR_U, AR_S)  # E: incompatible type
 
-@overload
-def add(x1: U_co, x2: U_co) -> NDArray[np.str_]: ...
-@overload
-def add(x1: S_co, x2: S_co) -> NDArray[np.bytes_]: ...
+np.strings.less(AR_U, AR_S)  # E: incompatible type
 
-@overload
-def multiply(a: U_co, i: i_co) -> NDArray[np.str_]: ...
-@overload
-def multiply(a: S_co, i: i_co) -> NDArray[np.bytes_]: ...
+np.strings.encode(AR_S)  # E: incompatible type
+np.strings.decode(AR_U)  # E: incompatible type
 
-@overload
-def mod(a: U_co, value: Any) -> NDArray[np.str_]: ...
-@overload
-def mod(a: S_co, value: Any) -> NDArray[np.bytes_]: ...
+np.strings.join(AR_U, b"_")  # E: incompatible type
+np.strings.join(AR_S, "_")  # E: incompatible type
 
-def isalpha(x: U_co | S_co) -> NDArray[np.bool]: ...
-def isalnum(a: U_co | S_co) -> NDArray[np.bool]: ...
-def isdigit(x: U_co | S_co) -> NDArray[np.bool]: ...
-def isspace(x: U_co | S_co) -> NDArray[np.bool]: ...
-def isdecimal(x: U_co) -> NDArray[np.bool]: ...
-def isnumeric(x: U_co) -> NDArray[np.bool]: ...
-def islower(a: U_co | S_co) -> NDArray[np.bool]: ...
-def istitle(a: U_co | S_co) -> NDArray[np.bool]: ...
-def isupper(a: U_co | S_co) -> NDArray[np.bool]: ...
+np.strings.ljust(AR_U, 5, fillchar=b"a")  # E: incompatible type
+np.strings.ljust(AR_S, 5, fillchar="a")  # E: incompatible type
+np.strings.rjust(AR_U, 5, fillchar=b"a")  # E: incompatible type
+np.strings.rjust(AR_S, 5, fillchar="a")  # E: incompatible type
 
-def str_len(x: U_co | S_co) -> NDArray[np.int_]: ...
+np.strings.lstrip(AR_U, b"a")  # E: incompatible type
+np.strings.lstrip(AR_S, "a")  # E: incompatible type
+np.strings.strip(AR_U, b"a")  # E: incompatible type
+np.strings.strip(AR_S, "a")  # E: incompatible type
+np.strings.rstrip(AR_U, b"a")  # E: incompatible type
+np.strings.rstrip(AR_S, "a")  # E: incompatible type
 
-@overload
-def find(
-    a: U_co,
-    sub: U_co,
-    start: i_co = ...,
-    end: i_co | None = ...,
-) -> NDArray[np.int_]: ...
-@overload
-def find(
-    a: S_co,
-    sub: S_co,
-    start: i_co = ...,
-    end: i_co | None = ...,
-) -> NDArray[np.int_]: ...
+np.strings.partition(AR_U, b"a")  # E: incompatible type
+np.strings.partition(AR_S, "a")  # E: incompatible type
+np.strings.rpartition(AR_U, b"a")  # E: incompatible type
+np.strings.rpartition(AR_S, "a")  # E: incompatible type
 
-@overload
-def rfind(
-    a: U_co,
-    sub: U_co,
-    start: i_co = ...,
-    end: i_co | None = ...,
-) -> NDArray[np.int_]: ...
-@overload
-def rfind(
-    a: S_co,
-    sub: S_co,
-    start: i_co = ...,
-    end: i_co | None = ...,
-) -> NDArray[np.int_]: ...
+np.strings.split(AR_U, b"_")  # E: incompatible type
+np.strings.split(AR_S, "_")  # E: incompatible type
+np.strings.rsplit(AR_U, b"_")  # E: incompatible type
+np.strings.rsplit(AR_S, "_")  # E: incompatible type
 
-@overload
-def index(
-    a: U_co,
-    sub: U_co,
-    start: i_co = ...,
-    end: None | i_co = ...,
-) -> NDArray[np.int_]: ...
-@overload
-def index(
-    a: S_co,
-    sub: S_co,
-    start: i_co = ...,
-    end: None | i_co = ...,
-) -> NDArray[np.int_]: ...
+np.strings.count(AR_U, b"a", [1, 2, 3], [1, 2, 3])  # E: incompatible type
+np.strings.count(AR_S, "a", 0, 9)  # E: incompatible type
 
-@overload
-def rindex(
-    a: U_co,
-    sub: U_co,
-    start: i_co = ...,
-    end: None | i_co = ...,
-) -> NDArray[np.int_]: ...
-@overload
-def rindex(
-    a: S_co,
-    sub: S_co,
-    start: i_co = ...,
-    end: None | i_co = ...,
-) -> NDArray[np.int_]: ...
+np.strings.endswith(AR_U, b"a", [1, 2, 3], [1, 2, 3])  # E: incompatible type
+np.strings.endswith(AR_S, "a", 0, 9)  # E: incompatible type
+np.strings.startswith(AR_U, b"a", [1, 2, 3], [1, 2, 3])  # E: incompatible type
+np.strings.startswith(AR_S, "a", 0, 9)  # E: incompatible type
 
-@overload
-def count(
-    a: U_co,
-    sub: U_co,
-    start: i_co = ...,
-    end: i_co | None = ...,
-) -> NDArray[np.int_]: ...
-@overload
-def count(
-    a: S_co,
-    sub: S_co,
-    start: i_co = ...,
-    end: i_co | None = ...,
-) -> NDArray[np.int_]: ...
+np.strings.find(AR_U, b"a", [1, 2, 3], [1, 2, 3])  # E: incompatible type
+np.strings.find(AR_S, "a", 0, 9)  # E: incompatible type
+np.strings.rfind(AR_U, b"a", [1, 2, 3], [1, 2 , 3])  # E: incompatible type
+np.strings.rfind(AR_S, "a", 0, 9)  # E: incompatible type
 
-@overload
-def startswith(
-    a: U_co,
-    prefix: U_co,
-    start: i_co = ...,
-    end: i_co | None = ...,
-) -> NDArray[np.bool]: ...
-@overload
-def startswith(
-    a: S_co,
-    prefix: S_co,
-    start: i_co = ...,
-    end: i_co | None = ...,
-) -> NDArray[np.bool]: ...
+np.strings.index(AR_U, b"a", start=[1, 2, 3])  # E: incompatible type
+np.strings.index(AR_S, "a", end=9)  # E: incompatible type
+np.strings.rindex(AR_U, b"a", start=[1, 2, 3])  # E: incompatible type
+np.strings.rindex(AR_S, "a", end=9)  # E: incompatible type
 
-@overload
-def endswith(
-    a: U_co,
-    suffix: U_co,
-    start: i_co = ...,
-    end: i_co | None = ...,
-) -> NDArray[np.bool]: ...
-@overload
-def endswith(
-    a: S_co,
-    suffix: S_co,
-    start: i_co = ...,
-    end: i_co | None = ...,
-) -> NDArray[np.bool]: ...
+np.strings.isdecimal(AR_S)  # E: incompatible type
+np.strings.isnumeric(AR_S)  # E: incompatible type
 
-def decode(
-    a: S_co,
-    encoding: None | str = ...,
-    errors: None | str = ...,
-) -> NDArray[np.str_]: ...
-
-def encode(
-    a: U_co,
-    encoding: None | str = ...,
-    errors: None | str = ...,
-) -> NDArray[np.bytes_]: ...
-
-@overload
-def expandtabs(a: U_co, tabsize: i_co = ...) -> NDArray[np.str_]: ...
-@overload
-def expandtabs(a: S_co, tabsize: i_co = ...) -> NDArray[np.bytes_]: ...
-
-@overload
-def center(a: U_co, width: i_co, fillchar: U_co = ...) -> NDArray[np.str_]: ...
-@overload
-def center(a: S_co, width: i_co, fillchar: S_co = ...) -> NDArray[np.bytes_]: ...
-
-@overload
-def ljust(a: U_co, width: i_co, fillchar: U_co = ...) -> NDArray[np.str_]: ...
-@overload
-def ljust(a: S_co, width: i_co, fillchar: S_co = ...) -> NDArray[np.bytes_]: ...
-
-@overload
-def rjust(
-    a: U_co,
-    width: i_co,
-    fillchar: U_co = ...,
-) -> NDArray[np.str_]: ...
-@overload
-def rjust(
-    a: S_co,
-    width: i_co,
-    fillchar: S_co = ...,
-) -> NDArray[np.bytes_]: ...
-
-@overload
-def lstrip(a: U_co, chars: None | U_co = ...) -> NDArray[np.str_]: ...
-@overload
-def lstrip(a: S_co, chars: None | S_co = ...) -> NDArray[np.bytes_]: ...
-
-@overload
-def rstrip(a: U_co, char: None | U_co = ...) -> NDArray[np.str_]: ...
-@overload
-def rstrip(a: S_co, char: None | S_co = ...) -> NDArray[np.bytes_]: ...
-
-@overload
-def strip(a: U_co, chars: None | U_co = ...) -> NDArray[np.str_]: ...
-@overload
-def strip(a: S_co, chars: None | S_co = ...) -> NDArray[np.bytes_]: ...
-
-@overload
-def zfill(a: U_co, width: i_co) -> NDArray[np.str_]: ...
-@overload
-def zfill(a: S_co, width: i_co) -> NDArray[np.bytes_]: ...
-
-@overload
-def upper(a: U_co) -> NDArray[np.str_]: ...
-@overload
-def upper(a: S_co) -> NDArray[np.bytes_]: ...
-
-@overload
-def lower(a: U_co) -> NDArray[np.str_]: ...
-@overload
-def lower(a: S_co) -> NDArray[np.bytes_]: ...
-
-@overload
-def swapcase(a: U_co) -> NDArray[np.str_]: ...
-@overload
-def swapcase(a: S_co) -> NDArray[np.bytes_]: ...
-
-@overload
-def capitalize(a: U_co) -> NDArray[np.str_]: ...
-@overload
-def capitalize(a: S_co) -> NDArray[np.bytes_]: ...
-
-@overload
-def title(a: U_co) -> NDArray[np.str_]: ...
-@overload
-def title(a: S_co) -> NDArray[np.bytes_]: ...
-
-@overload
-def replace(
-    a: U_co,
-    old: U_co,
-    new: U_co,
-    count: i_co = ...,
-) -> NDArray[np.str_]: ...
-@overload
-def replace(
-    a: S_co,
-    old: S_co,
-    new: S_co,
-    count: i_co = ...,
-) -> NDArray[np.bytes_]: ...
-
-@overload
-def join(sep: U_co, seq: U_co) -> NDArray[np.str_]: ...
-@overload
-def join(sep: S_co, seq: S_co) -> NDArray[np.bytes_]: ...
-
-@overload
-def split(
-    a: U_co,
-    sep: None | U_co = ...,
-    maxsplit: None | i_co = ...,
-) -> NDArray[np.object_]: ...
-@overload
-def split(
-    a: S_co,
-    sep: None | S_co = ...,
-    maxsplit: None | i_co = ...,
-) -> NDArray[np.object_]: ...
-
-@overload
-def rsplit(
-    a: U_co,
-    sep: None | U_co = ...,
-    maxsplit: None | i_co = ...,
-) -> NDArray[np.object_]: ...
-@overload
-def rsplit(
-    a: S_co,
-    sep: None | S_co = ...,
-    maxsplit: None | i_co = ...,
-) -> NDArray[np.object_]: ...
-
-@overload
-def splitlines(a: U_co, keepends: None | b_co = ...) -> NDArray[np.object_]: ...
-@overload
-def splitlines(a: S_co, keepends: None | b_co = ...) -> NDArray[np.object_]: ...
-
-@overload
-def partition(a: U_co, sep: U_co) -> NDArray[np.str_]: ...
-@overload
-def partition(a: S_co, sep: S_co) -> NDArray[np.bytes_]: ...
-
-@overload
-def rpartition(a: U_co, sep: U_co) -> NDArray[np.str_]: ...
-@overload
-def rpartition(a: S_co, sep: S_co) -> NDArray[np.bytes_]: ...
-
-@overload
-def translate(
-    a: U_co,
-    table: U_co,
-    deletechars: None | U_co = ...,
-) -> NDArray[np.str_]: ...
-@overload
-def translate(
-    a: S_co,
-    table: S_co,
-    deletechars: None | S_co = ...,
-) -> NDArray[np.bytes_]: ...
+np.strings.replace(AR_U, b"_", b"-", 10)  # E: incompatible type
+np.strings.replace(AR_S, "_", "-", 1)  # E: incompatible type

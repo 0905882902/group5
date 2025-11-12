@@ -1,1083 +1,161 @@
-from collections.abc import Sequence
-from typing import Any, overload, TypeVar, Literal, SupportsIndex
+"""Tests for :mod:`numpy._core.fromnumeric`."""
 
 import numpy as np
-from numpy import (
-    number,
-    uint64,
-    int_,
-    int64,
-    intp,
-    float16,
-    floating,
-    complexfloating,
-    object_,
-    generic,
-    _OrderKACF,
-    _OrderACF,
-    _ModeKind,
-    _PartitionKind,
-    _SortKind,
-    _SortSide,
-    _CastingKind,
+import numpy.typing as npt
+
+A = np.array(True, ndmin=2, dtype=bool)
+A.setflags(write=False)
+AR_U: npt.NDArray[np.str_]
+
+a = np.bool(True)
+
+np.take(a, None)  # E: No overload variant
+np.take(a, axis=1.0)  # E: No overload variant
+np.take(A, out=1)  # E: No overload variant
+np.take(A, mode="bob")  # E: No overload variant
+
+np.reshape(a, None)  # E: No overload variant
+np.reshape(A, 1, order="bob")  # E: No overload variant
+
+np.choose(a, None)  # E: No overload variant
+np.choose(a, out=1.0)  # E: No overload variant
+np.choose(A, mode="bob")  # E: No overload variant
+
+np.repeat(a, None)  # E: No overload variant
+np.repeat(A, 1, axis=1.0)  # E: No overload variant
+
+np.swapaxes(A, None, 1)  # E: No overload variant
+np.swapaxes(A, 1, [0])  # E: No overload variant
+
+np.transpose(A, axes=1.0)  # E: No overload variant
+
+np.partition(a, None)  # E: No overload variant
+np.partition(  # E: No overload variant
+    a, 0, axis="bob"
 )
-from numpy._typing import (
-    DTypeLike,
-    _DTypeLike,
-    ArrayLike,
-    _ArrayLike,
-    NDArray,
-    _ShapeLike,
-    _Shape,
-    _ArrayLikeBool_co,
-    _ArrayLikeUInt_co,
-    _ArrayLikeInt_co,
-    _ArrayLikeFloat_co,
-    _ArrayLikeComplex_co,
-    _ArrayLikeObject_co,
-    _IntLike_co,
-    _BoolLike_co,
-    _ComplexLike_co,
-    _NumberLike_co,
-    _ScalarLike_co,
+np.partition(  # E: No overload variant
+    A, 0, kind="bob"
+)
+np.partition(
+    A, 0, order=range(5)  # E: Argument "order" to "partition" has incompatible type
 )
 
-_SCT = TypeVar("_SCT", bound=generic)
-_SCT_uifcO = TypeVar("_SCT_uifcO", bound=number[Any] | object_)
-_ArrayType = TypeVar("_ArrayType", bound=NDArray[Any])
+np.argpartition(
+    a, None  # E: incompatible type
+)
+np.argpartition(
+    a, 0, axis="bob"  # E: incompatible type
+)
+np.argpartition(
+    A, 0, kind="bob"  # E: incompatible type
+)
+np.argpartition(
+    A, 0, order=range(5)  # E: Argument "order" to "argpartition" has incompatible type
+)
 
-__all__: list[str]
+np.sort(A, axis="bob")  # E: No overload variant
+np.sort(A, kind="bob")  # E: No overload variant
+np.sort(A, order=range(5))  # E: Argument "order" to "sort" has incompatible type
 
-@overload
-def take(
-    a: _ArrayLike[_SCT],
-    indices: _IntLike_co,
-    axis: None = ...,
-    out: None = ...,
-    mode: _ModeKind = ...,
-) -> _SCT: ...
-@overload
-def take(
-    a: ArrayLike,
-    indices: _IntLike_co,
-    axis: None | SupportsIndex = ...,
-    out: None = ...,
-    mode: _ModeKind = ...,
-) -> Any: ...
-@overload
-def take(
-    a: _ArrayLike[_SCT],
-    indices: _ArrayLikeInt_co,
-    axis: None | SupportsIndex = ...,
-    out: None = ...,
-    mode: _ModeKind = ...,
-) -> NDArray[_SCT]: ...
-@overload
-def take(
-    a: ArrayLike,
-    indices: _ArrayLikeInt_co,
-    axis: None | SupportsIndex = ...,
-    out: None = ...,
-    mode: _ModeKind = ...,
-) -> NDArray[Any]: ...
-@overload
-def take(
-    a: ArrayLike,
-    indices: _ArrayLikeInt_co,
-    axis: None | SupportsIndex = ...,
-    out: _ArrayType = ...,
-    mode: _ModeKind = ...,
-) -> _ArrayType: ...
+np.argsort(A, axis="bob")  # E: Argument "axis" to "argsort" has incompatible type
+np.argsort(A, kind="bob")  # E: Argument "kind" to "argsort" has incompatible type
+np.argsort(A, order=range(5))  # E: Argument "order" to "argsort" has incompatible type
 
-@overload
-def reshape(
-    a: _ArrayLike[_SCT],
-    newshape: _ShapeLike,
-    order: _OrderACF = ...,
-) -> NDArray[_SCT]: ...
-@overload
-def reshape(
-    a: ArrayLike,
-    newshape: _ShapeLike,
-    order: _OrderACF = ...,
-) -> NDArray[Any]: ...
+np.argmax(A, axis="bob")  # E: No overload variant of "argmax" matches argument type
+np.argmax(A, kind="bob")  # E: No overload variant of "argmax" matches argument type
 
-@overload
-def choose(
-    a: _IntLike_co,
-    choices: ArrayLike,
-    out: None = ...,
-    mode: _ModeKind = ...,
-) -> Any: ...
-@overload
-def choose(
-    a: _ArrayLikeInt_co,
-    choices: _ArrayLike[_SCT],
-    out: None = ...,
-    mode: _ModeKind = ...,
-) -> NDArray[_SCT]: ...
-@overload
-def choose(
-    a: _ArrayLikeInt_co,
-    choices: ArrayLike,
-    out: None = ...,
-    mode: _ModeKind = ...,
-) -> NDArray[Any]: ...
-@overload
-def choose(
-    a: _ArrayLikeInt_co,
-    choices: ArrayLike,
-    out: _ArrayType = ...,
-    mode: _ModeKind = ...,
-) -> _ArrayType: ...
+np.argmin(A, axis="bob")  # E: No overload variant of "argmin" matches argument type
+np.argmin(A, kind="bob")  # E: No overload variant of "argmin" matches argument type
 
-@overload
-def repeat(
-    a: _ArrayLike[_SCT],
-    repeats: _ArrayLikeInt_co,
-    axis: None | SupportsIndex = ...,
-) -> NDArray[_SCT]: ...
-@overload
-def repeat(
-    a: ArrayLike,
-    repeats: _ArrayLikeInt_co,
-    axis: None | SupportsIndex = ...,
-) -> NDArray[Any]: ...
+np.searchsorted(  # E: No overload variant of "searchsorted" matches argument type
+    A[0], 0, side="bob"
+)
+np.searchsorted(  # E: No overload variant of "searchsorted" matches argument type
+    A[0], 0, sorter=1.0
+)
 
-def put(
-    a: NDArray[Any],
-    ind: _ArrayLikeInt_co,
-    v: ArrayLike,
-    mode: _ModeKind = ...,
-) -> None: ...
+np.resize(A, 1.0)  # E: No overload variant
 
-@overload
-def swapaxes(
-    a: _ArrayLike[_SCT],
-    axis1: SupportsIndex,
-    axis2: SupportsIndex,
-) -> NDArray[_SCT]: ...
-@overload
-def swapaxes(
-    a: ArrayLike,
-    axis1: SupportsIndex,
-    axis2: SupportsIndex,
-) -> NDArray[Any]: ...
+np.squeeze(A, 1.0)  # E: No overload variant of "squeeze" matches argument type
 
-@overload
-def transpose(
-    a: _ArrayLike[_SCT],
-    axes: None | _ShapeLike = ...
-) -> NDArray[_SCT]: ...
-@overload
-def transpose(
-    a: ArrayLike,
-    axes: None | _ShapeLike = ...
-) -> NDArray[Any]: ...
+np.diagonal(A, offset=None)  # E: No overload variant
+np.diagonal(A, axis1="bob")  # E: No overload variant
+np.diagonal(A, axis2=[])  # E: No overload variant
 
-@overload
-def matrix_transpose(x: _ArrayLike[_SCT]) -> NDArray[_SCT]: ...
-@overload
-def matrix_transpose(x: ArrayLike) -> NDArray[Any]: ...
+np.trace(A, offset=None)  # E: No overload variant
+np.trace(A, axis1="bob")  # E: No overload variant
+np.trace(A, axis2=[])  # E: No overload variant
 
-@overload
-def partition(
-    a: _ArrayLike[_SCT],
-    kth: _ArrayLikeInt_co,
-    axis: None | SupportsIndex = ...,
-    kind: _PartitionKind = ...,
-    order: None | str | Sequence[str] = ...,
-) -> NDArray[_SCT]: ...
-@overload
-def partition(
-    a: ArrayLike,
-    kth: _ArrayLikeInt_co,
-    axis: None | SupportsIndex = ...,
-    kind: _PartitionKind = ...,
-    order: None | str | Sequence[str] = ...,
-) -> NDArray[Any]: ...
+np.ravel(a, order="bob")  # E: No overload variant
 
-def argpartition(
-    a: ArrayLike,
-    kth: _ArrayLikeInt_co,
-    axis: None | SupportsIndex = ...,
-    kind: _PartitionKind = ...,
-    order: None | str | Sequence[str] = ...,
-) -> NDArray[intp]: ...
+np.compress(  # E: No overload variant
+    [True], A, axis=1.0
+)
 
-@overload
-def sort(
-    a: _ArrayLike[_SCT],
-    axis: None | SupportsIndex = ...,
-    kind: None | _SortKind = ...,
-    order: None | str | Sequence[str] = ...,
-    *,
-    stable: None | bool = ...,
-) -> NDArray[_SCT]: ...
-@overload
-def sort(
-    a: ArrayLike,
-    axis: None | SupportsIndex = ...,
-    kind: None | _SortKind = ...,
-    order: None | str | Sequence[str] = ...,
-    *,
-    stable: None | bool = ...,
-) -> NDArray[Any]: ...
+np.clip(a, 1, 2, out=1)  # E: No overload variant of "clip" matches argument type
 
-def argsort(
-    a: ArrayLike,
-    axis: None | SupportsIndex = ...,
-    kind: None | _SortKind = ...,
-    order: None | str | Sequence[str] = ...,
-    *,
-    stable: None | bool = ...,
-) -> NDArray[intp]: ...
+np.sum(a, axis=1.0)  # E: No overload variant
+np.sum(a, keepdims=1.0)  # E: No overload variant
+np.sum(a, initial=[1])  # E: No overload variant
 
-@overload
-def argmax(
-    a: ArrayLike,
-    axis: None = ...,
-    out: None = ...,
-    *,
-    keepdims: Literal[False] = ...,
-) -> intp: ...
-@overload
-def argmax(
-    a: ArrayLike,
-    axis: None | SupportsIndex = ...,
-    out: None = ...,
-    *,
-    keepdims: bool = ...,
-) -> Any: ...
-@overload
-def argmax(
-    a: ArrayLike,
-    axis: None | SupportsIndex = ...,
-    out: _ArrayType = ...,
-    *,
-    keepdims: bool = ...,
-) -> _ArrayType: ...
+np.all(a, axis=1.0)  # E: No overload variant
+np.all(a, keepdims=1.0)  # E: No overload variant
+np.all(a, out=1.0)  # E: No overload variant
 
-@overload
-def argmin(
-    a: ArrayLike,
-    axis: None = ...,
-    out: None = ...,
-    *,
-    keepdims: Literal[False] = ...,
-) -> intp: ...
-@overload
-def argmin(
-    a: ArrayLike,
-    axis: None | SupportsIndex = ...,
-    out: None = ...,
-    *,
-    keepdims: bool = ...,
-) -> Any: ...
-@overload
-def argmin(
-    a: ArrayLike,
-    axis: None | SupportsIndex = ...,
-    out: _ArrayType = ...,
-    *,
-    keepdims: bool = ...,
-) -> _ArrayType: ...
+np.any(a, axis=1.0)  # E: No overload variant
+np.any(a, keepdims=1.0)  # E: No overload variant
+np.any(a, out=1.0)  # E: No overload variant
 
-@overload
-def searchsorted(
-    a: ArrayLike,
-    v: _ScalarLike_co,
-    side: _SortSide = ...,
-    sorter: None | _ArrayLikeInt_co = ...,  # 1D int array
-) -> intp: ...
-@overload
-def searchsorted(
-    a: ArrayLike,
-    v: ArrayLike,
-    side: _SortSide = ...,
-    sorter: None | _ArrayLikeInt_co = ...,  # 1D int array
-) -> NDArray[intp]: ...
+np.cumsum(a, axis=1.0)  # E: No overload variant
+np.cumsum(a, dtype=1.0)  # E: No overload variant
+np.cumsum(a, out=1.0)  # E: No overload variant
 
-@overload
-def resize(
-    a: _ArrayLike[_SCT],
-    new_shape: _ShapeLike,
-) -> NDArray[_SCT]: ...
-@overload
-def resize(
-    a: ArrayLike,
-    new_shape: _ShapeLike,
-) -> NDArray[Any]: ...
+np.ptp(a, axis=1.0)  # E: No overload variant
+np.ptp(a, keepdims=1.0)  # E: No overload variant
+np.ptp(a, out=1.0)  # E: No overload variant
 
-@overload
-def squeeze(
-    a: _SCT,
-    axis: None | _ShapeLike = ...,
-) -> _SCT: ...
-@overload
-def squeeze(
-    a: _ArrayLike[_SCT],
-    axis: None | _ShapeLike = ...,
-) -> NDArray[_SCT]: ...
-@overload
-def squeeze(
-    a: ArrayLike,
-    axis: None | _ShapeLike = ...,
-) -> NDArray[Any]: ...
+np.amax(a, axis=1.0)  # E: No overload variant
+np.amax(a, keepdims=1.0)  # E: No overload variant
+np.amax(a, out=1.0)  # E: No overload variant
+np.amax(a, initial=[1.0])  # E: No overload variant
+np.amax(a, where=[1.0])  # E: incompatible type
 
-@overload
-def diagonal(
-    a: _ArrayLike[_SCT],
-    offset: SupportsIndex = ...,
-    axis1: SupportsIndex = ...,
-    axis2: SupportsIndex = ...,  # >= 2D array
-) -> NDArray[_SCT]: ...
-@overload
-def diagonal(
-    a: ArrayLike,
-    offset: SupportsIndex = ...,
-    axis1: SupportsIndex = ...,
-    axis2: SupportsIndex = ...,  # >= 2D array
-) -> NDArray[Any]: ...
+np.amin(a, axis=1.0)  # E: No overload variant
+np.amin(a, keepdims=1.0)  # E: No overload variant
+np.amin(a, out=1.0)  # E: No overload variant
+np.amin(a, initial=[1.0])  # E: No overload variant
+np.amin(a, where=[1.0])  # E: incompatible type
 
-@overload
-def trace(
-    a: ArrayLike,  # >= 2D array
-    offset: SupportsIndex = ...,
-    axis1: SupportsIndex = ...,
-    axis2: SupportsIndex = ...,
-    dtype: DTypeLike = ...,
-    out: None = ...,
-) -> Any: ...
-@overload
-def trace(
-    a: ArrayLike,  # >= 2D array
-    offset: SupportsIndex = ...,
-    axis1: SupportsIndex = ...,
-    axis2: SupportsIndex = ...,
-    dtype: DTypeLike = ...,
-    out: _ArrayType = ...,
-) -> _ArrayType: ...
+np.prod(a, axis=1.0)  # E: No overload variant
+np.prod(a, out=False)  # E: No overload variant
+np.prod(a, keepdims=1.0)  # E: No overload variant
+np.prod(a, initial=int)  # E: No overload variant
+np.prod(a, where=1.0)  # E: No overload variant
+np.prod(AR_U)  # E: incompatible type
 
-@overload
-def ravel(a: _ArrayLike[_SCT], order: _OrderKACF = ...) -> NDArray[_SCT]: ...
-@overload
-def ravel(a: ArrayLike, order: _OrderKACF = ...) -> NDArray[Any]: ...
+np.cumprod(a, axis=1.0)  # E: No overload variant
+np.cumprod(a, out=False)  # E: No overload variant
+np.cumprod(AR_U)  # E: incompatible type
 
-def nonzero(a: ArrayLike) -> tuple[NDArray[intp], ...]: ...
+np.size(a, axis=1.0)  # E: Argument "axis" to "size" has incompatible type
 
-def shape(a: ArrayLike) -> _Shape: ...
+np.around(a, decimals=1.0)  # E: No overload variant
+np.around(a, out=type)  # E: No overload variant
+np.around(AR_U)  # E: incompatible type
 
-@overload
-def compress(
-    condition: _ArrayLikeBool_co,  # 1D bool array
-    a: _ArrayLike[_SCT],
-    axis: None | SupportsIndex = ...,
-    out: None = ...,
-) -> NDArray[_SCT]: ...
-@overload
-def compress(
-    condition: _ArrayLikeBool_co,  # 1D bool array
-    a: ArrayLike,
-    axis: None | SupportsIndex = ...,
-    out: None = ...,
-) -> NDArray[Any]: ...
-@overload
-def compress(
-    condition: _ArrayLikeBool_co,  # 1D bool array
-    a: ArrayLike,
-    axis: None | SupportsIndex = ...,
-    out: _ArrayType = ...,
-) -> _ArrayType: ...
+np.mean(a, axis=1.0)  # E: No overload variant
+np.mean(a, out=False)  # E: No overload variant
+np.mean(a, keepdims=1.0)  # E: No overload variant
+np.mean(AR_U)  # E: incompatible type
 
-@overload
-def clip(
-    a: _SCT,
-    a_min: None | ArrayLike,
-    a_max: None | ArrayLike,
-    out: None = ...,
-    *,
-    dtype: None = ...,
-    where: None | _ArrayLikeBool_co = ...,
-    order: _OrderKACF = ...,
-    subok: bool = ...,
-    signature: str | tuple[None | str, ...] = ...,
-    casting: _CastingKind = ...,
-) -> _SCT: ...
-@overload
-def clip(
-    a: _ScalarLike_co,
-    a_min: None | ArrayLike,
-    a_max: None | ArrayLike,
-    out: None = ...,
-    *,
-    dtype: None = ...,
-    where: None | _ArrayLikeBool_co = ...,
-    order: _OrderKACF = ...,
-    subok: bool = ...,
-    signature: str | tuple[None | str, ...] = ...,
-    casting: _CastingKind = ...,
-) -> Any: ...
-@overload
-def clip(
-    a: _ArrayLike[_SCT],
-    a_min: None | ArrayLike,
-    a_max: None | ArrayLike,
-    out: None = ...,
-    *,
-    dtype: None = ...,
-    where: None | _ArrayLikeBool_co = ...,
-    order: _OrderKACF = ...,
-    subok: bool = ...,
-    signature: str | tuple[None | str, ...] = ...,
-    casting: _CastingKind = ...,
-) -> NDArray[_SCT]: ...
-@overload
-def clip(
-    a: ArrayLike,
-    a_min: None | ArrayLike,
-    a_max: None | ArrayLike,
-    out: None = ...,
-    *,
-    dtype: None = ...,
-    where: None | _ArrayLikeBool_co = ...,
-    order: _OrderKACF = ...,
-    subok: bool = ...,
-    signature: str | tuple[None | str, ...] = ...,
-    casting: _CastingKind = ...,
-) -> NDArray[Any]: ...
-@overload
-def clip(
-    a: ArrayLike,
-    a_min: None | ArrayLike,
-    a_max: None | ArrayLike,
-    out: _ArrayType = ...,
-    *,
-    dtype: DTypeLike,
-    where: None | _ArrayLikeBool_co = ...,
-    order: _OrderKACF = ...,
-    subok: bool = ...,
-    signature: str | tuple[None | str, ...] = ...,
-    casting: _CastingKind = ...,
-) -> Any: ...
-@overload
-def clip(
-    a: ArrayLike,
-    a_min: None | ArrayLike,
-    a_max: None | ArrayLike,
-    out: _ArrayType,
-    *,
-    dtype: DTypeLike = ...,
-    where: None | _ArrayLikeBool_co = ...,
-    order: _OrderKACF = ...,
-    subok: bool = ...,
-    signature: str | tuple[None | str, ...] = ...,
-    casting: _CastingKind = ...,
-) -> _ArrayType: ...
+np.std(a, axis=1.0)  # E: No overload variant
+np.std(a, out=False)  # E: No overload variant
+np.std(a, ddof='test')  # E: No overload variant
+np.std(a, keepdims=1.0)  # E: No overload variant
+np.std(AR_U)  # E: incompatible type
 
-@overload
-def sum(
-    a: _ArrayLike[_SCT],
-    axis: None = ...,
-    dtype: None = ...,
-    out: None  = ...,
-    keepdims: bool = ...,
-    initial: _NumberLike_co = ...,
-    where: _ArrayLikeBool_co = ...,
-) -> _SCT: ...
-@overload
-def sum(
-    a: ArrayLike,
-    axis: None | _ShapeLike = ...,
-    dtype: DTypeLike = ...,
-    out: None  = ...,
-    keepdims: bool = ...,
-    initial: _NumberLike_co = ...,
-    where: _ArrayLikeBool_co = ...,
-) -> Any: ...
-@overload
-def sum(
-    a: ArrayLike,
-    axis: None | _ShapeLike = ...,
-    dtype: DTypeLike = ...,
-    out: _ArrayType  = ...,
-    keepdims: bool = ...,
-    initial: _NumberLike_co = ...,
-    where: _ArrayLikeBool_co = ...,
-) -> _ArrayType: ...
-
-@overload
-def all(
-    a: ArrayLike,
-    axis: None = ...,
-    out: None = ...,
-    keepdims: Literal[False] = ...,
-    *,
-    where: _ArrayLikeBool_co = ...,
-) -> np.bool: ...
-@overload
-def all(
-    a: ArrayLike,
-    axis: None | _ShapeLike = ...,
-    out: None = ...,
-    keepdims: bool = ...,
-    *,
-    where: _ArrayLikeBool_co = ...,
-) -> Any: ...
-@overload
-def all(
-    a: ArrayLike,
-    axis: None | _ShapeLike = ...,
-    out: _ArrayType = ...,
-    keepdims: bool = ...,
-    *,
-    where: _ArrayLikeBool_co = ...,
-) -> _ArrayType: ...
-
-@overload
-def any(
-    a: ArrayLike,
-    axis: None = ...,
-    out: None = ...,
-    keepdims: Literal[False] = ...,
-    *,
-    where: _ArrayLikeBool_co = ...,
-) -> np.bool: ...
-@overload
-def any(
-    a: ArrayLike,
-    axis: None | _ShapeLike = ...,
-    out: None = ...,
-    keepdims: bool = ...,
-    *,
-    where: _ArrayLikeBool_co = ...,
-) -> Any: ...
-@overload
-def any(
-    a: ArrayLike,
-    axis: None | _ShapeLike = ...,
-    out: _ArrayType = ...,
-    keepdims: bool = ...,
-    *,
-    where: _ArrayLikeBool_co = ...,
-) -> _ArrayType: ...
-
-@overload
-def cumsum(
-    a: _ArrayLike[_SCT],
-    axis: None | SupportsIndex = ...,
-    dtype: None = ...,
-    out: None = ...,
-) -> NDArray[_SCT]: ...
-@overload
-def cumsum(
-    a: ArrayLike,
-    axis: None | SupportsIndex = ...,
-    dtype: None = ...,
-    out: None = ...,
-) -> NDArray[Any]: ...
-@overload
-def cumsum(
-    a: ArrayLike,
-    axis: None | SupportsIndex = ...,
-    dtype: _DTypeLike[_SCT] = ...,
-    out: None = ...,
-) -> NDArray[_SCT]: ...
-@overload
-def cumsum(
-    a: ArrayLike,
-    axis: None | SupportsIndex = ...,
-    dtype: DTypeLike = ...,
-    out: None = ...,
-) -> NDArray[Any]: ...
-@overload
-def cumsum(
-    a: ArrayLike,
-    axis: None | SupportsIndex = ...,
-    dtype: DTypeLike = ...,
-    out: _ArrayType = ...,
-) -> _ArrayType: ...
-
-@overload
-def ptp(
-    a: _ArrayLike[_SCT],
-    axis: None = ...,
-    out: None = ...,
-    keepdims: Literal[False] = ...,
-) -> _SCT: ...
-@overload
-def ptp(
-    a: ArrayLike,
-    axis: None | _ShapeLike = ...,
-    out: None = ...,
-    keepdims: bool = ...,
-) -> Any: ...
-@overload
-def ptp(
-    a: ArrayLike,
-    axis: None | _ShapeLike = ...,
-    out: _ArrayType = ...,
-    keepdims: bool = ...,
-) -> _ArrayType: ...
-
-@overload
-def amax(
-    a: _ArrayLike[_SCT],
-    axis: None = ...,
-    out: None = ...,
-    keepdims: Literal[False] = ...,
-    initial: _NumberLike_co = ...,
-    where: _ArrayLikeBool_co = ...,
-) -> _SCT: ...
-@overload
-def amax(
-    a: ArrayLike,
-    axis: None | _ShapeLike = ...,
-    out: None = ...,
-    keepdims: bool = ...,
-    initial: _NumberLike_co = ...,
-    where: _ArrayLikeBool_co = ...,
-) -> Any: ...
-@overload
-def amax(
-    a: ArrayLike,
-    axis: None | _ShapeLike = ...,
-    out: _ArrayType = ...,
-    keepdims: bool = ...,
-    initial: _NumberLike_co = ...,
-    where: _ArrayLikeBool_co = ...,
-) -> _ArrayType: ...
-
-@overload
-def amin(
-    a: _ArrayLike[_SCT],
-    axis: None = ...,
-    out: None = ...,
-    keepdims: Literal[False] = ...,
-    initial: _NumberLike_co = ...,
-    where: _ArrayLikeBool_co = ...,
-) -> _SCT: ...
-@overload
-def amin(
-    a: ArrayLike,
-    axis: None | _ShapeLike = ...,
-    out: None = ...,
-    keepdims: bool = ...,
-    initial: _NumberLike_co = ...,
-    where: _ArrayLikeBool_co = ...,
-) -> Any: ...
-@overload
-def amin(
-    a: ArrayLike,
-    axis: None | _ShapeLike = ...,
-    out: _ArrayType = ...,
-    keepdims: bool = ...,
-    initial: _NumberLike_co = ...,
-    where: _ArrayLikeBool_co = ...,
-) -> _ArrayType: ...
-
-# TODO: `np.prod()``: For object arrays `initial` does not necessarily
-# have to be a numerical scalar.
-# The only requirement is that it is compatible
-# with the `.__mul__()` method(s) of the passed array's elements.
-
-# Note that the same situation holds for all wrappers around
-# `np.ufunc.reduce`, e.g. `np.sum()` (`.__add__()`).
-@overload
-def prod(
-    a: _ArrayLikeBool_co,
-    axis: None = ...,
-    dtype: None = ...,
-    out: None = ...,
-    keepdims: Literal[False] = ...,
-    initial: _NumberLike_co = ...,
-    where: _ArrayLikeBool_co = ...,
-) -> int_: ...
-@overload
-def prod(
-    a: _ArrayLikeUInt_co,
-    axis: None = ...,
-    dtype: None = ...,
-    out: None = ...,
-    keepdims: Literal[False] = ...,
-    initial: _NumberLike_co = ...,
-    where: _ArrayLikeBool_co = ...,
-) -> uint64: ...
-@overload
-def prod(
-    a: _ArrayLikeInt_co,
-    axis: None = ...,
-    dtype: None = ...,
-    out: None = ...,
-    keepdims: Literal[False] = ...,
-    initial: _NumberLike_co = ...,
-    where: _ArrayLikeBool_co = ...,
-) -> int64: ...
-@overload
-def prod(
-    a: _ArrayLikeFloat_co,
-    axis: None = ...,
-    dtype: None = ...,
-    out: None = ...,
-    keepdims: Literal[False] = ...,
-    initial: _NumberLike_co = ...,
-    where: _ArrayLikeBool_co = ...,
-) -> floating[Any]: ...
-@overload
-def prod(
-    a: _ArrayLikeComplex_co,
-    axis: None = ...,
-    dtype: None = ...,
-    out: None = ...,
-    keepdims: Literal[False] = ...,
-    initial: _NumberLike_co = ...,
-    where: _ArrayLikeBool_co = ...,
-) -> complexfloating[Any, Any]: ...
-@overload
-def prod(
-    a: _ArrayLikeComplex_co | _ArrayLikeObject_co,
-    axis: None | _ShapeLike = ...,
-    dtype: None = ...,
-    out: None = ...,
-    keepdims: bool = ...,
-    initial: _NumberLike_co = ...,
-    where: _ArrayLikeBool_co = ...,
-) -> Any: ...
-@overload
-def prod(
-    a: _ArrayLikeComplex_co | _ArrayLikeObject_co,
-    axis: None = ...,
-    dtype: _DTypeLike[_SCT] = ...,
-    out: None = ...,
-    keepdims: Literal[False] = ...,
-    initial: _NumberLike_co = ...,
-    where: _ArrayLikeBool_co = ...,
-) -> _SCT: ...
-@overload
-def prod(
-    a: _ArrayLikeComplex_co | _ArrayLikeObject_co,
-    axis: None | _ShapeLike = ...,
-    dtype: None | DTypeLike = ...,
-    out: None = ...,
-    keepdims: bool = ...,
-    initial: _NumberLike_co = ...,
-    where: _ArrayLikeBool_co = ...,
-) -> Any: ...
-@overload
-def prod(
-    a: _ArrayLikeComplex_co | _ArrayLikeObject_co,
-    axis: None | _ShapeLike = ...,
-    dtype: None | DTypeLike = ...,
-    out: _ArrayType = ...,
-    keepdims: bool = ...,
-    initial: _NumberLike_co = ...,
-    where: _ArrayLikeBool_co = ...,
-) -> _ArrayType: ...
-
-@overload
-def cumprod(
-    a: _ArrayLikeBool_co,
-    axis: None | SupportsIndex = ...,
-    dtype: None = ...,
-    out: None = ...,
-) -> NDArray[int_]: ...
-@overload
-def cumprod(
-    a: _ArrayLikeUInt_co,
-    axis: None | SupportsIndex = ...,
-    dtype: None = ...,
-    out: None = ...,
-) -> NDArray[uint64]: ...
-@overload
-def cumprod(
-    a: _ArrayLikeInt_co,
-    axis: None | SupportsIndex = ...,
-    dtype: None = ...,
-    out: None = ...,
-) -> NDArray[int64]: ...
-@overload
-def cumprod(
-    a: _ArrayLikeFloat_co,
-    axis: None | SupportsIndex = ...,
-    dtype: None = ...,
-    out: None = ...,
-) -> NDArray[floating[Any]]: ...
-@overload
-def cumprod(
-    a: _ArrayLikeComplex_co,
-    axis: None | SupportsIndex = ...,
-    dtype: None = ...,
-    out: None = ...,
-) -> NDArray[complexfloating[Any, Any]]: ...
-@overload
-def cumprod(
-    a: _ArrayLikeObject_co,
-    axis: None | SupportsIndex = ...,
-    dtype: None = ...,
-    out: None = ...,
-) -> NDArray[object_]: ...
-@overload
-def cumprod(
-    a: _ArrayLikeComplex_co | _ArrayLikeObject_co,
-    axis: None | SupportsIndex = ...,
-    dtype: _DTypeLike[_SCT] = ...,
-    out: None = ...,
-) -> NDArray[_SCT]: ...
-@overload
-def cumprod(
-    a: _ArrayLikeComplex_co | _ArrayLikeObject_co,
-    axis: None | SupportsIndex = ...,
-    dtype: DTypeLike = ...,
-    out: None = ...,
-) -> NDArray[Any]: ...
-@overload
-def cumprod(
-    a: _ArrayLikeComplex_co | _ArrayLikeObject_co,
-    axis: None | SupportsIndex = ...,
-    dtype: DTypeLike = ...,
-    out: _ArrayType = ...,
-) -> _ArrayType: ...
-
-def ndim(a: ArrayLike) -> int: ...
-
-def size(a: ArrayLike, axis: None | int = ...) -> int: ...
-
-@overload
-def around(
-    a: _BoolLike_co,
-    decimals: SupportsIndex = ...,
-    out: None = ...,
-) -> float16: ...
-@overload
-def around(
-    a: _SCT_uifcO,
-    decimals: SupportsIndex = ...,
-    out: None = ...,
-) -> _SCT_uifcO: ...
-@overload
-def around(
-    a: _ComplexLike_co | object_,
-    decimals: SupportsIndex = ...,
-    out: None = ...,
-) -> Any: ...
-@overload
-def around(
-    a: _ArrayLikeBool_co,
-    decimals: SupportsIndex = ...,
-    out: None = ...,
-) -> NDArray[float16]: ...
-@overload
-def around(
-    a: _ArrayLike[_SCT_uifcO],
-    decimals: SupportsIndex = ...,
-    out: None = ...,
-) -> NDArray[_SCT_uifcO]: ...
-@overload
-def around(
-    a: _ArrayLikeComplex_co | _ArrayLikeObject_co,
-    decimals: SupportsIndex = ...,
-    out: None = ...,
-) -> NDArray[Any]: ...
-@overload
-def around(
-    a: _ArrayLikeComplex_co | _ArrayLikeObject_co,
-    decimals: SupportsIndex = ...,
-    out: _ArrayType = ...,
-) -> _ArrayType: ...
-
-@overload
-def mean(
-    a: _ArrayLikeFloat_co,
-    axis: None = ...,
-    dtype: None = ...,
-    out: None = ...,
-    keepdims: Literal[False] = ...,
-    *,
-    where: _ArrayLikeBool_co = ...,
-) -> floating[Any]: ...
-@overload
-def mean(
-    a: _ArrayLikeComplex_co,
-    axis: None = ...,
-    dtype: None = ...,
-    out: None = ...,
-    keepdims: Literal[False] = ...,
-    *,
-    where: _ArrayLikeBool_co = ...,
-) -> complexfloating[Any, Any]: ...
-@overload
-def mean(
-    a: _ArrayLikeComplex_co | _ArrayLikeObject_co,
-    axis: None | _ShapeLike = ...,
-    dtype: None = ...,
-    out: None = ...,
-    keepdims: bool = ...,
-    *,
-    where: _ArrayLikeBool_co = ...,
-) -> Any: ...
-@overload
-def mean(
-    a: _ArrayLikeComplex_co | _ArrayLikeObject_co,
-    axis: None = ...,
-    dtype: _DTypeLike[_SCT] = ...,
-    out: None = ...,
-    keepdims: Literal[False] = ...,
-    *,
-    where: _ArrayLikeBool_co = ...,
-) -> _SCT: ...
-@overload
-def mean(
-    a: _ArrayLikeComplex_co | _ArrayLikeObject_co,
-    axis: None | _ShapeLike = ...,
-    dtype: DTypeLike = ...,
-    out: None = ...,
-    keepdims: bool = ...,
-    *,
-    where: _ArrayLikeBool_co = ...,
-) -> Any: ...
-@overload
-def mean(
-    a: _ArrayLikeComplex_co | _ArrayLikeObject_co,
-    axis: None | _ShapeLike = ...,
-    dtype: DTypeLike = ...,
-    out: _ArrayType = ...,
-    keepdims: bool = ...,
-    *,
-    where: _ArrayLikeBool_co = ...,
-) -> _ArrayType: ...
-
-@overload
-def std(
-    a: _ArrayLikeComplex_co,
-    axis: None = ...,
-    dtype: None = ...,
-    out: None = ...,
-    ddof: int | float = ...,
-    keepdims: Literal[False] = ...,
-    *,
-    where: _ArrayLikeBool_co = ...,
-    mean: _ArrayLikeComplex_co = ...,
-    correction: int | float = ...,
-) -> floating[Any]: ...
-@overload
-def std(
-    a: _ArrayLikeComplex_co | _ArrayLikeObject_co,
-    axis: None | _ShapeLike = ...,
-    dtype: None = ...,
-    out: None = ...,
-    ddof: int | float = ...,
-    keepdims: bool = ...,
-    *,
-    where: _ArrayLikeBool_co = ...,
-    mean: _ArrayLikeComplex_co | _ArrayLikeObject_co = ...,
-    correction: int | float = ...,
-) -> Any: ...
-@overload
-def std(
-    a: _ArrayLikeComplex_co | _ArrayLikeObject_co,
-    axis: None = ...,
-    dtype: _DTypeLike[_SCT] = ...,
-    out: None = ...,
-    ddof: int | float = ...,
-    keepdims: Literal[False] = ...,
-    *,
-    where: _ArrayLikeBool_co = ...,
-    mean: _ArrayLikeComplex_co | _ArrayLikeObject_co = ...,
-    correction: int | float = ...,
-) -> _SCT: ...
-@overload
-def std(
-    a: _ArrayLikeComplex_co | _ArrayLikeObject_co,
-    axis: None | _ShapeLike = ...,
-    dtype: DTypeLike = ...,
-    out: None = ...,
-    ddof: int | float = ...,
-    keepdims: bool = ...,
-    *,
-    where: _ArrayLikeBool_co = ...,
-    mean: _ArrayLikeComplex_co | _ArrayLikeObject_co = ...,
-    correction: int | float = ...,
-) -> Any: ...
-@overload
-def std(
-    a: _ArrayLikeComplex_co | _ArrayLikeObject_co,
-    axis: None | _ShapeLike = ...,
-    dtype: DTypeLike = ...,
-    out: _ArrayType = ...,
-    ddof: int | float = ...,
-    keepdims: bool = ...,
-    *,
-    where: _ArrayLikeBool_co = ...,
-    mean: _ArrayLikeComplex_co | _ArrayLikeObject_co = ...,
-    correction: int | float = ...,
-) -> _ArrayType: ...
-
-@overload
-def var(
-    a: _ArrayLikeComplex_co,
-    axis: None = ...,
-    dtype: None = ...,
-    out: None = ...,
-    ddof: int | float = ...,
-    keepdims: Literal[False] = ...,
-    *,
-    where: _ArrayLikeBool_co = ...,
-    mean: _ArrayLikeComplex_co = ...,
-    correction: int | float = ...,
-) -> floating[Any]: ...
-@overload
-def var(
-    a: _ArrayLikeComplex_co | _ArrayLikeObject_co,
-    axis: None | _ShapeLike = ...,
-    dtype: None = ...,
-    out: None = ...,
-    ddof: int | float = ...,
-    keepdims: bool = ...,
-    *,
-    where: _ArrayLikeBool_co = ...,
-    mean: _ArrayLikeComplex_co | _ArrayLikeObject_co = ...,
-    correction: int | float = ...,
-) -> Any: ...
-@overload
-def var(
-    a: _ArrayLikeComplex_co | _ArrayLikeObject_co,
-    axis: None = ...,
-    dtype: _DTypeLike[_SCT] = ...,
-    out: None = ...,
-    ddof: int | float = ...,
-    keepdims: Literal[False] = ...,
-    *,
-    where: _ArrayLikeBool_co = ...,
-    mean: _ArrayLikeComplex_co | _ArrayLikeObject_co = ...,
-    correction: int | float = ...,
-) -> _SCT: ...
-@overload
-def var(
-    a: _ArrayLikeComplex_co | _ArrayLikeObject_co,
-    axis: None | _ShapeLike = ...,
-    dtype: DTypeLike = ...,
-    out: None = ...,
-    ddof: int | float = ...,
-    keepdims: bool = ...,
-    *,
-    where: _ArrayLikeBool_co = ...,
-    mean: _ArrayLikeComplex_co | _ArrayLikeObject_co = ...,
-    correction: int | float = ...,
-) -> Any: ...
-@overload
-def var(
-    a: _ArrayLikeComplex_co | _ArrayLikeObject_co,
-    axis: None | _ShapeLike = ...,
-    dtype: DTypeLike = ...,
-    out: _ArrayType = ...,
-    ddof: int | float = ...,
-    keepdims: bool = ...,
-    *,
-    where: _ArrayLikeBool_co = ...,
-    mean: _ArrayLikeComplex_co | _ArrayLikeObject_co = ...,
-    correction: int | float = ...,
-) -> _ArrayType: ...
-
-max = amax
-min = amin
-round = around
+np.var(a, axis=1.0)  # E: No overload variant
+np.var(a, out=False)  # E: No overload variant
+np.var(a, ddof='test')  # E: No overload variant
+np.var(a, keepdims=1.0)  # E: No overload variant
+np.var(AR_U)  # E: incompatible type
