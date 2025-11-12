@@ -1,57 +1,31 @@
-import numpy as np
+from dateutil.tz import tzlocal
 import pytest
-import pytz
 
-from pandas._libs.tslibs import (
-    Resolution,
-    get_resolution,
-)
-from pandas._libs.tslibs.dtypes import NpyDatetimeUnit
+from pandas.compat import IS64
 
-import pandas._testing as tm
-
-
-def test_get_resolution_nano():
-    # don't return the fallback RESO_DAY
-    arr = np.array([1], dtype=np.int64)
-    res = get_resolution(arr)
-    assert res == Resolution.RESO_NS
-
-
-def test_get_resolution_non_nano_data():
-    arr = np.array([1], dtype=np.int64)
-    res = get_resolution(arr, None, NpyDatetimeUnit.NPY_FR_us.value)
-    assert res == Resolution.RESO_US
-
-    res = get_resolution(arr, pytz.UTC, NpyDatetimeUnit.NPY_FR_us.value)
-    assert res == Resolution.RESO_US
+from pandas import date_range
 
 
 @pytest.mark.parametrize(
-    "freqstr,expected",
+    "freq,expected",
     [
-        ("Y", "year"),
-        ("Q", "quarter"),
-        ("M", "month"),
+        ("YE", "day"),
+        ("QE", "day"),
+        ("ME", "day"),
         ("D", "day"),
         ("h", "hour"),
         ("min", "minute"),
         ("s", "second"),
         ("ms", "millisecond"),
         ("us", "microsecond"),
-        ("ns", "nanosecond"),
     ],
 )
-def test_get_attrname_from_abbrev(freqstr, expected):
-    reso = Resolution.get_reso_from_freqstr(freqstr)
-    assert reso.attr_abbrev == freqstr
-    assert reso.attrname == expected
+def test_dti_resolution(request, tz_naive_fixture, freq, expected):
+    tz = tz_naive_fixture
+    if freq == "YE" and not IS64 and isinstance(tz, tzlocal):
+        request.applymarker(
+            pytest.mark.xfail(reason="OverflowError inside tzlocal past 2038")
+        )
 
-
-@pytest.mark.parametrize("freq", ["A", "H", "T", "S", "L", "U", "N"])
-def test_units_A_H_T_S_L_U_N_deprecated_from_attrname_to_abbrevs(freq):
-    # GH#52536
-    msg = f"'{freq}' is deprecated and will be removed in a future version."
-
-    with tm.assert_produces_warning(FutureWarning, match=msg):
-        Resolution.get_reso_from_freqstr(freq)
+    idx = date_range(start="2013-04-01", periods=30, freq=freq, tz=tz)
+    assert idx.resolution == expected

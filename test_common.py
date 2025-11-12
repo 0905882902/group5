@@ -1,657 +1,513 @@
 """
-Tests for the pandas.io.common functionalities
+Collection of tests asserting things that should be true for
+any index subclass except for MultiIndex. Makes use of the `index_flat`
+fixture defined in pandas/conftest.py.
 """
-import codecs
-import errno
-from functools import partial
-from io import (
-    BytesIO,
-    StringIO,
-    UnsupportedOperation,
+from copy import (
+    copy,
+    deepcopy,
 )
-import mmap
-import os
-from pathlib import Path
-import pickle
-import tempfile
+import re
 
 import numpy as np
 import pytest
 
-from pandas.compat import is_platform_windows
-from pandas.compat.pyarrow import pa_version_under19p0
-import pandas.util._test_decorators as td
+from pandas.compat import IS64
+from pandas.compat.numpy import np_version_gte1p25
+
+from pandas.core.dtypes.common import (
+    is_integer_dtype,
+    is_numeric_dtype,
+)
 
 import pandas as pd
+from pandas import (
+    CategoricalIndex,
+    MultiIndex,
+    PeriodIndex,
+    RangeIndex,
+)
 import pandas._testing as tm
 
-import pandas.io.common as icom
 
-pytestmark = pytest.mark.filterwarnings(
-    "ignore:Passing a BlockManager to DataFrame:DeprecationWarning"
-)
+class TestCommon:
+    @pytest.mark.parametrize("name", [None, "new_name"])
+    def test_to_frame(self, name, index_flat, using_copy_on_write):
+        # see GH#15230, GH#22580
+        idx = index_flat
 
-
-class CustomFSPath:
-    """For testing fspath on unknown objects"""
-
-    def __init__(self, path) -> None:
-        self.path = path
-
-    def __fspath__(self):
-        return self.path
-
-
-# Functions that consume a string path and return a string or path-like object
-path_types = [str, CustomFSPath, Path]
-
-try:
-    from py.path import local as LocalPath
-
-    path_types.append(LocalPath)
-except ImportError:
-    pass
-
-HERE = os.path.abspath(os.path.dirname(__file__))
-
-
-# https://github.com/cython/cython/issues/1720
-class TestCommonIOCapabilities:
-    data1 = """index,A,B,C,D
-foo,2,3,4,5
-bar,7,8,9,10
-baz,12,13,14,15
-qux,12,13,14,15
-foo2,12,13,14,15
-bar2,12,13,14,15
-"""
-
-    def test_expand_user(self):
-        filename = "~/sometest"
-        expanded_name = icom._expand_user(filename)
-
-        assert expanded_name != filename
-        assert os.path.isabs(expanded_name)
-        assert os.path.expanduser(filename) == expanded_name
-
-    def test_expand_user_normal_path(self):
-        filename = "/somefolder/sometest"
-        expanded_name = icom._expand_user(filename)
-
-        assert expanded_name == filename
-        assert os.path.expanduser(filename) == expanded_name
-
-    def test_stringify_path_pathlib(self):
-        rel_path = icom.stringify_path(Path("."))
-        assert rel_path == "."
-        redundant_path = icom.stringify_path(Path("foo//bar"))
-        assert redundant_path == os.path.join("foo", "bar")
-
-    @td.skip_if_no("py.path")
-    def test_stringify_path_localpath(self):
-        path = os.path.join("foo", "bar")
-        abs_path = os.path.abspath(path)
-        lpath = LocalPath(path)
-        assert icom.stringify_path(lpath) == abs_path
-
-    def test_stringify_path_fspath(self):
-        p = CustomFSPath("foo/bar.csv")
-        result = icom.stringify_path(p)
-        assert result == "foo/bar.csv"
-
-    def test_stringify_file_and_path_like(self):
-        # GH 38125: do not stringify file objects that are also path-like
-        fsspec = pytest.importorskip("fsspec")
-        with tm.ensure_clean() as path:
-            with fsspec.open(f"file://{path}", mode="wb") as fsspec_obj:
-                assert fsspec_obj == icom.stringify_path(fsspec_obj)
-
-    @pytest.mark.parametrize("path_type", path_types)
-    def test_infer_compression_from_path(self, compression_format, path_type):
-        extension, expected = compression_format
-        path = path_type("foo/bar.csv" + extension)
-        compression = icom.infer_compression(path, compression="infer")
-        assert compression == expected
-
-    @pytest.mark.parametrize("path_type", [str, CustomFSPath, Path])
-    def test_get_handle_with_path(self, path_type):
-        # ignore LocalPath: it creates strange paths: /absolute/~/sometest
-        with tempfile.TemporaryDirectory(dir=Path.home()) as tmp:
-            filename = path_type("~/" + Path(tmp).name + "/sometest")
-            with icom.get_handle(filename, "w") as handles:
-                assert Path(handles.handle.name).is_absolute()
-                assert os.path.expanduser(filename) == handles.handle.name
-
-    def test_get_handle_with_buffer(self):
-        with StringIO() as input_buffer:
-            with icom.get_handle(input_buffer, "r") as handles:
-                assert handles.handle == input_buffer
-            assert not input_buffer.closed
-        assert input_buffer.closed
-
-    # Test that BytesIOWrapper(get_handle) returns correct amount of bytes every time
-    def test_bytesiowrapper_returns_correct_bytes(self):
-        # Test latin1, ucs-2, and ucs-4 chars
-        data = """a,b,c
-1,2,3
-©,®,®
-Look,a snake,🐍"""
-        with icom.get_handle(StringIO(data), "rb", is_text=False) as handles:
-            result = b""
-            chunksize = 5
-            while True:
-                chunk = handles.handle.read(chunksize)
-                # Make sure each chunk is correct amount of bytes
-                assert len(chunk) <= chunksize
-                if len(chunk) < chunksize:
-                    # Can be less amount of bytes, but only at EOF
-                    # which happens when read returns empty
-                    assert len(handles.handle.read()) == 0
-                    result += chunk
-                    break
-                result += chunk
-            assert result == data.encode("utf-8")
-
-    # Test that pyarrow can handle a file opened with get_handle
-    def test_get_handle_pyarrow_compat(self):
-        pa_csv = pytest.importorskip("pyarrow.csv")
-
-        # Test latin1, ucs-2, and ucs-4 chars
-        data = """a,b,c
-1,2,3
-©,®,®
-Look,a snake,🐍"""
-        expected = pd.DataFrame(
-            {"a": ["1", "©", "Look"], "b": ["2", "®", "a snake"], "c": ["3", "®", "🐍"]}
-        )
-        s = StringIO(data)
-        with icom.get_handle(s, "rb", is_text=False) as handles:
-            df = pa_csv.read_csv(handles.handle).to_pandas()
-            if pa_version_under19p0:
-                expected = expected.astype("object")
-            tm.assert_frame_equal(df, expected)
-            assert not s.closed
-
-    def test_iterator(self):
-        with pd.read_csv(StringIO(self.data1), chunksize=1) as reader:
-            result = pd.concat(reader, ignore_index=True)
-        expected = pd.read_csv(StringIO(self.data1))
-        tm.assert_frame_equal(result, expected)
-
-        # GH12153
-        with pd.read_csv(StringIO(self.data1), chunksize=1) as it:
-            first = next(it)
-            tm.assert_frame_equal(first, expected.iloc[[0]])
-            tm.assert_frame_equal(pd.concat(it), expected.iloc[1:])
-
-    @pytest.mark.parametrize(
-        "reader, module, error_class, fn_ext",
-        [
-            (pd.read_csv, "os", FileNotFoundError, "csv"),
-            (pd.read_fwf, "os", FileNotFoundError, "txt"),
-            (pd.read_excel, "xlrd", FileNotFoundError, "xlsx"),
-            (pd.read_feather, "pyarrow", OSError, "feather"),
-            (pd.read_hdf, "tables", FileNotFoundError, "h5"),
-            (pd.read_stata, "os", FileNotFoundError, "dta"),
-            (pd.read_sas, "os", FileNotFoundError, "sas7bdat"),
-            (pd.read_json, "os", FileNotFoundError, "json"),
-            (pd.read_pickle, "os", FileNotFoundError, "pickle"),
-        ],
-    )
-    def test_read_non_existent(self, reader, module, error_class, fn_ext):
-        pytest.importorskip(module)
-
-        path = os.path.join(HERE, "data", "does_not_exist." + fn_ext)
-        msg1 = rf"File (b')?.+does_not_exist\.{fn_ext}'? does not exist"
-        msg2 = rf"\[Errno 2\] No such file or directory: '.+does_not_exist\.{fn_ext}'"
-        msg3 = "Expected object or value"
-        msg4 = "path_or_buf needs to be a string file path or file-like"
-        msg5 = (
-            rf"\[Errno 2\] File .+does_not_exist\.{fn_ext} does not exist: "
-            rf"'.+does_not_exist\.{fn_ext}'"
-        )
-        msg6 = rf"\[Errno 2\] 没有那个文件或目录: '.+does_not_exist\.{fn_ext}'"
-        msg7 = (
-            rf"\[Errno 2\] File o directory non esistente: '.+does_not_exist\.{fn_ext}'"
-        )
-        msg8 = rf"Failed to open local file.+does_not_exist\.{fn_ext}"
-
-        with pytest.raises(
-            error_class,
-            match=rf"({msg1}|{msg2}|{msg3}|{msg4}|{msg5}|{msg6}|{msg7}|{msg8})",
-        ):
-            reader(path)
-
-    @pytest.mark.parametrize(
-        "method, module, error_class, fn_ext",
-        [
-            (pd.DataFrame.to_csv, "os", OSError, "csv"),
-            (pd.DataFrame.to_html, "os", OSError, "html"),
-            (pd.DataFrame.to_excel, "xlrd", OSError, "xlsx"),
-            (pd.DataFrame.to_feather, "pyarrow", OSError, "feather"),
-            (pd.DataFrame.to_parquet, "pyarrow", OSError, "parquet"),
-            (pd.DataFrame.to_stata, "os", OSError, "dta"),
-            (pd.DataFrame.to_json, "os", OSError, "json"),
-            (pd.DataFrame.to_pickle, "os", OSError, "pickle"),
-        ],
-    )
-    # NOTE: Missing parent directory for pd.DataFrame.to_hdf is handled by PyTables
-    def test_write_missing_parent_directory(self, method, module, error_class, fn_ext):
-        pytest.importorskip(module)
-
-        dummy_frame = pd.DataFrame({"a": [1, 2, 3], "b": [2, 3, 4], "c": [3, 4, 5]})
-
-        path = os.path.join(HERE, "data", "missing_folder", "does_not_exist." + fn_ext)
-
-        with pytest.raises(
-            error_class,
-            match=r"Cannot save file into a non-existent directory: .*missing_folder",
-        ):
-            method(dummy_frame, path)
-
-    @pytest.mark.parametrize(
-        "reader, module, error_class, fn_ext",
-        [
-            (pd.read_csv, "os", FileNotFoundError, "csv"),
-            (pd.read_table, "os", FileNotFoundError, "csv"),
-            (pd.read_fwf, "os", FileNotFoundError, "txt"),
-            (pd.read_excel, "xlrd", FileNotFoundError, "xlsx"),
-            (pd.read_feather, "pyarrow", OSError, "feather"),
-            (pd.read_hdf, "tables", FileNotFoundError, "h5"),
-            (pd.read_stata, "os", FileNotFoundError, "dta"),
-            (pd.read_sas, "os", FileNotFoundError, "sas7bdat"),
-            (pd.read_json, "os", FileNotFoundError, "json"),
-            (pd.read_pickle, "os", FileNotFoundError, "pickle"),
-        ],
-    )
-    def test_read_expands_user_home_dir(
-        self, reader, module, error_class, fn_ext, monkeypatch
-    ):
-        pytest.importorskip(module)
-
-        path = os.path.join("~", "does_not_exist." + fn_ext)
-        monkeypatch.setattr(icom, "_expand_user", lambda x: os.path.join("foo", x))
-
-        msg1 = rf"File (b')?.+does_not_exist\.{fn_ext}'? does not exist"
-        msg2 = rf"\[Errno 2\] No such file or directory: '.+does_not_exist\.{fn_ext}'"
-        msg3 = "Unexpected character found when decoding 'false'"
-        msg4 = "path_or_buf needs to be a string file path or file-like"
-        msg5 = (
-            rf"\[Errno 2\] File .+does_not_exist\.{fn_ext} does not exist: "
-            rf"'.+does_not_exist\.{fn_ext}'"
-        )
-        msg6 = rf"\[Errno 2\] 没有那个文件或目录: '.+does_not_exist\.{fn_ext}'"
-        msg7 = (
-            rf"\[Errno 2\] File o directory non esistente: '.+does_not_exist\.{fn_ext}'"
-        )
-        msg8 = rf"Failed to open local file.+does_not_exist\.{fn_ext}"
-
-        with pytest.raises(
-            error_class,
-            match=rf"({msg1}|{msg2}|{msg3}|{msg4}|{msg5}|{msg6}|{msg7}|{msg8})",
-        ):
-            reader(path)
-
-    @pytest.mark.parametrize(
-        "reader, module, path",
-        [
-            (pd.read_csv, "os", ("io", "data", "csv", "iris.csv")),
-            (pd.read_table, "os", ("io", "data", "csv", "iris.csv")),
-            (
-                pd.read_fwf,
-                "os",
-                ("io", "data", "fixed_width", "fixed_width_format.txt"),
-            ),
-            (pd.read_excel, "xlrd", ("io", "data", "excel", "test1.xlsx")),
-            (
-                pd.read_feather,
-                "pyarrow",
-                ("io", "data", "feather", "feather-0_3_1.feather"),
-            ),
-            pytest.param(
-                pd.read_hdf,
-                "tables",
-                ("io", "data", "legacy_hdf", "datetimetz_object.h5"),
-                # cleaned-up in https://github.com/pandas-dev/pandas/pull/57387 on main
-                marks=pytest.mark.xfail(reason="TODO(infer_string)", strict=False),
-            ),
-            (pd.read_stata, "os", ("io", "data", "stata", "stata10_115.dta")),
-            (pd.read_sas, "os", ("io", "sas", "data", "test1.sas7bdat")),
-            (pd.read_json, "os", ("io", "json", "data", "tsframe_v012.json")),
-            (
-                pd.read_pickle,
-                "os",
-                ("io", "data", "pickle", "categorical.0.25.0.pickle"),
-            ),
-        ],
-    )
-    def test_read_fspath_all(self, reader, module, path, datapath):
-        pytest.importorskip(module)
-        path = datapath(*path)
-
-        mypath = CustomFSPath(path)
-        result = reader(mypath)
-        expected = reader(path)
-
-        if path.endswith(".pickle"):
-            # categorical
-            tm.assert_categorical_equal(result, expected)
+        if name:
+            idx_name = name
         else:
-            tm.assert_frame_equal(result, expected)
+            idx_name = idx.name or 0
 
-    @pytest.mark.parametrize(
-        "writer_name, writer_kwargs, module",
-        [
-            ("to_csv", {}, "os"),
-            ("to_excel", {"engine": "openpyxl"}, "openpyxl"),
-            ("to_feather", {}, "pyarrow"),
-            ("to_html", {}, "os"),
-            ("to_json", {}, "os"),
-            ("to_latex", {}, "os"),
-            ("to_pickle", {}, "os"),
-            ("to_stata", {"time_stamp": pd.to_datetime("2019-01-01 00:00")}, "os"),
-        ],
-    )
-    def test_write_fspath_all(self, writer_name, writer_kwargs, module):
-        if writer_name in ["to_latex"]:  # uses Styler implementation
-            pytest.importorskip("jinja2")
-        p1 = tm.ensure_clean("string")
-        p2 = tm.ensure_clean("fspath")
-        df = pd.DataFrame({"A": [1, 2]})
+        df = idx.to_frame(name=idx_name)
 
-        with p1 as string, p2 as fspath:
-            pytest.importorskip(module)
-            mypath = CustomFSPath(fspath)
-            writer = getattr(df, writer_name)
+        assert df.index is idx
+        assert len(df.columns) == 1
+        assert df.columns[0] == idx_name
+        if not using_copy_on_write:
+            assert df[idx_name].values is not idx.values
 
-            writer(string, **writer_kwargs)
-            writer(mypath, **writer_kwargs)
-            with open(string, "rb") as f_str, open(fspath, "rb") as f_path:
-                if writer_name == "to_excel":
-                    # binary representation of excel contains time creation
-                    # data that causes flaky CI failures
-                    result = pd.read_excel(f_str, **writer_kwargs)
-                    expected = pd.read_excel(f_path, **writer_kwargs)
-                    tm.assert_frame_equal(result, expected)
-                else:
-                    result = f_str.read()
-                    expected = f_path.read()
-                    assert result == expected
+        df = idx.to_frame(index=False, name=idx_name)
+        assert df.index is not idx
 
-    def test_write_fspath_hdf5(self):
-        # Same test as write_fspath_all, except HDF5 files aren't
-        # necessarily byte-for-byte identical for a given dataframe, so we'll
-        # have to read and compare equality
-        pytest.importorskip("tables")
+    def test_droplevel(self, index_flat):
+        # GH 21115
+        # MultiIndex is tested separately in test_multi.py
+        index = index_flat
 
-        df = pd.DataFrame({"A": [1, 2]})
-        p1 = tm.ensure_clean("string")
-        p2 = tm.ensure_clean("fspath")
+        assert index.droplevel([]).equals(index)
 
-        with p1 as string, p2 as fspath:
-            mypath = CustomFSPath(fspath)
-            df.to_hdf(mypath, key="bar")
-            df.to_hdf(string, key="bar")
+        for level in [index.name, [index.name]]:
+            if isinstance(index.name, tuple) and level is index.name:
+                # GH 21121 : droplevel with tuple name
+                continue
+            msg = (
+                "Cannot remove 1 levels from an index with 1 levels: at least one "
+                "level must be left."
+            )
+            with pytest.raises(ValueError, match=msg):
+                index.droplevel(level)
 
-            result = pd.read_hdf(fspath, key="bar")
-            expected = pd.read_hdf(string, key="bar")
+        for level in "wrong", ["wrong"]:
+            with pytest.raises(
+                KeyError,
+                match=r"'Requested level \(wrong\) does not match index name \(None\)'",
+            ):
+                index.droplevel(level)
 
-        tm.assert_frame_equal(result, expected)
+    def test_constructor_non_hashable_name(self, index_flat):
+        # GH 20527
+        index = index_flat
 
+        message = "Index.name must be a hashable type"
+        renamed = [["1"]]
 
-@pytest.fixture
-def mmap_file(datapath):
-    return datapath("io", "data", "csv", "test_mmap.csv")
+        # With .rename()
+        with pytest.raises(TypeError, match=message):
+            index.rename(name=renamed)
 
+        # With .set_names()
+        with pytest.raises(TypeError, match=message):
+            index.set_names(names=renamed)
 
-class TestMMapWrapper:
-    def test_constructor_bad_file(self, mmap_file):
-        non_file = StringIO("I am not a file")
-        non_file.fileno = lambda: -1
+    def test_constructor_unwraps_index(self, index_flat):
+        a = index_flat
+        # Passing dtype is necessary for Index([True, False], dtype=object)
+        #  case.
+        b = type(a)(a, dtype=a.dtype)
+        tm.assert_equal(a._data, b._data)
 
-        # the error raised is different on Windows
-        if is_platform_windows():
-            msg = "The parameter is incorrect"
-            err = OSError
-        else:
-            msg = "[Errno 22]"
-            err = mmap.error
+    def test_to_flat_index(self, index_flat):
+        # 22866
+        index = index_flat
 
-        with pytest.raises(err, match=msg):
-            icom._maybe_memory_map(non_file, True)
+        result = index.to_flat_index()
+        tm.assert_index_equal(result, index)
 
-        with open(mmap_file, encoding="utf-8") as target:
+    def test_set_name_methods(self, index_flat):
+        # MultiIndex tested separately
+        index = index_flat
+        new_name = "This is the new name for this index"
+
+        original_name = index.name
+        new_ind = index.set_names([new_name])
+        assert new_ind.name == new_name
+        assert index.name == original_name
+        res = index.rename(new_name, inplace=True)
+
+        # should return None
+        assert res is None
+        assert index.name == new_name
+        assert index.names == [new_name]
+        with pytest.raises(ValueError, match="Level must be None"):
+            index.set_names("a", level=0)
+
+        # rename in place just leaves tuples and other containers alone
+        name = ("A", "B")
+        index.rename(name, inplace=True)
+        assert index.name == name
+        assert index.names == [name]
+
+    @pytest.mark.xfail
+    def test_set_names_single_label_no_level(self, index_flat):
+        with pytest.raises(TypeError, match="list-like"):
+            # should still fail even if it would be the right length
+            index_flat.set_names("a")
+
+    def test_copy_and_deepcopy(self, index_flat):
+        index = index_flat
+
+        for func in (copy, deepcopy):
+            idx_copy = func(index)
+            assert idx_copy is not index
+            assert idx_copy.equals(index)
+
+        new_copy = index.copy(deep=True, name="banana")
+        assert new_copy.name == "banana"
+
+    @pytest.mark.filterwarnings(r"ignore:Dtype inference:FutureWarning")
+    def test_copy_name(self, index_flat):
+        # GH#12309: Check that the "name" argument
+        # passed at initialization is honored.
+        index = index_flat
+
+        first = type(index)(index, copy=True, name="mario")
+        second = type(first)(first, copy=False)
+
+        # Even though "copy=False", we want a new object.
+        assert first is not second
+        tm.assert_index_equal(first, second)
+
+        # Not using tm.assert_index_equal() since names differ.
+        assert index.equals(first)
+
+        assert first.name == "mario"
+        assert second.name == "mario"
+
+        # TODO: belongs in series arithmetic tests?
+        s1 = pd.Series(2, index=first)
+        s2 = pd.Series(3, index=second[:-1])
+        # See GH#13365
+        s3 = s1 * s2
+        assert s3.index.name == "mario"
+
+    def test_copy_name2(self, index_flat):
+        # GH#35592
+        index = index_flat
+
+        assert index.copy(name="mario").name == "mario"
+
+        with pytest.raises(ValueError, match="Length of new names must be 1, got 2"):
+            index.copy(name=["mario", "luigi"])
+
+        msg = f"{type(index).__name__}.name must be a hashable type"
+        with pytest.raises(TypeError, match=msg):
+            index.copy(name=[["mario"]])
+
+    def test_unique_level(self, index_flat):
+        # don't test a MultiIndex here (as its tested separated)
+        index = index_flat
+
+        # GH 17896
+        expected = index.drop_duplicates()
+        for level in [0, index.name, None]:
+            result = index.unique(level=level)
+            tm.assert_index_equal(result, expected)
+
+        msg = "Too many levels: Index has only 1 level, not 4"
+        with pytest.raises(IndexError, match=msg):
+            index.unique(level=3)
+
+        msg = (
+            rf"Requested level \(wrong\) does not match index name "
+            rf"\({re.escape(index.name.__repr__())}\)"
+        )
+        with pytest.raises(KeyError, match=msg):
+            index.unique(level="wrong")
+
+    def test_unique(self, index_flat):
+        # MultiIndex tested separately
+        index = index_flat
+        if not len(index):
+            pytest.skip("Skip check for empty Index and MultiIndex")
+
+        idx = index[[0] * 5]
+        idx_unique = index[[0]]
+
+        # We test against `idx_unique`, so first we make sure it's unique
+        # and doesn't contain nans.
+        assert idx_unique.is_unique is True
+        try:
+            assert idx_unique.hasnans is False
+        except NotImplementedError:
             pass
 
-        msg = "I/O operation on closed file"
-        with pytest.raises(ValueError, match=msg):
-            icom._maybe_memory_map(target, True)
+        result = idx.unique()
+        tm.assert_index_equal(result, idx_unique)
 
-    def test_next(self, mmap_file):
-        with open(mmap_file, encoding="utf-8") as target:
-            lines = target.readlines()
+        # nans:
+        if not index._can_hold_na:
+            pytest.skip("Skip na-check if index cannot hold na")
 
-            with icom.get_handle(
-                target, "r", is_text=True, memory_map=True
-            ) as wrappers:
-                wrapper = wrappers.handle
-                assert isinstance(wrapper.buffer.buffer, mmap.mmap)
+        vals = index._values[[0] * 5]
+        vals[0] = np.nan
 
-                for line in lines:
-                    next_line = next(wrapper)
-                    assert next_line.strip() == line.strip()
+        vals_unique = vals[:2]
+        idx_nan = index._shallow_copy(vals)
+        idx_unique_nan = index._shallow_copy(vals_unique)
+        assert idx_unique_nan.is_unique is True
 
-                with pytest.raises(StopIteration, match=r"^$"):
-                    next(wrapper)
+        assert idx_nan.dtype == index.dtype
+        assert idx_unique_nan.dtype == index.dtype
 
-    def test_unknown_engine(self):
-        with tm.ensure_clean() as path:
-            df = pd.DataFrame(
-                1.1 * np.arange(120).reshape((30, 4)),
-                columns=pd.Index(list("ABCD")),
-                index=pd.Index([f"i-{i}" for i in range(30)]),
+        expected = idx_unique_nan
+        for pos, i in enumerate([idx_nan, idx_unique_nan]):
+            result = i.unique()
+            tm.assert_index_equal(result, expected)
+
+    @pytest.mark.filterwarnings("ignore:Period with BDay freq:FutureWarning")
+    @pytest.mark.filterwarnings(r"ignore:PeriodDtype\[B\] is deprecated:FutureWarning")
+    def test_searchsorted_monotonic(self, index_flat, request):
+        # GH17271
+        index = index_flat
+        # not implemented for tuple searches in MultiIndex
+        # or Intervals searches in IntervalIndex
+        if isinstance(index, pd.IntervalIndex):
+            mark = pytest.mark.xfail(
+                reason="IntervalIndex.searchsorted does not support Interval arg",
+                raises=NotImplementedError,
             )
-            df.to_csv(path)
-            with pytest.raises(ValueError, match="Unknown engine"):
-                pd.read_csv(path, engine="pyt")
+            request.applymarker(mark)
 
-    def test_binary_mode(self):
-        """
-        'encoding' shouldn't be passed to 'open' in binary mode.
+        # nothing to test if the index is empty
+        if index.empty:
+            pytest.skip("Skip check for empty Index")
+        value = index[0]
 
-        GH 35058
-        """
-        with tm.ensure_clean() as path:
-            df = pd.DataFrame(
-                1.1 * np.arange(120).reshape((30, 4)),
-                columns=pd.Index(list("ABCD")),
-                index=pd.Index([f"i-{i}" for i in range(30)]),
-            )
-            df.to_csv(path, mode="w+b")
-            tm.assert_frame_equal(df, pd.read_csv(path, index_col=0))
+        # determine the expected results (handle dupes for 'right')
+        expected_left, expected_right = 0, (index == value).argmin()
+        if expected_right == 0:
+            # all values are the same, expected_right should be length
+            expected_right = len(index)
 
-    @pytest.mark.parametrize("encoding", ["utf-16", "utf-32"])
-    @pytest.mark.parametrize("compression_", ["bz2", "xz"])
-    def test_warning_missing_utf_bom(self, encoding, compression_):
-        """
-        bz2 and xz do not write the byte order mark (BOM) for utf-16/32.
+        # test _searchsorted_monotonic in all cases
+        # test searchsorted only for increasing
+        if index.is_monotonic_increasing:
+            ssm_left = index._searchsorted_monotonic(value, side="left")
+            assert expected_left == ssm_left
 
-        https://stackoverflow.com/questions/55171439
+            ssm_right = index._searchsorted_monotonic(value, side="right")
+            assert expected_right == ssm_right
 
-        GH 35681
-        """
-        df = pd.DataFrame(
-            1.1 * np.arange(120).reshape((30, 4)),
-            columns=pd.Index(list("ABCD")),
-            index=pd.Index([f"i-{i}" for i in range(30)]),
-        )
-        with tm.ensure_clean() as path:
-            with tm.assert_produces_warning(UnicodeWarning):
-                df.to_csv(path, compression=compression_, encoding=encoding)
+            ss_left = index.searchsorted(value, side="left")
+            assert expected_left == ss_left
 
-            # reading should fail (otherwise we wouldn't need the warning)
-            msg = (
-                r"UTF-\d+ stream does not start with BOM|"
-                r"'utf-\d+' codec can't decode byte"
-            )
-            with pytest.raises(UnicodeError, match=msg):
-                pd.read_csv(path, compression=compression_, encoding=encoding)
+            ss_right = index.searchsorted(value, side="right")
+            assert expected_right == ss_right
 
+        elif index.is_monotonic_decreasing:
+            ssm_left = index._searchsorted_monotonic(value, side="left")
+            assert expected_left == ssm_left
 
-def test_is_fsspec_url():
-    assert icom.is_fsspec_url("gcs://pandas/somethingelse.com")
-    assert icom.is_fsspec_url("gs://pandas/somethingelse.com")
-    # the following is the only remote URL that is handled without fsspec
-    assert not icom.is_fsspec_url("http://pandas/somethingelse.com")
-    assert not icom.is_fsspec_url("random:pandas/somethingelse.com")
-    assert not icom.is_fsspec_url("/local/path")
-    assert not icom.is_fsspec_url("relative/local/path")
-    # fsspec URL in string should not be recognized
-    assert not icom.is_fsspec_url("this is not fsspec://url")
-    assert not icom.is_fsspec_url("{'url': 'gs://pandas/somethingelse.com'}")
-    # accept everything that conforms to RFC 3986 schema
-    assert icom.is_fsspec_url("RFC-3986+compliant.spec://something")
-
-
-@pytest.mark.parametrize("format", ["csv", "json"])
-def test_codecs_encoding(format):
-    # GH39247
-    expected = pd.DataFrame(
-        1.1 * np.arange(120).reshape((30, 4)),
-        columns=pd.Index(list("ABCD")),
-        index=pd.Index([f"i-{i}" for i in range(30)]),
-    )
-    with tm.ensure_clean() as path:
-        with open(path, mode="w", encoding="utf-8") as handle:
-            getattr(expected, f"to_{format}")(handle)
-        with open(path, encoding="utf-8") as handle:
-            if format == "csv":
-                df = pd.read_csv(handle, index_col=0)
-            else:
-                df = pd.read_json(handle)
-    tm.assert_frame_equal(expected, df)
-
-
-def test_codecs_get_writer_reader():
-    # GH39247
-    expected = pd.DataFrame(
-        1.1 * np.arange(120).reshape((30, 4)),
-        columns=pd.Index(list("ABCD")),
-        index=pd.Index([f"i-{i}" for i in range(30)]),
-    )
-    with tm.ensure_clean() as path:
-        with open(path, "wb") as handle:
-            with codecs.getwriter("utf-8")(handle) as encoded:
-                expected.to_csv(encoded)
-        with open(path, "rb") as handle:
-            with codecs.getreader("utf-8")(handle) as encoded:
-                df = pd.read_csv(encoded, index_col=0)
-    tm.assert_frame_equal(expected, df)
-
-
-@pytest.mark.parametrize(
-    "io_class,mode,msg",
-    [
-        (BytesIO, "t", "a bytes-like object is required, not 'str'"),
-        (StringIO, "b", "string argument expected, got 'bytes'"),
-    ],
-)
-def test_explicit_encoding(io_class, mode, msg):
-    # GH39247; this test makes sure that if a user provides mode="*t" or "*b",
-    # it is used. In the case of this test it leads to an error as intentionally the
-    # wrong mode is requested
-    expected = pd.DataFrame(
-        1.1 * np.arange(120).reshape((30, 4)),
-        columns=pd.Index(list("ABCD")),
-        index=pd.Index([f"i-{i}" for i in range(30)]),
-    )
-    with io_class() as buffer:
-        with pytest.raises(TypeError, match=msg):
-            expected.to_csv(buffer, mode=f"w{mode}")
-
-
-@pytest.mark.parametrize("encoding_errors", [None, "strict", "replace"])
-@pytest.mark.parametrize("format", ["csv", "json"])
-def test_encoding_errors(encoding_errors, format):
-    # GH39450
-    msg = "'utf-8' codec can't decode byte"
-    bad_encoding = b"\xe4"
-
-    if format == "csv":
-        content = b"," + bad_encoding + b"\n" + bad_encoding * 2 + b"," + bad_encoding
-        reader = partial(pd.read_csv, index_col=0)
-    else:
-        content = (
-            b'{"'
-            + bad_encoding * 2
-            + b'": {"'
-            + bad_encoding
-            + b'":"'
-            + bad_encoding
-            + b'"}}'
-        )
-        reader = partial(pd.read_json, orient="index")
-    with tm.ensure_clean() as path:
-        file = Path(path)
-        file.write_bytes(content)
-
-        if encoding_errors != "replace":
-            with pytest.raises(UnicodeDecodeError, match=msg):
-                reader(path, encoding_errors=encoding_errors)
+            ssm_right = index._searchsorted_monotonic(value, side="right")
+            assert expected_right == ssm_right
         else:
-            df = reader(path, encoding_errors=encoding_errors)
-            decoded = bad_encoding.decode(errors=encoding_errors)
-            expected = pd.DataFrame({decoded: [decoded]}, index=[decoded * 2])
-            tm.assert_frame_equal(df, expected)
+            # non-monotonic should raise.
+            msg = "index must be monotonic increasing or decreasing"
+            with pytest.raises(ValueError, match=msg):
+                index._searchsorted_monotonic(value, side="left")
+
+    @pytest.mark.filterwarnings(r"ignore:PeriodDtype\[B\] is deprecated:FutureWarning")
+    def test_drop_duplicates(self, index_flat, keep):
+        # MultiIndex is tested separately
+        index = index_flat
+        if isinstance(index, RangeIndex):
+            pytest.skip(
+                "RangeIndex is tested in test_drop_duplicates_no_duplicates "
+                "as it cannot hold duplicates"
+            )
+        if len(index) == 0:
+            pytest.skip(
+                "empty index is tested in test_drop_duplicates_no_duplicates "
+                "as it cannot hold duplicates"
+            )
+
+        # make unique index
+        holder = type(index)
+        unique_values = list(set(index))
+        dtype = index.dtype if is_numeric_dtype(index) else None
+        unique_idx = holder(unique_values, dtype=dtype)
+
+        # make duplicated index
+        n = len(unique_idx)
+        duplicated_selection = np.random.default_rng(2).choice(n, int(n * 1.5))
+        idx = holder(unique_idx.values[duplicated_selection])
+
+        # Series.duplicated is tested separately
+        expected_duplicated = (
+            pd.Series(duplicated_selection).duplicated(keep=keep).values
+        )
+        tm.assert_numpy_array_equal(idx.duplicated(keep=keep), expected_duplicated)
+
+        # Series.drop_duplicates is tested separately
+        expected_dropped = holder(pd.Series(idx).drop_duplicates(keep=keep))
+        tm.assert_index_equal(idx.drop_duplicates(keep=keep), expected_dropped)
+
+    @pytest.mark.filterwarnings(r"ignore:PeriodDtype\[B\] is deprecated:FutureWarning")
+    def test_drop_duplicates_no_duplicates(self, index_flat):
+        # MultiIndex is tested separately
+        index = index_flat
+
+        # make unique index
+        if isinstance(index, RangeIndex):
+            # RangeIndex cannot have duplicates
+            unique_idx = index
+        else:
+            holder = type(index)
+            unique_values = list(set(index))
+            dtype = index.dtype if is_numeric_dtype(index) else None
+            unique_idx = holder(unique_values, dtype=dtype)
+
+        # check on unique index
+        expected_duplicated = np.array([False] * len(unique_idx), dtype="bool")
+        tm.assert_numpy_array_equal(unique_idx.duplicated(), expected_duplicated)
+        result_dropped = unique_idx.drop_duplicates()
+        tm.assert_index_equal(result_dropped, unique_idx)
+        # validate shallow copy
+        assert result_dropped is not unique_idx
+
+    def test_drop_duplicates_inplace(self, index):
+        msg = r"drop_duplicates\(\) got an unexpected keyword argument"
+        with pytest.raises(TypeError, match=msg):
+            index.drop_duplicates(inplace=True)
+
+    @pytest.mark.filterwarnings(r"ignore:PeriodDtype\[B\] is deprecated:FutureWarning")
+    def test_has_duplicates(self, index_flat):
+        # MultiIndex tested separately in:
+        #   tests/indexes/multi/test_unique_and_duplicates.
+        index = index_flat
+        holder = type(index)
+        if not len(index) or isinstance(index, RangeIndex):
+            # MultiIndex tested separately in:
+            #   tests/indexes/multi/test_unique_and_duplicates.
+            # RangeIndex is unique by definition.
+            pytest.skip("Skip check for empty Index, MultiIndex, and RangeIndex")
+
+        idx = holder([index[0]] * 5)
+        assert idx.is_unique is False
+        assert idx.has_duplicates is True
+
+    @pytest.mark.parametrize(
+        "dtype",
+        ["int64", "uint64", "float64", "category", "datetime64[ns]", "timedelta64[ns]"],
+    )
+    def test_astype_preserves_name(self, index, dtype):
+        # https://github.com/pandas-dev/pandas/issues/32013
+        if isinstance(index, MultiIndex):
+            index.names = ["idx" + str(i) for i in range(index.nlevels)]
+        else:
+            index.name = "idx"
+
+        warn = None
+        if index.dtype.kind == "c" and dtype in ["float64", "int64", "uint64"]:
+            # imaginary components discarded
+            if np_version_gte1p25:
+                warn = np.exceptions.ComplexWarning
+            else:
+                warn = np.ComplexWarning
+
+        is_pyarrow_str = str(index.dtype) == "string[pyarrow]" and dtype == "category"
+        try:
+            # Some of these conversions cannot succeed so we use a try / except
+            with tm.assert_produces_warning(
+                warn,
+                raise_on_extra_warnings=is_pyarrow_str,
+                check_stacklevel=False,
+            ):
+                result = index.astype(dtype)
+        except (ValueError, TypeError, NotImplementedError, SystemError):
+            return
+
+        if isinstance(index, MultiIndex):
+            assert result.names == index.names
+        else:
+            assert result.name == index.name
+
+    def test_hasnans_isnans(self, index_flat):
+        # GH#11343, added tests for hasnans / isnans
+        index = index_flat
+
+        # cases in indices doesn't include NaN
+        idx = index.copy(deep=True)
+        expected = np.array([False] * len(idx), dtype=bool)
+        tm.assert_numpy_array_equal(idx._isnan, expected)
+        assert idx.hasnans is False
+
+        idx = index.copy(deep=True)
+        values = idx._values
+
+        if len(index) == 0:
+            return
+        elif is_integer_dtype(index.dtype):
+            return
+        elif index.dtype == bool:
+            # values[1] = np.nan below casts to True!
+            return
+
+        values[1] = np.nan
+
+        idx = type(index)(values)
+
+        expected = np.array([False] * len(idx), dtype=bool)
+        expected[1] = True
+        tm.assert_numpy_array_equal(idx._isnan, expected)
+        assert idx.hasnans is True
 
 
-def test_bad_encdoing_errors():
-    # GH 39777
-    with tm.ensure_clean() as path:
-        with pytest.raises(LookupError, match="unknown error handler name"):
-            icom.get_handle(path, "w", errors="bad")
+@pytest.mark.filterwarnings(r"ignore:PeriodDtype\[B\] is deprecated:FutureWarning")
+@pytest.mark.parametrize("na_position", [None, "middle"])
+def test_sort_values_invalid_na_position(index_with_missing, na_position):
+    with pytest.raises(ValueError, match=f"invalid na_position: {na_position}"):
+        index_with_missing.sort_values(na_position=na_position)
 
 
-def test_errno_attribute():
-    # GH 13872
-    with pytest.raises(FileNotFoundError, match="\\[Errno 2\\]") as err:
-        pd.read_csv("doesnt_exist")
-        assert err.errno == errno.ENOENT
+@pytest.mark.fails_arm_wheels
+@pytest.mark.filterwarnings(r"ignore:PeriodDtype\[B\] is deprecated:FutureWarning")
+@pytest.mark.parametrize("na_position", ["first", "last"])
+def test_sort_values_with_missing(index_with_missing, na_position, request):
+    # GH 35584. Test that sort_values works with missing values,
+    # sort non-missing and place missing according to na_position
+
+    if isinstance(index_with_missing, CategoricalIndex):
+        request.applymarker(
+            pytest.mark.xfail(
+                reason="missing value sorting order not well-defined", strict=False
+            )
+        )
+
+    missing_count = np.sum(index_with_missing.isna())
+    not_na_vals = index_with_missing[index_with_missing.notna()].values
+    sorted_values = np.sort(not_na_vals)
+    if na_position == "first":
+        sorted_values = np.concatenate([[None] * missing_count, sorted_values])
+    else:
+        sorted_values = np.concatenate([sorted_values, [None] * missing_count])
+
+    # Explicitly pass dtype needed for Index backed by EA e.g. IntegerArray
+    expected = type(index_with_missing)(sorted_values, dtype=index_with_missing.dtype)
+
+    result = index_with_missing.sort_values(na_position=na_position)
+    tm.assert_index_equal(result, expected)
 
 
-def test_fail_mmap():
-    with pytest.raises(UnsupportedOperation, match="fileno"):
-        with BytesIO() as buffer:
-            icom.get_handle(buffer, "rb", memory_map=True)
+def test_ndarray_compat_properties(index):
+    if isinstance(index, PeriodIndex) and not IS64:
+        pytest.skip("Overflow")
+    idx = index
+    assert idx.T.equals(idx)
+    assert idx.transpose().equals(idx)
+
+    values = idx.values
+
+    assert idx.shape == values.shape
+    assert idx.ndim == values.ndim
+    assert idx.size == values.size
+
+    if not isinstance(index, (RangeIndex, MultiIndex)):
+        # These two are not backed by an ndarray
+        assert idx.nbytes == values.nbytes
+
+    # test for validity
+    idx.nbytes
+    idx.values.nbytes
 
 
-def test_close_on_error():
-    # GH 47136
-    class TestError:
-        def close(self):
-            raise OSError("test")
-
-    with pytest.raises(OSError, match="test"):
-        with BytesIO() as buffer:
-            with icom.get_handle(buffer, "rb") as handles:
-                handles.created_handles.append(TestError())
-
-
-@pytest.mark.parametrize(
-    "reader",
-    [
-        pd.read_csv,
-        pd.read_fwf,
-        pd.read_excel,
-        pd.read_feather,
-        pd.read_hdf,
-        pd.read_stata,
-        pd.read_sas,
-        pd.read_json,
-        pd.read_pickle,
-    ],
-)
-def test_pickle_reader(reader):
-    # GH 22265
-    with BytesIO() as buffer:
-        pickle.dump(reader, buffer)
+def test_compare_read_only_array():
+    # GH#57130
+    arr = np.array([], dtype=object)
+    arr.flags.writeable = False
+    idx = pd.Index(arr)
+    result = idx > 69
+    assert result.dtype == bool

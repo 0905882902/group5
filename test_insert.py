@@ -1,120 +1,265 @@
-"""
-test_insert is specifically for the DataFrame.insert method; not to be
-confused with tests with "insert" in their names that are really testing
-__setitem__.
-"""
+from datetime import datetime
+
 import numpy as np
 import pytest
-
-from pandas.errors import PerformanceWarning
+import pytz
 
 from pandas import (
-    DataFrame,
+    NA,
+    DatetimeIndex,
     Index,
+    NaT,
+    Timestamp,
+    date_range,
 )
 import pandas._testing as tm
 
 
-class TestDataFrameInsert:
-    def test_insert(self):
-        df = DataFrame(
-            np.random.default_rng(2).standard_normal((5, 3)),
-            index=np.arange(5),
-            columns=["c", "b", "a"],
+class TestInsert:
+    @pytest.mark.parametrize("null", [None, np.nan, np.datetime64("NaT"), NaT, NA])
+    @pytest.mark.parametrize("tz", [None, "UTC", "US/Eastern"])
+    def test_insert_nat(self, tz, null):
+        # GH#16537, GH#18295 (test missing)
+
+        idx = DatetimeIndex(["2017-01-01"], tz=tz)
+        expected = DatetimeIndex(["NaT", "2017-01-01"], tz=tz)
+        if tz is not None and isinstance(null, np.datetime64):
+            expected = Index([null, idx[0]], dtype=object)
+
+        res = idx.insert(0, null)
+        tm.assert_index_equal(res, expected)
+
+    @pytest.mark.parametrize("tz", [None, "UTC", "US/Eastern"])
+    def test_insert_invalid_na(self, tz):
+        idx = DatetimeIndex(["2017-01-01"], tz=tz)
+
+        item = np.timedelta64("NaT")
+        result = idx.insert(0, item)
+        expected = Index([item] + list(idx), dtype=object)
+        tm.assert_index_equal(result, expected)
+
+    def test_insert_empty_preserves_freq(self, tz_naive_fixture):
+        # GH#33573
+        tz = tz_naive_fixture
+        dti = DatetimeIndex([], tz=tz, freq="D")
+        item = Timestamp("2017-04-05").tz_localize(tz)
+
+        result = dti.insert(0, item)
+        assert result.freq == dti.freq
+
+        # But not when we insert an item that doesn't conform to freq
+        dti = DatetimeIndex([], tz=tz, freq="W-THU")
+        result = dti.insert(0, item)
+        assert result.freq is None
+
+    def test_insert(self, unit):
+        idx = DatetimeIndex(
+            ["2000-01-04", "2000-01-01", "2000-01-02"], name="idx"
+        ).as_unit(unit)
+
+        result = idx.insert(2, datetime(2000, 1, 5))
+        exp = DatetimeIndex(
+            ["2000-01-04", "2000-01-01", "2000-01-05", "2000-01-02"], name="idx"
+        ).as_unit(unit)
+        tm.assert_index_equal(result, exp)
+
+        # insertion of non-datetime should coerce to object index
+        result = idx.insert(1, "inserted")
+        expected = Index(
+            [
+                datetime(2000, 1, 4),
+                "inserted",
+                datetime(2000, 1, 1),
+                datetime(2000, 1, 2),
+            ],
+            name="idx",
         )
+        assert not isinstance(result, DatetimeIndex)
+        tm.assert_index_equal(result, expected)
+        assert result.name == expected.name
 
-        df.insert(0, "foo", df["a"])
-        tm.assert_index_equal(df.columns, Index(["foo", "c", "b", "a"]))
-        tm.assert_series_equal(df["a"], df["foo"], check_names=False)
+    def test_insert2(self, unit):
+        idx = date_range("1/1/2000", periods=3, freq="ME", name="idx", unit=unit)
 
-        df.insert(2, "bar", df["c"])
-        tm.assert_index_equal(df.columns, Index(["foo", "c", "bar", "b", "a"]))
-        tm.assert_almost_equal(df["c"], df["bar"], check_names=False)
+        # preserve freq
+        expected_0 = DatetimeIndex(
+            ["1999-12-31", "2000-01-31", "2000-02-29", "2000-03-31"],
+            name="idx",
+            freq="ME",
+        ).as_unit(unit)
+        expected_3 = DatetimeIndex(
+            ["2000-01-31", "2000-02-29", "2000-03-31", "2000-04-30"],
+            name="idx",
+            freq="ME",
+        ).as_unit(unit)
 
-        with pytest.raises(ValueError, match="already exists"):
-            df.insert(1, "a", df["b"])
+        # reset freq to None
+        expected_1_nofreq = DatetimeIndex(
+            ["2000-01-31", "2000-01-31", "2000-02-29", "2000-03-31"],
+            name="idx",
+            freq=None,
+        ).as_unit(unit)
+        expected_3_nofreq = DatetimeIndex(
+            ["2000-01-31", "2000-02-29", "2000-03-31", "2000-01-02"],
+            name="idx",
+            freq=None,
+        ).as_unit(unit)
 
-        msg = "cannot insert c, already exists"
-        with pytest.raises(ValueError, match=msg):
-            df.insert(1, "c", df["b"])
+        cases = [
+            (0, datetime(1999, 12, 31), expected_0),
+            (-3, datetime(1999, 12, 31), expected_0),
+            (3, datetime(2000, 4, 30), expected_3),
+            (1, datetime(2000, 1, 31), expected_1_nofreq),
+            (3, datetime(2000, 1, 2), expected_3_nofreq),
+        ]
 
-        df.columns.name = "some_name"
-        # preserve columns name field
-        df.insert(0, "baz", df["c"])
-        assert df.columns.name == "some_name"
+        for n, d, expected in cases:
+            result = idx.insert(n, d)
+            tm.assert_index_equal(result, expected)
+            assert result.name == expected.name
+            assert result.freq == expected.freq
 
-    def test_insert_column_bug_4032(self):
-        # GH#4032, inserting a column and renaming causing errors
-        df = DataFrame({"b": [1.1, 2.2]})
+    def test_insert3(self, unit):
+        idx = date_range("1/1/2000", periods=3, freq="ME", name="idx", unit=unit)
 
-        df = df.rename(columns={})
-        df.insert(0, "a", [1, 2])
-        result = df.rename(columns={})
+        # reset freq to None
+        result = idx.insert(3, datetime(2000, 1, 2))
+        expected = DatetimeIndex(
+            ["2000-01-31", "2000-02-29", "2000-03-31", "2000-01-02"],
+            name="idx",
+            freq=None,
+        ).as_unit(unit)
+        tm.assert_index_equal(result, expected)
+        assert result.name == expected.name
+        assert result.freq is None
 
-        expected = DataFrame([[1, 1.1], [2, 2.2]], columns=["a", "b"])
-        tm.assert_frame_equal(result, expected)
+    def test_insert4(self, unit):
+        for tz in ["US/Pacific", "Asia/Singapore"]:
+            idx = date_range(
+                "1/1/2000 09:00", periods=6, freq="h", tz=tz, name="idx", unit=unit
+            )
+            # preserve freq
+            expected = date_range(
+                "1/1/2000 09:00", periods=7, freq="h", tz=tz, name="idx", unit=unit
+            )
+            for d in [
+                Timestamp("2000-01-01 15:00", tz=tz),
+                pytz.timezone(tz).localize(datetime(2000, 1, 1, 15)),
+            ]:
+                result = idx.insert(6, d)
+                tm.assert_index_equal(result, expected)
+                assert result.name == expected.name
+                assert result.freq == expected.freq
+                assert result.tz == expected.tz
 
-        df.insert(0, "c", [1.3, 2.3])
-        result = df.rename(columns={})
+            expected = DatetimeIndex(
+                [
+                    "2000-01-01 09:00",
+                    "2000-01-01 10:00",
+                    "2000-01-01 11:00",
+                    "2000-01-01 12:00",
+                    "2000-01-01 13:00",
+                    "2000-01-01 14:00",
+                    "2000-01-01 10:00",
+                ],
+                name="idx",
+                tz=tz,
+                freq=None,
+            ).as_unit(unit)
+            # reset freq to None
+            for d in [
+                Timestamp("2000-01-01 10:00", tz=tz),
+                pytz.timezone(tz).localize(datetime(2000, 1, 1, 10)),
+            ]:
+                result = idx.insert(6, d)
+                tm.assert_index_equal(result, expected)
+                assert result.name == expected.name
+                assert result.tz == expected.tz
+                assert result.freq is None
 
-        expected = DataFrame([[1.3, 1, 1.1], [2.3, 2, 2.2]], columns=["c", "a", "b"])
-        tm.assert_frame_equal(result, expected)
+    # TODO: also changes DataFrame.__setitem__ with expansion
+    def test_insert_mismatched_tzawareness(self):
+        # see GH#7299
+        idx = date_range("1/1/2000", periods=3, freq="D", tz="Asia/Tokyo", name="idx")
 
-    def test_insert_with_columns_dups(self):
-        # GH#14291
-        df = DataFrame()
-        df.insert(0, "A", ["g", "h", "i"], allow_duplicates=True)
-        df.insert(0, "A", ["d", "e", "f"], allow_duplicates=True)
-        df.insert(0, "A", ["a", "b", "c"], allow_duplicates=True)
-        exp = DataFrame(
-            [["a", "d", "g"], ["b", "e", "h"], ["c", "f", "i"]], columns=["A", "A", "A"]
+        # mismatched tz-awareness
+        item = Timestamp("2000-01-04")
+        result = idx.insert(3, item)
+        expected = Index(
+            list(idx[:3]) + [item] + list(idx[3:]), dtype=object, name="idx"
         )
-        tm.assert_frame_equal(df, exp)
+        tm.assert_index_equal(result, expected)
 
-    def test_insert_item_cache(self, using_array_manager, using_copy_on_write):
-        df = DataFrame(np.random.default_rng(2).standard_normal((4, 3)))
-        ser = df[0]
+        # mismatched tz-awareness
+        item = datetime(2000, 1, 4)
+        result = idx.insert(3, item)
+        expected = Index(
+            list(idx[:3]) + [item] + list(idx[3:]), dtype=object, name="idx"
+        )
+        tm.assert_index_equal(result, expected)
 
-        if using_array_manager:
-            expected_warning = None
+    # TODO: also changes DataFrame.__setitem__ with expansion
+    def test_insert_mismatched_tz(self):
+        # see GH#7299
+        # pre-2.0 with mismatched tzs we would cast to object
+        idx = date_range("1/1/2000", periods=3, freq="D", tz="Asia/Tokyo", name="idx")
+
+        # mismatched tz -> cast to object (could reasonably cast to same tz or UTC)
+        item = Timestamp("2000-01-04", tz="US/Eastern")
+        result = idx.insert(3, item)
+        expected = Index(
+            list(idx[:3]) + [item.tz_convert(idx.tz)] + list(idx[3:]),
+            name="idx",
+        )
+        assert expected.dtype == idx.dtype
+        tm.assert_index_equal(result, expected)
+
+        item = datetime(2000, 1, 4, tzinfo=pytz.timezone("US/Eastern"))
+        result = idx.insert(3, item)
+        expected = Index(
+            list(idx[:3]) + [item.astimezone(idx.tzinfo)] + list(idx[3:]),
+            name="idx",
+        )
+        assert expected.dtype == idx.dtype
+        tm.assert_index_equal(result, expected)
+
+    @pytest.mark.parametrize(
+        "item", [0, np.int64(0), np.float64(0), np.array(0), np.timedelta64(456)]
+    )
+    def test_insert_mismatched_types_raises(self, tz_aware_fixture, item):
+        # GH#33703 dont cast these to dt64
+        tz = tz_aware_fixture
+        dti = date_range("2019-11-04", periods=9, freq="-1D", name=9, tz=tz)
+
+        result = dti.insert(1, item)
+
+        if isinstance(item, np.ndarray):
+            assert item.item() == 0
+            expected = Index([dti[0], 0] + list(dti[1:]), dtype=object, name=9)
         else:
-            # with BlockManager warn about high fragmentation of single dtype
-            expected_warning = PerformanceWarning
+            expected = Index([dti[0], item] + list(dti[1:]), dtype=object, name=9)
 
-        with tm.assert_produces_warning(expected_warning):
-            for n in range(100):
-                df[n + 3] = df[1] * n
+        tm.assert_index_equal(result, expected)
 
-        if using_copy_on_write:
-            ser.iloc[0] = 99
-            assert df.iloc[0, 0] == df[0][0]
-            assert df.iloc[0, 0] != 99
-        else:
-            ser.values[0] = 99
-            assert df.iloc[0, 0] == df[0][0]
-            assert df.iloc[0, 0] == 99
+    def test_insert_castable_str(self, tz_aware_fixture):
+        # GH#33703
+        tz = tz_aware_fixture
+        dti = date_range("2019-11-04", periods=3, freq="-1D", name=9, tz=tz)
 
-    def test_insert_EA_no_warning(self):
-        # PerformanceWarning about fragmented frame should not be raised when
-        # using EAs (https://github.com/pandas-dev/pandas/issues/44098)
-        df = DataFrame(
-            np.random.default_rng(2).integers(0, 100, size=(3, 100)), dtype="Int64"
-        )
-        with tm.assert_produces_warning(None):
-            df["a"] = np.array([1, 2, 3])
+        value = "2019-11-05"
+        result = dti.insert(0, value)
 
-    def test_insert_frame(self):
-        # GH#42403
-        df = DataFrame({"col1": [1, 2], "col2": [3, 4]})
+        ts = Timestamp(value).tz_localize(tz)
+        expected = DatetimeIndex([ts] + list(dti), dtype=dti.dtype, name=9)
+        tm.assert_index_equal(result, expected)
 
-        msg = (
-            "Expected a one-dimensional object, got a DataFrame with 2 columns instead."
-        )
-        with pytest.raises(ValueError, match=msg):
-            df.insert(1, "newcol", df)
+    def test_insert_non_castable_str(self, tz_aware_fixture):
+        # GH#33703
+        tz = tz_aware_fixture
+        dti = date_range("2019-11-04", periods=3, freq="-1D", name=9, tz=tz)
 
-    def test_insert_int64_loc(self):
-        # GH#53193
-        df = DataFrame({"a": [1, 2]})
-        df.insert(np.int64(0), "b", 0)
-        tm.assert_frame_equal(df, DataFrame({"b": [0, 0], "a": [1, 2]}))
+        value = "foo"
+        result = dti.insert(0, value)
+
+        expected = Index(["foo"] + list(dti), dtype=object, name=9)
+        tm.assert_index_equal(result, expected)

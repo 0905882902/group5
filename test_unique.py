@@ -1,76 +1,77 @@
-import numpy as np
+from datetime import (
+    datetime,
+    timedelta,
+)
 
 from pandas import (
-    Categorical,
-    IntervalIndex,
-    Series,
-    date_range,
+    DatetimeIndex,
+    NaT,
+    Timestamp,
 )
 import pandas._testing as tm
 
 
-class TestUnique:
-    def test_unique_uint64(self):
-        ser = Series([1, 2, 2**63, 2**63], dtype=np.uint64)
-        res = ser.unique()
-        exp = np.array([1, 2, 2**63], dtype=np.uint64)
-        tm.assert_numpy_array_equal(res, exp)
+def test_unique(tz_naive_fixture):
+    idx = DatetimeIndex(["2017"] * 2, tz=tz_naive_fixture)
+    expected = idx[:1]
 
-    def test_unique_data_ownership(self):
-        # it works! GH#1807
-        Series(Series(["a", "c", "b"]).unique()).sort_values()
+    result = idx.unique()
+    tm.assert_index_equal(result, expected)
+    # GH#21737
+    # Ensure the underlying data is consistent
+    assert result[0] == expected[0]
 
-    def test_unique(self):
-        # GH#714 also, dtype=float
-        ser = Series([1.2345] * 100)
-        ser[::2] = np.nan
-        result = ser.unique()
-        assert len(result) == 2
 
-        # explicit f4 dtype
-        ser = Series([1.2345] * 100, dtype="f4")
-        ser[::2] = np.nan
-        result = ser.unique()
-        assert len(result) == 2
+def test_index_unique(rand_series_with_duplicate_datetimeindex):
+    dups = rand_series_with_duplicate_datetimeindex
+    index = dups.index
 
-    def test_unique_nan_object_dtype(self):
-        # NAs in object arrays GH#714
-        ser = Series(["foo"] * 100, dtype="O")
-        ser[::2] = np.nan
-        result = ser.unique()
-        assert len(result) == 2
+    uniques = index.unique()
+    expected = DatetimeIndex(
+        [
+            datetime(2000, 1, 2),
+            datetime(2000, 1, 3),
+            datetime(2000, 1, 4),
+            datetime(2000, 1, 5),
+        ],
+        dtype=index.dtype,
+    )
+    assert uniques.dtype == index.dtype  # sanity
+    tm.assert_index_equal(uniques, expected)
+    assert index.nunique() == 4
 
-    def test_unique_none(self):
-        # decision about None
-        ser = Series([1, 2, 3, None, None, None], dtype=object)
-        result = ser.unique()
-        expected = np.array([1, 2, 3, None], dtype=object)
-        tm.assert_numpy_array_equal(result, expected)
+    # GH#2563
+    assert isinstance(uniques, DatetimeIndex)
 
-    def test_unique_categorical(self):
-        # GH#18051
-        cat = Categorical([])
-        ser = Series(cat)
-        result = ser.unique()
-        tm.assert_categorical_equal(result, cat)
+    dups_local = index.tz_localize("US/Eastern")
+    dups_local.name = "foo"
+    result = dups_local.unique()
+    expected = DatetimeIndex(expected, name="foo")
+    expected = expected.tz_localize("US/Eastern")
+    assert result.tz is not None
+    assert result.name == "foo"
+    tm.assert_index_equal(result, expected)
 
-        cat = Categorical([np.nan])
-        ser = Series(cat)
-        result = ser.unique()
-        tm.assert_categorical_equal(result, cat)
 
-    def test_tz_unique(self):
-        # GH 46128
-        dti1 = date_range("2016-01-01", periods=3)
-        ii1 = IntervalIndex.from_breaks(dti1)
-        ser1 = Series(ii1)
-        uni1 = ser1.unique()
-        tm.assert_interval_array_equal(ser1.array, uni1)
+def test_index_unique2():
+    # NaT, note this is excluded
+    arr = [1370745748 + t for t in range(20)] + [NaT._value]
+    idx = DatetimeIndex(arr * 3)
+    tm.assert_index_equal(idx.unique(), DatetimeIndex(arr))
+    assert idx.nunique() == 20
+    assert idx.nunique(dropna=False) == 21
 
-        dti2 = date_range("2016-01-01", periods=3, tz="US/Eastern")
-        ii2 = IntervalIndex.from_breaks(dti2)
-        ser2 = Series(ii2)
-        uni2 = ser2.unique()
-        tm.assert_interval_array_equal(ser2.array, uni2)
 
-        assert uni1.dtype != uni2.dtype
+def test_index_unique3():
+    arr = [
+        Timestamp("2013-06-09 02:42:28") + timedelta(seconds=t) for t in range(20)
+    ] + [NaT]
+    idx = DatetimeIndex(arr * 3)
+    tm.assert_index_equal(idx.unique(), DatetimeIndex(arr))
+    assert idx.nunique() == 20
+    assert idx.nunique(dropna=False) == 21
+
+
+def test_is_unique_monotonic(rand_series_with_duplicate_datetimeindex):
+    index = rand_series_with_duplicate_datetimeindex.index
+    assert not index.is_unique

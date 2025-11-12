@@ -2,39 +2,82 @@ import numpy as np
 import pytest
 
 from pandas import (
-    MultiIndex,
-    Series,
+    DatetimeIndex,
+    Timestamp,
+    date_range,
 )
 import pandas._testing as tm
 
 
 class TestRepeat:
-    def test_repeat(self):
-        ser = Series(np.random.default_rng(2).standard_normal(3), index=["a", "b", "c"])
+    def test_repeat_range(self, tz_naive_fixture):
+        rng = date_range("1/1/2000", "1/1/2001")
 
-        reps = ser.repeat(5)
-        exp = Series(ser.values.repeat(5), index=ser.index.values.repeat(5))
-        tm.assert_series_equal(reps, exp)
+        result = rng.repeat(5)
+        assert result.freq is None
+        assert len(result) == 5 * len(rng)
 
-        to_rep = [2, 3, 4]
-        reps = ser.repeat(to_rep)
-        exp = Series(ser.values.repeat(to_rep), index=ser.index.values.repeat(to_rep))
-        tm.assert_series_equal(reps, exp)
+    def test_repeat_range2(self, tz_naive_fixture, unit):
+        tz = tz_naive_fixture
+        index = date_range("2001-01-01", periods=2, freq="D", tz=tz, unit=unit)
+        exp = DatetimeIndex(
+            ["2001-01-01", "2001-01-01", "2001-01-02", "2001-01-02"], tz=tz
+        ).as_unit(unit)
+        for res in [index.repeat(2), np.repeat(index, 2)]:
+            tm.assert_index_equal(res, exp)
+            assert res.freq is None
 
-    def test_numpy_repeat(self):
-        ser = Series(np.arange(3), name="x")
-        expected = Series(
-            ser.values.repeat(2), name="x", index=ser.index.values.repeat(2)
-        )
-        tm.assert_series_equal(np.repeat(ser, 2), expected)
+    def test_repeat_range3(self, tz_naive_fixture, unit):
+        tz = tz_naive_fixture
+        index = date_range("2001-01-01", periods=2, freq="2D", tz=tz, unit=unit)
+        exp = DatetimeIndex(
+            ["2001-01-01", "2001-01-01", "2001-01-03", "2001-01-03"], tz=tz
+        ).as_unit(unit)
+        for res in [index.repeat(2), np.repeat(index, 2)]:
+            tm.assert_index_equal(res, exp)
+            assert res.freq is None
 
+    def test_repeat_range4(self, tz_naive_fixture, unit):
+        tz = tz_naive_fixture
+        index = DatetimeIndex(["2001-01-01", "NaT", "2003-01-01"], tz=tz).as_unit(unit)
+        exp = DatetimeIndex(
+            [
+                "2001-01-01",
+                "2001-01-01",
+                "2001-01-01",
+                "NaT",
+                "NaT",
+                "NaT",
+                "2003-01-01",
+                "2003-01-01",
+                "2003-01-01",
+            ],
+            tz=tz,
+        ).as_unit(unit)
+        for res in [index.repeat(3), np.repeat(index, 3)]:
+            tm.assert_index_equal(res, exp)
+            assert res.freq is None
+
+    def test_repeat(self, tz_naive_fixture, unit):
+        tz = tz_naive_fixture
+        reps = 2
         msg = "the 'axis' parameter is not supported"
-        with pytest.raises(ValueError, match=msg):
-            np.repeat(ser, 2, axis=0)
 
-    def test_repeat_with_multiindex(self):
-        # GH#9361, fixed by  GH#7891
-        m_idx = MultiIndex.from_tuples([(1, 2), (3, 4), (5, 6), (7, 8)])
-        data = ["a", "b", "c", "d"]
-        m_df = Series(data, index=m_idx)
-        assert m_df.repeat(3).shape == (3 * len(data),)
+        rng = date_range(start="2016-01-01", periods=2, freq="30Min", tz=tz, unit=unit)
+
+        expected_rng = DatetimeIndex(
+            [
+                Timestamp("2016-01-01 00:00:00", tz=tz),
+                Timestamp("2016-01-01 00:00:00", tz=tz),
+                Timestamp("2016-01-01 00:30:00", tz=tz),
+                Timestamp("2016-01-01 00:30:00", tz=tz),
+            ]
+        ).as_unit(unit)
+
+        res = rng.repeat(reps)
+        tm.assert_index_equal(res, expected_rng)
+        assert res.freq is None
+
+        tm.assert_index_equal(np.repeat(rng, reps), expected_rng)
+        with pytest.raises(ValueError, match=msg):
+            np.repeat(rng, reps, axis=1)

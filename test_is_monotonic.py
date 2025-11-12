@@ -1,26 +1,46 @@
-import numpy as np
-
 from pandas import (
-    Series,
+    Index,
+    NaT,
     date_range,
 )
 
 
-class TestIsMonotonic:
-    def test_is_monotonic_numeric(self):
-        ser = Series(np.random.default_rng(2).integers(0, 10, size=1000))
-        assert not ser.is_monotonic_increasing
-        ser = Series(np.arange(1000))
-        assert ser.is_monotonic_increasing is True
-        assert ser.is_monotonic_increasing is True
-        ser = Series(np.arange(1000, 0, -1))
-        assert ser.is_monotonic_decreasing is True
+def test_is_monotonic_with_nat():
+    # GH#31437
+    # PeriodIndex.is_monotonic_increasing should behave analogously to DatetimeIndex,
+    #  in particular never be monotonic when we have NaT
+    dti = date_range("2016-01-01", periods=3)
+    pi = dti.to_period("D")
+    tdi = Index(dti.view("timedelta64[ns]"))
 
-    def test_is_monotonic_dt64(self):
-        ser = Series(date_range("20130101", periods=10))
-        assert ser.is_monotonic_increasing is True
-        assert ser.is_monotonic_increasing is True
+    for obj in [pi, pi._engine, dti, dti._engine, tdi, tdi._engine]:
+        if isinstance(obj, Index):
+            # i.e. not Engines
+            assert obj.is_monotonic_increasing
+        assert obj.is_monotonic_increasing
+        assert not obj.is_monotonic_decreasing
+        assert obj.is_unique
 
-        ser = Series(list(reversed(ser)))
-        assert ser.is_monotonic_increasing is False
-        assert ser.is_monotonic_decreasing is True
+    dti1 = dti.insert(0, NaT)
+    pi1 = dti1.to_period("D")
+    tdi1 = Index(dti1.view("timedelta64[ns]"))
+
+    for obj in [pi1, pi1._engine, dti1, dti1._engine, tdi1, tdi1._engine]:
+        if isinstance(obj, Index):
+            # i.e. not Engines
+            assert not obj.is_monotonic_increasing
+        assert not obj.is_monotonic_increasing
+        assert not obj.is_monotonic_decreasing
+        assert obj.is_unique
+
+    dti2 = dti.insert(3, NaT)
+    pi2 = dti2.to_period("h")
+    tdi2 = Index(dti2.view("timedelta64[ns]"))
+
+    for obj in [pi2, pi2._engine, dti2, dti2._engine, tdi2, tdi2._engine]:
+        if isinstance(obj, Index):
+            # i.e. not Engines
+            assert not obj.is_monotonic_increasing
+        assert not obj.is_monotonic_increasing
+        assert not obj.is_monotonic_decreasing
+        assert obj.is_unique

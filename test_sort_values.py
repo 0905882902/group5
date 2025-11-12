@@ -2,245 +2,314 @@ import numpy as np
 import pytest
 
 from pandas import (
-    Categorical,
-    DataFrame,
-    Series,
+    DatetimeIndex,
+    Index,
+    NaT,
+    PeriodIndex,
+    TimedeltaIndex,
+    timedelta_range,
 )
 import pandas._testing as tm
 
 
-class TestSeriesSortValues:
-    def test_sort_values(self, datetime_series, using_copy_on_write):
-        # check indexes are reordered corresponding with the values
-        ser = Series([3, 2, 4, 1], ["A", "B", "C", "D"])
-        expected = Series([1, 2, 3, 4], ["D", "B", "A", "C"])
-        result = ser.sort_values()
-        tm.assert_series_equal(expected, result)
-
-        ts = datetime_series.copy()
-        ts[:5] = np.nan
-        vals = ts.values
-
-        result = ts.sort_values()
-        assert np.isnan(result[-5:]).all()
-        tm.assert_numpy_array_equal(result[:-5].values, np.sort(vals[5:]))
-
-        # na_position
-        result = ts.sort_values(na_position="first")
-        assert np.isnan(result[:5]).all()
-        tm.assert_numpy_array_equal(result[5:].values, np.sort(vals[5:]))
-
-        # something object-type
-        ser = Series(["A", "B"], [1, 2])
-        # no failure
-        ser.sort_values()
-
-        # ascending=False
-        ordered = ts.sort_values(ascending=False)
-        expected = np.sort(ts.dropna().values)[::-1]
-        tm.assert_almost_equal(expected, ordered.dropna().values)
-        ordered = ts.sort_values(ascending=False, na_position="first")
-        tm.assert_almost_equal(expected, ordered.dropna().values)
-
-        # ascending=[False] should behave the same as ascending=False
-        ordered = ts.sort_values(ascending=[False])
-        expected = ts.sort_values(ascending=False)
-        tm.assert_series_equal(expected, ordered)
-        ordered = ts.sort_values(ascending=[False], na_position="first")
-        expected = ts.sort_values(ascending=False, na_position="first")
-        tm.assert_series_equal(expected, ordered)
-
-        msg = 'For argument "ascending" expected type bool, received type NoneType.'
-        with pytest.raises(ValueError, match=msg):
-            ts.sort_values(ascending=None)
-        msg = r"Length of ascending \(0\) must be 1 for Series"
-        with pytest.raises(ValueError, match=msg):
-            ts.sort_values(ascending=[])
-        msg = r"Length of ascending \(3\) must be 1 for Series"
-        with pytest.raises(ValueError, match=msg):
-            ts.sort_values(ascending=[1, 2, 3])
-        msg = r"Length of ascending \(2\) must be 1 for Series"
-        with pytest.raises(ValueError, match=msg):
-            ts.sort_values(ascending=[False, False])
-        msg = 'For argument "ascending" expected type bool, received type str.'
-        with pytest.raises(ValueError, match=msg):
-            ts.sort_values(ascending="foobar")
-
-        # inplace=True
-        ts = datetime_series.copy()
-        return_value = ts.sort_values(ascending=False, inplace=True)
-        assert return_value is None
-        tm.assert_series_equal(ts, datetime_series.sort_values(ascending=False))
-        tm.assert_index_equal(
-            ts.index, datetime_series.sort_values(ascending=False).index
-        )
-
-        # GH#5856/5853
-        # Series.sort_values operating on a view
-        df = DataFrame(np.random.default_rng(2).standard_normal((10, 4)))
-        s = df.iloc[:, 0]
-
-        msg = (
-            "This Series is a view of some other array, to sort in-place "
-            "you must create a copy"
-        )
-        if using_copy_on_write:
-            s.sort_values(inplace=True)
-            tm.assert_series_equal(s, df.iloc[:, 0].sort_values())
+def check_freq_ascending(ordered, orig, ascending):
+    """
+    Check the expected freq on a PeriodIndex/DatetimeIndex/TimedeltaIndex
+    when the original index is generated (or generate-able) with
+    period_range/date_range/timedelta_range.
+    """
+    if isinstance(ordered, PeriodIndex):
+        assert ordered.freq == orig.freq
+    elif isinstance(ordered, (DatetimeIndex, TimedeltaIndex)):
+        if ascending:
+            assert ordered.freq.n == orig.freq.n
         else:
-            with pytest.raises(ValueError, match=msg):
-                s.sort_values(inplace=True)
+            assert ordered.freq.n == -1 * orig.freq.n
 
-    def test_sort_values_categorical(self):
-        c = Categorical(["a", "b", "b", "a"], ordered=False)
-        cat = Series(c.copy())
 
-        # sort in the categories order
-        expected = Series(
-            Categorical(["a", "a", "b", "b"], ordered=False), index=[0, 3, 1, 2]
-        )
-        result = cat.sort_values()
-        tm.assert_series_equal(result, expected)
+def check_freq_nonmonotonic(ordered, orig):
+    """
+    Check the expected freq on a PeriodIndex/DatetimeIndex/TimedeltaIndex
+    when the original index is _not_ generated (or generate-able) with
+    period_range/date_range//timedelta_range.
+    """
+    if isinstance(ordered, PeriodIndex):
+        assert ordered.freq == orig.freq
+    elif isinstance(ordered, (DatetimeIndex, TimedeltaIndex)):
+        assert ordered.freq is None
 
-        cat = Series(Categorical(["a", "c", "b", "d"], ordered=True))
-        res = cat.sort_values()
-        exp = np.array(["a", "b", "c", "d"], dtype=np.object_)
-        tm.assert_numpy_array_equal(res.__array__(), exp)
 
-        cat = Series(
-            Categorical(
-                ["a", "c", "b", "d"], categories=["a", "b", "c", "d"], ordered=True
+class TestSortValues:
+    @pytest.fixture(params=[DatetimeIndex, TimedeltaIndex, PeriodIndex])
+    def non_monotonic_idx(self, request):
+        if request.param is DatetimeIndex:
+            return DatetimeIndex(["2000-01-04", "2000-01-01", "2000-01-02"])
+        elif request.param is PeriodIndex:
+            dti = DatetimeIndex(["2000-01-04", "2000-01-01", "2000-01-02"])
+            return dti.to_period("D")
+        else:
+            return TimedeltaIndex(
+                ["1 day 00:00:05", "1 day 00:00:01", "1 day 00:00:02"]
             )
-        )
-        res = cat.sort_values()
-        exp = np.array(["a", "b", "c", "d"], dtype=np.object_)
-        tm.assert_numpy_array_equal(res.__array__(), exp)
 
-        res = cat.sort_values(ascending=False)
-        exp = np.array(["d", "c", "b", "a"], dtype=np.object_)
-        tm.assert_numpy_array_equal(res.__array__(), exp)
+    def test_argmin_argmax(self, non_monotonic_idx):
+        assert non_monotonic_idx.argmin() == 1
+        assert non_monotonic_idx.argmax() == 0
 
-        raw_cat1 = Categorical(
-            ["a", "b", "c", "d"], categories=["a", "b", "c", "d"], ordered=False
-        )
-        raw_cat2 = Categorical(
-            ["a", "b", "c", "d"], categories=["d", "c", "b", "a"], ordered=True
-        )
-        s = ["a", "b", "c", "d"]
-        df = DataFrame(
-            {"unsort": raw_cat1, "sort": raw_cat2, "string": s, "values": [1, 2, 3, 4]}
-        )
+    def test_sort_values(self, non_monotonic_idx):
+        idx = non_monotonic_idx
+        ordered = idx.sort_values()
+        assert ordered.is_monotonic_increasing
+        ordered = idx.sort_values(ascending=False)
+        assert ordered[::-1].is_monotonic_increasing
 
-        # Cats must be sorted in a dataframe
-        res = df.sort_values(by=["string"], ascending=False)
-        exp = np.array(["d", "c", "b", "a"], dtype=np.object_)
-        tm.assert_numpy_array_equal(res["sort"].values.__array__(), exp)
-        assert res["sort"].dtype == "category"
+        ordered, dexer = idx.sort_values(return_indexer=True)
+        assert ordered.is_monotonic_increasing
+        tm.assert_numpy_array_equal(dexer, np.array([1, 2, 0], dtype=np.intp))
 
-        res = df.sort_values(by=["sort"], ascending=False)
-        exp = df.sort_values(by=["string"], ascending=True)
-        tm.assert_series_equal(res["values"], exp["values"])
-        assert res["sort"].dtype == "category"
-        assert res["unsort"].dtype == "category"
+        ordered, dexer = idx.sort_values(return_indexer=True, ascending=False)
+        assert ordered[::-1].is_monotonic_increasing
+        tm.assert_numpy_array_equal(dexer, np.array([0, 2, 1], dtype=np.intp))
 
-        # unordered cat, but we allow this
-        df.sort_values(by=["unsort"], ascending=False)
+    def check_sort_values_with_freq(self, idx):
+        ordered = idx.sort_values()
+        tm.assert_index_equal(ordered, idx)
+        check_freq_ascending(ordered, idx, True)
 
-        # multi-columns sort
-        # GH#7848
-        df = DataFrame(
-            {"id": [6, 5, 4, 3, 2, 1], "raw_grade": ["a", "b", "b", "a", "a", "e"]}
-        )
-        df["grade"] = Categorical(df["raw_grade"], ordered=True)
-        df["grade"] = df["grade"].cat.set_categories(["b", "e", "a"])
+        ordered = idx.sort_values(ascending=False)
+        expected = idx[::-1]
+        tm.assert_index_equal(ordered, expected)
+        check_freq_ascending(ordered, idx, False)
 
-        # sorts 'grade' according to the order of the categories
-        result = df.sort_values(by=["grade"])
-        expected = df.iloc[[1, 2, 5, 0, 3, 4]]
-        tm.assert_frame_equal(result, expected)
+        ordered, indexer = idx.sort_values(return_indexer=True)
+        tm.assert_index_equal(ordered, idx)
+        tm.assert_numpy_array_equal(indexer, np.array([0, 1, 2], dtype=np.intp))
+        check_freq_ascending(ordered, idx, True)
 
-        # multi
-        result = df.sort_values(by=["grade", "id"])
-        expected = df.iloc[[2, 1, 5, 4, 3, 0]]
-        tm.assert_frame_equal(result, expected)
+        ordered, indexer = idx.sort_values(return_indexer=True, ascending=False)
+        expected = idx[::-1]
+        tm.assert_index_equal(ordered, expected)
+        tm.assert_numpy_array_equal(indexer, np.array([2, 1, 0], dtype=np.intp))
+        check_freq_ascending(ordered, idx, False)
 
-    @pytest.mark.parametrize("inplace", [True, False])
+    @pytest.mark.parametrize("freq", ["D", "h"])
+    def test_sort_values_with_freq_timedeltaindex(self, freq):
+        # GH#10295
+        idx = timedelta_range(start=f"1{freq}", periods=3, freq=freq).rename("idx")
+
+        self.check_sort_values_with_freq(idx)
+
     @pytest.mark.parametrize(
-        "original_list, sorted_list, ignore_index, output_index",
+        "idx",
         [
-            ([2, 3, 6, 1], [6, 3, 2, 1], True, [0, 1, 2, 3]),
-            ([2, 3, 6, 1], [6, 3, 2, 1], False, [2, 1, 0, 3]),
+            DatetimeIndex(
+                ["2011-01-01", "2011-01-02", "2011-01-03"], freq="D", name="idx"
+            ),
+            DatetimeIndex(
+                ["2011-01-01 09:00", "2011-01-01 10:00", "2011-01-01 11:00"],
+                freq="h",
+                name="tzidx",
+                tz="Asia/Tokyo",
+            ),
         ],
     )
-    def test_sort_values_ignore_index(
-        self, inplace, original_list, sorted_list, ignore_index, output_index
+    def test_sort_values_with_freq_datetimeindex(self, idx):
+        self.check_sort_values_with_freq(idx)
+
+    @pytest.mark.parametrize("freq", ["D", "2D", "4D"])
+    def test_sort_values_with_freq_periodindex(self, freq):
+        # here with_freq refers to being period_range-like
+        idx = PeriodIndex(
+            ["2011-01-01", "2011-01-02", "2011-01-03"], freq=freq, name="idx"
+        )
+        self.check_sort_values_with_freq(idx)
+
+    @pytest.mark.parametrize(
+        "idx",
+        [
+            PeriodIndex(["2011", "2012", "2013"], name="pidx", freq="Y"),
+            Index([2011, 2012, 2013], name="idx"),  # for compatibility check
+        ],
+    )
+    def test_sort_values_with_freq_periodindex2(self, idx):
+        # here with_freq indicates this is period_range-like
+        self.check_sort_values_with_freq(idx)
+
+    def check_sort_values_without_freq(self, idx, expected):
+        ordered = idx.sort_values(na_position="first")
+        tm.assert_index_equal(ordered, expected)
+        check_freq_nonmonotonic(ordered, idx)
+
+        if not idx.isna().any():
+            ordered = idx.sort_values()
+            tm.assert_index_equal(ordered, expected)
+            check_freq_nonmonotonic(ordered, idx)
+
+        ordered = idx.sort_values(ascending=False)
+        tm.assert_index_equal(ordered, expected[::-1])
+        check_freq_nonmonotonic(ordered, idx)
+
+        ordered, indexer = idx.sort_values(return_indexer=True, na_position="first")
+        tm.assert_index_equal(ordered, expected)
+
+        exp = np.array([0, 4, 3, 1, 2], dtype=np.intp)
+        tm.assert_numpy_array_equal(indexer, exp)
+        check_freq_nonmonotonic(ordered, idx)
+
+        if not idx.isna().any():
+            ordered, indexer = idx.sort_values(return_indexer=True)
+            tm.assert_index_equal(ordered, expected)
+
+            exp = np.array([0, 4, 3, 1, 2], dtype=np.intp)
+            tm.assert_numpy_array_equal(indexer, exp)
+            check_freq_nonmonotonic(ordered, idx)
+
+        ordered, indexer = idx.sort_values(return_indexer=True, ascending=False)
+        tm.assert_index_equal(ordered, expected[::-1])
+
+        exp = np.array([2, 1, 3, 0, 4], dtype=np.intp)
+        tm.assert_numpy_array_equal(indexer, exp)
+        check_freq_nonmonotonic(ordered, idx)
+
+    def test_sort_values_without_freq_timedeltaindex(self):
+        # GH#10295
+
+        idx = TimedeltaIndex(
+            ["1 hour", "3 hour", "5 hour", "2 hour ", "1 hour"], name="idx1"
+        )
+        expected = TimedeltaIndex(
+            ["1 hour", "1 hour", "2 hour", "3 hour", "5 hour"], name="idx1"
+        )
+        self.check_sort_values_without_freq(idx, expected)
+
+    @pytest.mark.parametrize(
+        "index_dates,expected_dates",
+        [
+            (
+                ["2011-01-01", "2011-01-03", "2011-01-05", "2011-01-02", "2011-01-01"],
+                ["2011-01-01", "2011-01-01", "2011-01-02", "2011-01-03", "2011-01-05"],
+            ),
+            (
+                ["2011-01-01", "2011-01-03", "2011-01-05", "2011-01-02", "2011-01-01"],
+                ["2011-01-01", "2011-01-01", "2011-01-02", "2011-01-03", "2011-01-05"],
+            ),
+            (
+                [NaT, "2011-01-03", "2011-01-05", "2011-01-02", NaT],
+                [NaT, NaT, "2011-01-02", "2011-01-03", "2011-01-05"],
+            ),
+        ],
+    )
+    def test_sort_values_without_freq_datetimeindex(
+        self, index_dates, expected_dates, tz_naive_fixture
     ):
-        # GH 30114
-        ser = Series(original_list)
-        expected = Series(sorted_list, index=output_index)
-        kwargs = {"ignore_index": ignore_index, "inplace": inplace}
+        tz = tz_naive_fixture
 
-        if inplace:
-            result_ser = ser.copy()
-            result_ser.sort_values(ascending=False, **kwargs)
-        else:
-            result_ser = ser.sort_values(ascending=False, **kwargs)
+        # without freq
+        idx = DatetimeIndex(index_dates, tz=tz, name="idx")
+        expected = DatetimeIndex(expected_dates, tz=tz, name="idx")
 
-        tm.assert_series_equal(result_ser, expected)
-        tm.assert_series_equal(ser, Series(original_list))
+        self.check_sort_values_without_freq(idx, expected)
 
-    def test_mergesort_descending_stability(self):
-        # GH 28697
-        s = Series([1, 2, 1, 3], ["first", "b", "second", "c"])
-        result = s.sort_values(ascending=False, kind="mergesort")
-        expected = Series([3, 2, 1, 1], ["c", "b", "first", "second"])
-        tm.assert_series_equal(result, expected)
+    @pytest.mark.parametrize(
+        "idx,expected",
+        [
+            (
+                PeriodIndex(
+                    [
+                        "2011-01-01",
+                        "2011-01-03",
+                        "2011-01-05",
+                        "2011-01-02",
+                        "2011-01-01",
+                    ],
+                    freq="D",
+                    name="idx1",
+                ),
+                PeriodIndex(
+                    [
+                        "2011-01-01",
+                        "2011-01-01",
+                        "2011-01-02",
+                        "2011-01-03",
+                        "2011-01-05",
+                    ],
+                    freq="D",
+                    name="idx1",
+                ),
+            ),
+            (
+                PeriodIndex(
+                    [
+                        "2011-01-01",
+                        "2011-01-03",
+                        "2011-01-05",
+                        "2011-01-02",
+                        "2011-01-01",
+                    ],
+                    freq="D",
+                    name="idx2",
+                ),
+                PeriodIndex(
+                    [
+                        "2011-01-01",
+                        "2011-01-01",
+                        "2011-01-02",
+                        "2011-01-03",
+                        "2011-01-05",
+                    ],
+                    freq="D",
+                    name="idx2",
+                ),
+            ),
+            (
+                PeriodIndex(
+                    [NaT, "2011-01-03", "2011-01-05", "2011-01-02", NaT],
+                    freq="D",
+                    name="idx3",
+                ),
+                PeriodIndex(
+                    [NaT, NaT, "2011-01-02", "2011-01-03", "2011-01-05"],
+                    freq="D",
+                    name="idx3",
+                ),
+            ),
+            (
+                PeriodIndex(
+                    ["2011", "2013", "2015", "2012", "2011"], name="pidx", freq="Y"
+                ),
+                PeriodIndex(
+                    ["2011", "2011", "2012", "2013", "2015"], name="pidx", freq="Y"
+                ),
+            ),
+            (
+                # For compatibility check
+                Index([2011, 2013, 2015, 2012, 2011], name="idx"),
+                Index([2011, 2011, 2012, 2013, 2015], name="idx"),
+            ),
+        ],
+    )
+    def test_sort_values_without_freq_periodindex(self, idx, expected):
+        # here without_freq means not generateable by period_range
+        self.check_sort_values_without_freq(idx, expected)
 
-    def test_sort_values_validate_ascending_for_value_error(self):
-        # GH41634
-        ser = Series([23, 7, 21])
+    def test_sort_values_without_freq_periodindex_nat(self):
+        # doesn't quite fit into check_sort_values_without_freq
+        idx = PeriodIndex(["2011", "2013", "NaT", "2011"], name="pidx", freq="D")
+        expected = PeriodIndex(["NaT", "2011", "2011", "2013"], name="pidx", freq="D")
 
-        msg = 'For argument "ascending" expected type bool, received type str.'
-        with pytest.raises(ValueError, match=msg):
-            ser.sort_values(ascending="False")
+        ordered = idx.sort_values(na_position="first")
+        tm.assert_index_equal(ordered, expected)
+        check_freq_nonmonotonic(ordered, idx)
 
-    @pytest.mark.parametrize("ascending", [False, 0, 1, True])
-    def test_sort_values_validate_ascending_functional(self, ascending):
-        # GH41634
-        ser = Series([23, 7, 21])
-        expected = np.sort(ser.values)
-
-        sorted_ser = ser.sort_values(ascending=ascending)
-        if not ascending:
-            expected = expected[::-1]
-
-        result = sorted_ser.values
-        tm.assert_numpy_array_equal(result, expected)
+        ordered = idx.sort_values(ascending=False)
+        tm.assert_index_equal(ordered, expected[::-1])
+        check_freq_nonmonotonic(ordered, idx)
 
 
-class TestSeriesSortingKey:
-    def test_sort_values_key(self):
-        series = Series(np.array(["Hello", "goodbye"]))
-
-        result = series.sort_values(axis=0)
-        expected = series
-        tm.assert_series_equal(result, expected)
-
-        result = series.sort_values(axis=0, key=lambda x: x.str.lower())
-        expected = series[::-1]
-        tm.assert_series_equal(result, expected)
-
-    def test_sort_values_key_nan(self):
-        series = Series(np.array([0, 5, np.nan, 3, 2, np.nan]))
-
-        result = series.sort_values(axis=0)
-        expected = series.iloc[[0, 4, 3, 1, 2, 5]]
-        tm.assert_series_equal(result, expected)
-
-        result = series.sort_values(axis=0, key=lambda x: x + 5)
-        expected = series.iloc[[0, 4, 3, 1, 2, 5]]
-        tm.assert_series_equal(result, expected)
-
-        result = series.sort_values(axis=0, key=lambda x: -x, ascending=False)
-        expected = series.iloc[[0, 4, 3, 1, 2, 5]]
-        tm.assert_series_equal(result, expected)
+def test_order_stability_compat():
+    # GH#35922. sort_values is stable both for normal and datetime-like Index
+    pidx = PeriodIndex(["2011", "2013", "2015", "2012", "2011"], name="pidx", freq="Y")
+    iidx = Index([2011, 2013, 2015, 2012, 2011], name="idx")
+    ordered1, indexer1 = pidx.sort_values(return_indexer=True, ascending=False)
+    ordered2, indexer2 = iidx.sort_values(return_indexer=True, ascending=False)
+    tm.assert_numpy_array_equal(indexer1, indexer2)
