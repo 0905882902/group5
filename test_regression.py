@@ -1,228 +1,178 @@
-import os
+""" Test functions for linalg module
+"""
+import warnings
+
+import pytest
 
 import numpy as np
+from numpy import linalg, arange, float64, array, dot, transpose
 from numpy.testing import (
-    assert_, assert_equal, assert_array_equal, assert_array_almost_equal,
-    assert_raises, _assert_valid_refcount,
-    )
-import pytest
+    assert_, assert_raises, assert_equal, assert_array_equal,
+    assert_array_almost_equal, assert_array_less
+)
 
 
 class TestRegression:
-    def test_poly1d(self):
-        # Ticket #28
-        assert_equal(np.poly1d([1]) - np.poly1d([1, 0]),
-                     np.poly1d([-1, 1]))
 
-    def test_cov_parameters(self):
-        # Ticket #91
-        x = np.random.random((3, 3))
-        y = x.copy()
-        np.cov(x, rowvar=True)
-        np.cov(y, rowvar=False)
-        assert_array_equal(x, y)
+    def test_eig_build(self):
+        # Ticket #652
+        rva = array([1.03221168e+02 + 0.j,
+                     -1.91843603e+01 + 0.j,
+                     -6.04004526e-01 + 15.84422474j,
+                     -6.04004526e-01 - 15.84422474j,
+                     -1.13692929e+01 + 0.j,
+                     -6.57612485e-01 + 10.41755503j,
+                     -6.57612485e-01 - 10.41755503j,
+                     1.82126812e+01 + 0.j,
+                     1.06011014e+01 + 0.j,
+                     7.80732773e+00 + 0.j,
+                     -7.65390898e-01 + 0.j,
+                     1.51971555e-15 + 0.j,
+                     -1.51308713e-15 + 0.j])
+        a = arange(13 * 13, dtype=float64)
+        a.shape = (13, 13)
+        a = a % 17
+        va, ve = linalg.eig(a)
+        va.sort()
+        rva.sort()
+        assert_array_almost_equal(va, rva)
 
-    def test_mem_digitize(self):
-        # Ticket #95
-        for i in range(100):
-            np.digitize([1, 2, 3, 4], [1, 3])
-            np.digitize([0, 1, 2, 3, 4], [1, 3])
+    def test_eigh_build(self):
+        # Ticket 662.
+        rvals = [68.60568999, 89.57756725, 106.67185574]
 
-    def test_unique_zero_sized(self):
-        # Ticket #205
-        assert_array_equal([], np.unique(np.array([])))
+        cov = array([[77.70273908,   3.51489954,  15.64602427],
+                     [3.51489954,  88.97013878,  -1.07431931],
+                     [15.64602427,  -1.07431931,  98.18223512]])
 
-    def test_mem_vectorise(self):
-        # Ticket #325
-        vt = np.vectorize(lambda *args: args)
-        vt(np.zeros((1, 2, 1)), np.zeros((2, 1, 1)), np.zeros((1, 1, 2)))
-        vt(np.zeros((1, 2, 1)), np.zeros((2, 1, 1)), np.zeros((1,
-           1, 2)), np.zeros((2, 2)))
+        vals, vecs = linalg.eigh(cov)
+        assert_array_almost_equal(vals, rvals)
 
-    def test_mgrid_single_element(self):
-        # Ticket #339
-        assert_array_equal(np.mgrid[0:0:1j], [0])
-        assert_array_equal(np.mgrid[0:0], [])
+    def test_svd_build(self):
+        # Ticket 627.
+        a = array([[0., 1.], [1., 1.], [2., 1.], [3., 1.]])
+        m, n = a.shape
+        u, s, vh = linalg.svd(a)
 
-    def test_refcount_vectorize(self):
-        # Ticket #378
-        def p(x, y):
-            return 123
-        v = np.vectorize(p)
-        _assert_valid_refcount(v)
+        b = dot(transpose(u[:, n:]), a)
 
-    def test_poly1d_nan_roots(self):
-        # Ticket #396
-        p = np.poly1d([np.nan, np.nan, 1], r=False)
-        assert_raises(np.linalg.LinAlgError, getattr, p, "r")
+        assert_array_almost_equal(b, np.zeros((2, 2)))
 
-    def test_mem_polymul(self):
-        # Ticket #448
-        np.polymul([], [1.])
+    def test_norm_vector_badarg(self):
+        # Regression for #786: Frobenius norm for vectors raises
+        # ValueError.
+        assert_raises(ValueError, linalg.norm, array([1., 2., 3.]), 'fro')
 
-    def test_mem_string_concat(self):
-        # Ticket #469
-        x = np.array([])
-        np.append(x, 'asdasd\tasdasd')
+    def test_lapack_endian(self):
+        # For bug #1482
+        a = array([[5.7998084,  -2.1825367],
+                   [-2.1825367,   9.85910595]], dtype='>f8')
+        b = array(a, dtype='<f8')
 
-    def test_poly_div(self):
-        # Ticket #553
-        u = np.poly1d([1, 2, 3])
-        v = np.poly1d([1, 2, 3, 4, 5])
-        q, r = np.polydiv(u, v)
-        assert_equal(q*v + r, u)
+        ap = linalg.cholesky(a)
+        bp = linalg.cholesky(b)
+        assert_array_equal(ap, bp)
 
-    def test_poly_eq(self):
-        # Ticket #554
-        x = np.poly1d([1, 2, 3])
-        y = np.poly1d([3, 4])
-        assert_(x != y)
-        assert_(x == x)
+    def test_large_svd_32bit(self):
+        # See gh-4442, 64bit would require very large/slow matrices.
+        x = np.eye(1000, 66)
+        np.linalg.svd(x)
 
-    def test_polyfit_build(self):
-        # Ticket #628
-        ref = [-1.06123820e-06, 5.70886914e-04, -1.13822012e-01,
-               9.95368241e+00, -3.14526520e+02]
-        x = [90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103,
-             104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115,
-             116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 129,
-             130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141,
-             146, 147, 148, 149, 150, 151, 152, 153, 154, 155, 156, 157,
-             158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169,
-             170, 171, 172, 173, 174, 175, 176]
-        y = [9.0, 3.0, 7.0, 4.0, 4.0, 8.0, 6.0, 11.0, 9.0, 8.0, 11.0, 5.0,
-             6.0, 5.0, 9.0, 8.0, 6.0, 10.0, 6.0, 10.0, 7.0, 6.0, 6.0, 6.0,
-             13.0, 4.0, 9.0, 11.0, 4.0, 5.0, 8.0, 5.0, 7.0, 7.0, 6.0, 12.0,
-             7.0, 7.0, 9.0, 4.0, 12.0, 6.0, 6.0, 4.0, 3.0, 9.0, 8.0, 8.0,
-             6.0, 7.0, 9.0, 10.0, 6.0, 8.0, 4.0, 7.0, 7.0, 10.0, 8.0, 8.0,
-             6.0, 3.0, 8.0, 4.0, 5.0, 7.0, 8.0, 6.0, 6.0, 4.0, 12.0, 9.0,
-             8.0, 8.0, 8.0, 6.0, 7.0, 4.0, 4.0, 5.0, 7.0]
-        tested = np.polyfit(x, y, 4)
-        assert_array_almost_equal(ref, tested)
+    def test_svd_no_uv(self):
+        # gh-4733
+        for shape in (3, 4), (4, 4), (4, 3):
+            for t in float, complex:
+                a = np.ones(shape, dtype=t)
+                w = linalg.svd(a, compute_uv=False)
+                c = np.count_nonzero(np.absolute(w) > 0.5)
+                assert_equal(c, 1)
+                assert_equal(np.linalg.matrix_rank(a), 1)
+                assert_array_less(1, np.linalg.norm(a, ord=2))
 
-    def test_polydiv_type(self):
-        # Make polydiv work for complex types
-        msg = "Wrong type, should be complex"
-        x = np.ones(3, dtype=complex)
-        q, r = np.polydiv(x, x)
-        assert_(q.dtype == complex, msg)
-        msg = "Wrong type, should be float"
-        x = np.ones(3, dtype=int)
-        q, r = np.polydiv(x, x)
-        assert_(q.dtype == float, msg)
+                w_svdvals = linalg.svdvals(a)
+                assert_array_almost_equal(w, w_svdvals)
 
-    def test_histogramdd_too_many_bins(self):
-        # Ticket 928.
-        assert_raises(ValueError, np.histogramdd, np.ones((1, 10)), bins=2**10)
+    def test_norm_object_array(self):
+        # gh-7575
+        testvector = np.array([np.array([0, 1]), 0, 0], dtype=object)
 
-    def test_polyint_type(self):
-        # Ticket #944
-        msg = "Wrong type, should be complex"
-        x = np.ones(3, dtype=complex)
-        assert_(np.polyint(x).dtype == complex, msg)
-        msg = "Wrong type, should be float"
-        x = np.ones(3, dtype=int)
-        assert_(np.polyint(x).dtype == float, msg)
+        norm = linalg.norm(testvector)
+        assert_array_equal(norm, [0, 1])
+        assert_(norm.dtype == np.dtype('float64'))
 
-    def test_ndenumerate_crash(self):
-        # Ticket 1140
-        # Shouldn't crash:
-        list(np.ndenumerate(np.array([[]])))
+        norm = linalg.norm(testvector, ord=1)
+        assert_array_equal(norm, [0, 1])
+        assert_(norm.dtype != np.dtype('float64'))
 
-    def test_large_fancy_indexing(self):
-        # Large enough to fail on 64-bit.
-        nbits = np.dtype(np.intp).itemsize * 8
-        thesize = int((2**nbits)**(1.0/5.0)+1)
+        norm = linalg.norm(testvector, ord=2)
+        assert_array_equal(norm, [0, 1])
+        assert_(norm.dtype == np.dtype('float64'))
 
-        def dp():
-            n = 3
-            a = np.ones((n,)*5)
-            i = np.random.randint(0, n, size=thesize)
-            a[np.ix_(i, i, i, i, i)] = 0
+        assert_raises(ValueError, linalg.norm, testvector, ord='fro')
+        assert_raises(ValueError, linalg.norm, testvector, ord='nuc')
+        assert_raises(ValueError, linalg.norm, testvector, ord=np.inf)
+        assert_raises(ValueError, linalg.norm, testvector, ord=-np.inf)
+        assert_raises(ValueError, linalg.norm, testvector, ord=0)
+        assert_raises(ValueError, linalg.norm, testvector, ord=-1)
+        assert_raises(ValueError, linalg.norm, testvector, ord=-2)
 
-        def dp2():
-            n = 3
-            a = np.ones((n,)*5)
-            i = np.random.randint(0, n, size=thesize)
-            a[np.ix_(i, i, i, i, i)]
+        testmatrix = np.array([[np.array([0, 1]), 0, 0],
+                               [0,                0, 0]], dtype=object)
 
-        assert_raises(ValueError, dp)
-        assert_raises(ValueError, dp2)
+        norm = linalg.norm(testmatrix)
+        assert_array_equal(norm, [0, 1])
+        assert_(norm.dtype == np.dtype('float64'))
 
-    def test_void_coercion(self):
-        dt = np.dtype([('a', 'f4'), ('b', 'i4')])
-        x = np.zeros((1,), dt)
-        assert_(np.r_[x, x].dtype == dt)
+        norm = linalg.norm(testmatrix, ord='fro')
+        assert_array_equal(norm, [0, 1])
+        assert_(norm.dtype == np.dtype('float64'))
 
-    def test_include_dirs(self):
-        # As a sanity check, just test that get_include
-        # includes something reasonable.  Somewhat
-        # related to ticket #1405.
-        include_dirs = [np.get_include()]
-        for path in include_dirs:
-            assert_(isinstance(path, str))
-            assert_(path != '')
+        assert_raises(TypeError, linalg.norm, testmatrix, ord='nuc')
+        assert_raises(ValueError, linalg.norm, testmatrix, ord=np.inf)
+        assert_raises(ValueError, linalg.norm, testmatrix, ord=-np.inf)
+        assert_raises(ValueError, linalg.norm, testmatrix, ord=0)
+        assert_raises(ValueError, linalg.norm, testmatrix, ord=1)
+        assert_raises(ValueError, linalg.norm, testmatrix, ord=-1)
+        assert_raises(TypeError, linalg.norm, testmatrix, ord=2)
+        assert_raises(TypeError, linalg.norm, testmatrix, ord=-2)
+        assert_raises(ValueError, linalg.norm, testmatrix, ord=3)
 
-    def test_polyder_return_type(self):
-        # Ticket #1249
-        assert_(isinstance(np.polyder(np.poly1d([1]), 0), np.poly1d))
-        assert_(isinstance(np.polyder([1], 0), np.ndarray))
-        assert_(isinstance(np.polyder(np.poly1d([1]), 1), np.poly1d))
-        assert_(isinstance(np.polyder([1], 1), np.ndarray))
+    def test_lstsq_complex_larger_rhs(self):
+        # gh-9891
+        size = 20
+        n_rhs = 70
+        G = np.random.randn(size, size) + 1j * np.random.randn(size, size)
+        u = np.random.randn(size, n_rhs) + 1j * np.random.randn(size, n_rhs)
+        b = G.dot(u)
+        # This should work without segmentation fault.
+        u_lstsq, res, rank, sv = linalg.lstsq(G, b, rcond=None)
+        # check results just in case
+        assert_array_almost_equal(u_lstsq, u)
 
-    def test_append_fields_dtype_list(self):
-        # Ticket #1676
-        from numpy.lib.recfunctions import append_fields
+    @pytest.mark.parametrize("upper", [True, False])
+    def test_cholesky_empty_array(self, upper):
+        # gh-25840 - upper=True hung before.
+        res = np.linalg.cholesky(np.zeros((0, 0)), upper=upper)
+        assert res.size == 0
 
-        base = np.array([1, 2, 3], dtype=np.int32)
-        names = ['a', 'b', 'c']
-        data = np.eye(3).astype(np.int32)
-        dlist = [np.float64, np.int32, np.int32]
-        try:
-            append_fields(base, names, data, dlist)
-        except Exception:
-            raise AssertionError()
+    @pytest.mark.parametrize("rtol", [0.0, [0.0] * 4, np.zeros((4,))])
+    def test_matrix_rank_rtol_argument(self, rtol):
+        # gh-25877
+        x = np.zeros((4, 3, 2))
+        res = np.linalg.matrix_rank(x, rtol=rtol)
+        assert res.shape == (4,)
 
-    def test_loadtxt_fields_subarrays(self):
-        # For ticket #1936
-        from io import StringIO
-
-        dt = [("a", 'u1', 2), ("b", 'u1', 2)]
-        x = np.loadtxt(StringIO("0 1 2 3"), dtype=dt)
-        assert_equal(x, np.array([((0, 1), (2, 3))], dtype=dt))
-
-        dt = [("a", [("a", 'u1', (1, 3)), ("b", 'u1')])]
-        x = np.loadtxt(StringIO("0 1 2 3"), dtype=dt)
-        assert_equal(x, np.array([(((0, 1, 2), 3),)], dtype=dt))
-
-        dt = [("a", 'u1', (2, 2))]
-        x = np.loadtxt(StringIO("0 1 2 3"), dtype=dt)
-        assert_equal(x, np.array([(((0, 1), (2, 3)),)], dtype=dt))
-
-        dt = [("a", 'u1', (2, 3, 2))]
-        x = np.loadtxt(StringIO("0 1 2 3 4 5 6 7 8 9 10 11"), dtype=dt)
-        data = [((((0, 1), (2, 3), (4, 5)), ((6, 7), (8, 9), (10, 11))),)]
-        assert_equal(x, np.array(data, dtype=dt))
-
-    def test_nansum_with_boolean(self):
-        # gh-2978
-        a = np.zeros(2, dtype=bool)
-        try:
-            np.nansum(a)
-        except Exception:
-            raise AssertionError()
-
-    def test_py3_compat(self):
-        # gh-2561
-        # Test if the oldstyle class test is bypassed in python3
-        class C():
-            """Old-style class in python2, normal class in python3"""
-            pass
-
-        out = open(os.devnull, 'w')
-        try:
-            np.info(C(), output=out)
-        except AttributeError:
-            raise AssertionError()
-        finally:
-            out.close()
+    def test_openblas_threading(self):
+        # gh-27036
+        # Test whether matrix multiplication involving a large matrix always
+        # gives the same (correct) answer
+        x = np.arange(500000, dtype=np.float64)
+        src = np.vstack((x, -10*x)).T
+        matrix = np.array([[0, 1], [1, 0]])
+        expected = np.vstack((-10*x, x)).T  # src @ matrix
+        for i in range(200):
+            result = src @ matrix
+            mismatches = (~np.isclose(result, expected)).sum()
+            if mismatches != 0:
+                assert False, ("unexpected result from matmul, "
+                    "probably due to OpenBLAS threading issues")
