@@ -1,306 +1,218 @@
 import numpy as np
 import pytest
 
-from pandas import (
-    NaT,
-    SparseDtype,
-    Timestamp,
-    isna,
-)
-from pandas.core.arrays.sparse import SparseArray
+import pandas as pd
+from pandas import Timedelta
+import pandas._testing as tm
+from pandas.core import nanops
+from pandas.core.arrays import TimedeltaArray
 
 
 class TestReductions:
-    @pytest.mark.parametrize(
-        "data,pos,neg",
-        [
-            ([True, True, True], True, False),
-            ([1, 2, 1], 1, 0),
-            ([1.0, 2.0, 1.0], 1.0, 0.0),
-        ],
-    )
-    def test_all(self, data, pos, neg):
-        # GH#17570
-        out = SparseArray(data).all()
-        assert out
+    @pytest.mark.parametrize("name", ["std", "min", "max", "median", "mean"])
+    @pytest.mark.parametrize("skipna", [True, False])
+    def test_reductions_empty(self, name, skipna):
+        tdi = pd.TimedeltaIndex([])
+        arr = tdi.array
 
-        out = SparseArray(data, fill_value=pos).all()
-        assert out
+        result = getattr(tdi, name)(skipna=skipna)
+        assert result is pd.NaT
 
-        data[1] = neg
-        out = SparseArray(data).all()
-        assert not out
+        result = getattr(arr, name)(skipna=skipna)
+        assert result is pd.NaT
 
-        out = SparseArray(data, fill_value=pos).all()
-        assert not out
+    @pytest.mark.parametrize("skipna", [True, False])
+    def test_sum_empty(self, skipna):
+        tdi = pd.TimedeltaIndex([])
+        arr = tdi.array
 
-    @pytest.mark.parametrize(
-        "data,pos,neg",
-        [
-            ([True, True, True], True, False),
-            ([1, 2, 1], 1, 0),
-            ([1.0, 2.0, 1.0], 1.0, 0.0),
-        ],
-    )
-    def test_numpy_all(self, data, pos, neg):
-        # GH#17570
-        out = np.all(SparseArray(data))
-        assert out
+        result = tdi.sum(skipna=skipna)
+        assert isinstance(result, Timedelta)
+        assert result == Timedelta(0)
 
-        out = np.all(SparseArray(data, fill_value=pos))
-        assert out
+        result = arr.sum(skipna=skipna)
+        assert isinstance(result, Timedelta)
+        assert result == Timedelta(0)
 
-        data[1] = neg
-        out = np.all(SparseArray(data))
-        assert not out
+    def test_min_max(self, unit):
+        dtype = f"m8[{unit}]"
+        arr = TimedeltaArray._from_sequence(
+            ["3h", "3h", "NaT", "2h", "5h", "4h"], dtype=dtype
+        )
 
-        out = np.all(SparseArray(data, fill_value=pos))
-        assert not out
+        result = arr.min()
+        expected = Timedelta("2h")
+        assert result == expected
 
-        # raises with a different message on py2.
-        msg = "the 'out' parameter is not supported"
-        with pytest.raises(ValueError, match=msg):
-            np.all(SparseArray(data), out=np.array([]))
+        result = arr.max()
+        expected = Timedelta("5h")
+        assert result == expected
 
-    @pytest.mark.parametrize(
-        "data,pos,neg",
-        [
-            ([False, True, False], True, False),
-            ([0, 2, 0], 2, 0),
-            ([0.0, 2.0, 0.0], 2.0, 0.0),
-        ],
-    )
-    def test_any(self, data, pos, neg):
-        # GH#17570
-        out = SparseArray(data).any()
-        assert out
+        result = arr.min(skipna=False)
+        assert result is pd.NaT
 
-        out = SparseArray(data, fill_value=pos).any()
-        assert out
-
-        data[1] = neg
-        out = SparseArray(data).any()
-        assert not out
-
-        out = SparseArray(data, fill_value=pos).any()
-        assert not out
-
-    @pytest.mark.parametrize(
-        "data,pos,neg",
-        [
-            ([False, True, False], True, False),
-            ([0, 2, 0], 2, 0),
-            ([0.0, 2.0, 0.0], 2.0, 0.0),
-        ],
-    )
-    def test_numpy_any(self, data, pos, neg):
-        # GH#17570
-        out = np.any(SparseArray(data))
-        assert out
-
-        out = np.any(SparseArray(data, fill_value=pos))
-        assert out
-
-        data[1] = neg
-        out = np.any(SparseArray(data))
-        assert not out
-
-        out = np.any(SparseArray(data, fill_value=pos))
-        assert not out
-
-        msg = "the 'out' parameter is not supported"
-        with pytest.raises(ValueError, match=msg):
-            np.any(SparseArray(data), out=out)
+        result = arr.max(skipna=False)
+        assert result is pd.NaT
 
     def test_sum(self):
-        data = np.arange(10).astype(float)
-        out = SparseArray(data).sum()
-        assert out == 45.0
+        tdi = pd.TimedeltaIndex(["3h", "3h", "NaT", "2h", "5h", "4h"])
+        arr = tdi.array
 
-        data[5] = np.nan
-        out = SparseArray(data, fill_value=2).sum()
-        assert out == 40.0
+        result = arr.sum(skipna=True)
+        expected = Timedelta(hours=17)
+        assert isinstance(result, Timedelta)
+        assert result == expected
 
-        out = SparseArray(data, fill_value=np.nan).sum()
-        assert out == 40.0
+        result = tdi.sum(skipna=True)
+        assert isinstance(result, Timedelta)
+        assert result == expected
 
+        result = arr.sum(skipna=False)
+        assert result is pd.NaT
+
+        result = tdi.sum(skipna=False)
+        assert result is pd.NaT
+
+        result = arr.sum(min_count=9)
+        assert result is pd.NaT
+
+        result = tdi.sum(min_count=9)
+        assert result is pd.NaT
+
+        result = arr.sum(min_count=1)
+        assert isinstance(result, Timedelta)
+        assert result == expected
+
+        result = tdi.sum(min_count=1)
+        assert isinstance(result, Timedelta)
+        assert result == expected
+
+    def test_npsum(self):
+        # GH#25282, GH#25335 np.sum should return a Timedelta, not timedelta64
+        tdi = pd.TimedeltaIndex(["3h", "3h", "2h", "5h", "4h"])
+        arr = tdi.array
+
+        result = np.sum(tdi)
+        expected = Timedelta(hours=17)
+        assert isinstance(result, Timedelta)
+        assert result == expected
+
+        result = np.sum(arr)
+        assert isinstance(result, Timedelta)
+        assert result == expected
+
+    def test_sum_2d_skipna_false(self):
+        arr = np.arange(8).astype(np.int64).view("m8[s]").astype("m8[ns]").reshape(4, 2)
+        arr[-1, -1] = "Nat"
+
+        tda = TimedeltaArray._from_sequence(arr)
+
+        result = tda.sum(skipna=False)
+        assert result is pd.NaT
+
+        result = tda.sum(axis=0, skipna=False)
+        expected = pd.TimedeltaIndex([Timedelta(seconds=12), pd.NaT])._values
+        tm.assert_timedelta_array_equal(result, expected)
+
+        result = tda.sum(axis=1, skipna=False)
+        expected = pd.TimedeltaIndex(
+            [
+                Timedelta(seconds=1),
+                Timedelta(seconds=5),
+                Timedelta(seconds=9),
+                pd.NaT,
+            ]
+        )._values
+        tm.assert_timedelta_array_equal(result, expected)
+
+    # Adding a Timestamp makes this a test for DatetimeArray.std
     @pytest.mark.parametrize(
-        "arr",
-        [np.array([0, 1, np.nan, 1]), np.array([0, 1, 1])],
+        "add",
+        [
+            Timedelta(0),
+            pd.Timestamp("2021-01-01"),
+            pd.Timestamp("2021-01-01", tz="UTC"),
+            pd.Timestamp("2021-01-01", tz="Asia/Tokyo"),
+        ],
     )
-    @pytest.mark.parametrize("fill_value", [0, 1, np.nan])
-    @pytest.mark.parametrize("min_count, expected", [(3, 2), (4, np.nan)])
-    def test_sum_min_count(self, arr, fill_value, min_count, expected):
-        # GH#25777
-        sparray = SparseArray(arr, fill_value=fill_value)
-        result = sparray.sum(min_count=min_count)
-        if np.isnan(expected):
-            assert np.isnan(result)
-        else:
+    def test_std(self, add):
+        tdi = pd.TimedeltaIndex(["0h", "4h", "NaT", "4h", "0h", "2h"]) + add
+        arr = tdi.array
+
+        result = arr.std(skipna=True)
+        expected = Timedelta(hours=2)
+        assert isinstance(result, Timedelta)
+        assert result == expected
+
+        result = tdi.std(skipna=True)
+        assert isinstance(result, Timedelta)
+        assert result == expected
+
+        if getattr(arr, "tz", None) is None:
+            result = nanops.nanstd(np.asarray(arr), skipna=True)
+            assert isinstance(result, np.timedelta64)
             assert result == expected
 
-    def test_bool_sum_min_count(self):
-        spar_bool = SparseArray([False, True] * 5, dtype=np.bool_, fill_value=True)
-        res = spar_bool.sum(min_count=1)
-        assert res == 5
-        res = spar_bool.sum(min_count=11)
-        assert isna(res)
+        result = arr.std(skipna=False)
+        assert result is pd.NaT
 
-    def test_numpy_sum(self):
-        data = np.arange(10).astype(float)
-        out = np.sum(SparseArray(data))
-        assert out == 45.0
+        result = tdi.std(skipna=False)
+        assert result is pd.NaT
 
-        data[5] = np.nan
-        out = np.sum(SparseArray(data, fill_value=2))
-        assert out == 40.0
+        if getattr(arr, "tz", None) is None:
+            result = nanops.nanstd(np.asarray(arr), skipna=False)
+            assert isinstance(result, np.timedelta64)
+            assert np.isnat(result)
 
-        out = np.sum(SparseArray(data, fill_value=np.nan))
-        assert out == 40.0
+    def test_median(self):
+        tdi = pd.TimedeltaIndex(["0h", "3h", "NaT", "5h06m", "0h", "2h"])
+        arr = tdi.array
 
-        msg = "the 'dtype' parameter is not supported"
-        with pytest.raises(ValueError, match=msg):
-            np.sum(SparseArray(data), dtype=np.int64)
+        result = arr.median(skipna=True)
+        expected = Timedelta(hours=2)
+        assert isinstance(result, Timedelta)
+        assert result == expected
 
-        msg = "the 'out' parameter is not supported"
-        with pytest.raises(ValueError, match=msg):
-            np.sum(SparseArray(data), out=out)
+        result = tdi.median(skipna=True)
+        assert isinstance(result, Timedelta)
+        assert result == expected
+
+        result = arr.median(skipna=False)
+        assert result is pd.NaT
+
+        result = tdi.median(skipna=False)
+        assert result is pd.NaT
 
     def test_mean(self):
-        data = np.arange(10).astype(float)
-        out = SparseArray(data).mean()
-        assert out == 4.5
+        tdi = pd.TimedeltaIndex(["0h", "3h", "NaT", "5h06m", "0h", "2h"])
+        arr = tdi._data
 
-        data[5] = np.nan
-        out = SparseArray(data).mean()
-        assert out == 40.0 / 9
+        # manually verified result
+        expected = Timedelta(arr.dropna()._ndarray.mean())
 
-    def test_numpy_mean(self):
-        data = np.arange(10).astype(float)
-        out = np.mean(SparseArray(data))
-        assert out == 4.5
+        result = arr.mean()
+        assert result == expected
+        result = arr.mean(skipna=False)
+        assert result is pd.NaT
 
-        data[5] = np.nan
-        out = np.mean(SparseArray(data))
-        assert out == 40.0 / 9
+        result = arr.dropna().mean(skipna=False)
+        assert result == expected
 
-        msg = "the 'dtype' parameter is not supported"
-        with pytest.raises(ValueError, match=msg):
-            np.mean(SparseArray(data), dtype=np.int64)
+        result = arr.mean(axis=0)
+        assert result == expected
 
-        msg = "the 'out' parameter is not supported"
-        with pytest.raises(ValueError, match=msg):
-            np.mean(SparseArray(data), out=out)
+    def test_mean_2d(self):
+        tdi = pd.timedelta_range("14 days", periods=6)
+        tda = tdi._data.reshape(3, 2)
 
+        result = tda.mean(axis=0)
+        expected = tda[1]
+        tm.assert_timedelta_array_equal(result, expected)
 
-class TestMinMax:
-    @pytest.mark.parametrize(
-        "raw_data,max_expected,min_expected",
-        [
-            (np.arange(5.0), [4], [0]),
-            (-np.arange(5.0), [0], [-4]),
-            (np.array([0, 1, 2, np.nan, 4]), [4], [0]),
-            (np.array([np.nan] * 5), [np.nan], [np.nan]),
-            (np.array([]), [np.nan], [np.nan]),
-        ],
-    )
-    def test_nan_fill_value(self, raw_data, max_expected, min_expected):
-        arr = SparseArray(raw_data)
-        max_result = arr.max()
-        min_result = arr.min()
-        assert max_result in max_expected
-        assert min_result in min_expected
+        result = tda.mean(axis=1)
+        expected = tda[:, 0] + Timedelta(hours=12)
+        tm.assert_timedelta_array_equal(result, expected)
 
-        max_result = arr.max(skipna=False)
-        min_result = arr.min(skipna=False)
-        if np.isnan(raw_data).any():
-            assert np.isnan(max_result)
-            assert np.isnan(min_result)
-        else:
-            assert max_result in max_expected
-            assert min_result in min_expected
-
-    @pytest.mark.parametrize(
-        "fill_value,max_expected,min_expected",
-        [
-            (100, 100, 0),
-            (-100, 1, -100),
-        ],
-    )
-    def test_fill_value(self, fill_value, max_expected, min_expected):
-        arr = SparseArray(
-            np.array([fill_value, 0, 1]), dtype=SparseDtype("int", fill_value)
-        )
-        max_result = arr.max()
-        assert max_result == max_expected
-
-        min_result = arr.min()
-        assert min_result == min_expected
-
-    def test_only_fill_value(self):
-        fv = 100
-        arr = SparseArray(np.array([fv, fv, fv]), dtype=SparseDtype("int", fv))
-        assert len(arr._valid_sp_values) == 0
-
-        assert arr.max() == fv
-        assert arr.min() == fv
-        assert arr.max(skipna=False) == fv
-        assert arr.min(skipna=False) == fv
-
-    @pytest.mark.parametrize("func", ["min", "max"])
-    @pytest.mark.parametrize("data", [np.array([]), np.array([np.nan, np.nan])])
-    @pytest.mark.parametrize(
-        "dtype,expected",
-        [
-            (SparseDtype(np.float64, np.nan), np.nan),
-            (SparseDtype(np.float64, 5.0), np.nan),
-            (SparseDtype("datetime64[ns]", NaT), NaT),
-            (SparseDtype("datetime64[ns]", Timestamp("2018-05-05")), NaT),
-        ],
-    )
-    def test_na_value_if_no_valid_values(self, func, data, dtype, expected):
-        arr = SparseArray(data, dtype=dtype)
-        result = getattr(arr, func)()
-        if expected is NaT:
-            # TODO: pin down whether we wrap datetime64("NaT")
-            assert result is NaT or np.isnat(result)
-        else:
-            assert np.isnan(result)
-
-
-class TestArgmaxArgmin:
-    @pytest.mark.parametrize(
-        "arr,argmax_expected,argmin_expected",
-        [
-            (SparseArray([1, 2, 0, 1, 2]), 1, 2),
-            (SparseArray([-1, -2, 0, -1, -2]), 2, 1),
-            (SparseArray([np.nan, 1, 0, 0, np.nan, -1]), 1, 5),
-            (SparseArray([np.nan, 1, 0, 0, np.nan, 2]), 5, 2),
-            (SparseArray([np.nan, 1, 0, 0, np.nan, 2], fill_value=-1), 5, 2),
-            (SparseArray([np.nan, 1, 0, 0, np.nan, 2], fill_value=0), 5, 2),
-            (SparseArray([np.nan, 1, 0, 0, np.nan, 2], fill_value=1), 5, 2),
-            (SparseArray([np.nan, 1, 0, 0, np.nan, 2], fill_value=2), 5, 2),
-            (SparseArray([np.nan, 1, 0, 0, np.nan, 2], fill_value=3), 5, 2),
-            (SparseArray([0] * 10 + [-1], fill_value=0), 0, 10),
-            (SparseArray([0] * 10 + [-1], fill_value=-1), 0, 10),
-            (SparseArray([0] * 10 + [-1], fill_value=1), 0, 10),
-            (SparseArray([-1] + [0] * 10, fill_value=0), 1, 0),
-            (SparseArray([1] + [0] * 10, fill_value=0), 0, 1),
-            (SparseArray([-1] + [0] * 10, fill_value=-1), 1, 0),
-            (SparseArray([1] + [0] * 10, fill_value=1), 0, 1),
-        ],
-    )
-    def test_argmax_argmin(self, arr, argmax_expected, argmin_expected):
-        argmax_result = arr.argmax()
-        argmin_result = arr.argmin()
-        assert argmax_result == argmax_expected
-        assert argmin_result == argmin_expected
-
-    @pytest.mark.parametrize(
-        "arr,method",
-        [(SparseArray([]), "argmax"), (SparseArray([]), "argmin")],
-    )
-    def test_empty_array(self, arr, method):
-        msg = f"attempt to get {method} of an empty sequence"
-        with pytest.raises(ValueError, match=msg):
-            arr.argmax() if method == "argmax" else arr.argmin()
+        result = tda.mean(axis=None)
+        expected = tdi.mean()
+        assert result == expected

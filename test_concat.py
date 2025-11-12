@@ -1,69 +1,73 @@
 import numpy as np
 import pytest
 
+from pandas.compat import HAS_PYARROW
+
+from pandas.core.dtypes.cast import find_common_type
+
 import pandas as pd
 import pandas._testing as tm
+from pandas.util.version import Version
 
 
 @pytest.mark.parametrize(
     "to_concat_dtypes, result_dtype",
     [
-        (["Int64", "Int64"], "Int64"),
-        (["UInt64", "UInt64"], "UInt64"),
-        (["Int8", "Int8"], "Int8"),
-        (["Int8", "Int16"], "Int16"),
-        (["UInt8", "Int8"], "Int16"),
-        (["Int32", "UInt32"], "Int64"),
-        (["Int64", "UInt64"], "Float64"),
-        (["Int64", "boolean"], "object"),
-        (["UInt8", "boolean"], "object"),
+        # same types
+        ([("pyarrow", pd.NA), ("pyarrow", pd.NA)], ("pyarrow", pd.NA)),
+        ([("pyarrow", np.nan), ("pyarrow", np.nan)], ("pyarrow", np.nan)),
+        ([("python", pd.NA), ("python", pd.NA)], ("python", pd.NA)),
+        ([("python", np.nan), ("python", np.nan)], ("python", np.nan)),
+        # pyarrow preference
+        ([("pyarrow", pd.NA), ("python", pd.NA)], ("pyarrow", pd.NA)),
+        # NA preference
+        ([("python", pd.NA), ("python", np.nan)], ("python", pd.NA)),
     ],
 )
-def test_concat_series(to_concat_dtypes, result_dtype):
-    # we expect the same dtypes as we would get with non-masked inputs,
-    #  just masked where available.
+def test_concat_series(request, to_concat_dtypes, result_dtype):
+    if any(storage == "pyarrow" for storage, _ in to_concat_dtypes) and not HAS_PYARROW:
+        pytest.skip("Could not import 'pyarrow'")
 
-    result = pd.concat([pd.Series([0, 1, pd.NA], dtype=t) for t in to_concat_dtypes])
-    expected = pd.concat([pd.Series([0, 1, pd.NA], dtype=object)] * 2).astype(
-        result_dtype
+    ser_list = [
+        pd.Series(["a", "b", None], dtype=pd.StringDtype(storage, na_value))
+        for storage, na_value in to_concat_dtypes
+    ]
+
+    result = pd.concat(ser_list, ignore_index=True)
+    expected = pd.Series(
+        ["a", "b", None, "a", "b", None], dtype=pd.StringDtype(*result_dtype)
     )
     tm.assert_series_equal(result, expected)
 
     # order doesn't matter for result
+    result = pd.concat(ser_list[::1], ignore_index=True)
+    tm.assert_series_equal(result, expected)
+
+
+def test_concat_with_object(string_dtype_arguments):
+    # _get_common_dtype cannot inspect values, so object dtype with strings still
+    # results in object dtype
     result = pd.concat(
-        [pd.Series([0, 1, pd.NA], dtype=t) for t in to_concat_dtypes[::-1]]
+        [
+            pd.Series(["a", "b", None], dtype=pd.StringDtype(*string_dtype_arguments)),
+            pd.Series(["a", "b", None], dtype=object),
+        ]
     )
-    expected = pd.concat([pd.Series([0, 1, pd.NA], dtype=object)] * 2).astype(
-        result_dtype
-    )
-    tm.assert_series_equal(result, expected)
+    assert result.dtype == np.dtype("object")
 
 
-@pytest.mark.parametrize(
-    "to_concat_dtypes, result_dtype",
-    [
-        (["Int64", "int64"], "Int64"),
-        (["UInt64", "uint64"], "UInt64"),
-        (["Int8", "int8"], "Int8"),
-        (["Int8", "int16"], "Int16"),
-        (["UInt8", "int8"], "Int16"),
-        (["Int32", "uint32"], "Int64"),
-        (["Int64", "uint64"], "Float64"),
-        (["Int64", "bool"], "object"),
-        (["UInt8", "bool"], "object"),
-    ],
-)
-def test_concat_series_with_numpy(to_concat_dtypes, result_dtype):
-    # we expect the same dtypes as we would get with non-masked inputs,
-    #  just masked where available.
+def test_concat_with_numpy(string_dtype_arguments):
+    # common type with a numpy string dtype always preserves the pandas string dtype
+    dtype = pd.StringDtype(*string_dtype_arguments)
+    assert find_common_type([dtype, np.dtype("U")]) == dtype
+    assert find_common_type([np.dtype("U"), dtype]) == dtype
+    assert find_common_type([dtype, np.dtype("U10")]) == dtype
+    assert find_common_type([np.dtype("U10"), dtype]) == dtype
 
-    s1 = pd.Series([0, 1, pd.NA], dtype=to_concat_dtypes[0])
-    s2 = pd.Series(np.array([0, 1], dtype=to_concat_dtypes[1]))
-    result = pd.concat([s1, s2], ignore_index=True)
-    expected = pd.Series([0, 1, pd.NA, 0, 1], dtype=object).astype(result_dtype)
-    tm.assert_series_equal(result, expected)
+    # with any other numpy dtype -> object
+    assert find_common_type([dtype, np.dtype("S")]) == np.dtype("object")
+    assert find_common_type([dtype, np.dtype("int64")]) == np.dtype("object")
 
-    # order doesn't matter for result
-    result = pd.concat([s2, s1], ignore_index=True)
-    expected = pd.Series([0, 1, 0, 1, pd.NA], dtype=object).astype(result_dtype)
-    tm.assert_series_equal(result, expected)
+    if Version(np.__version__) >= Version("2"):
+        assert find_common_type([dtype, np.dtypes.StringDType()]) == dtype
+        assert find_common_type([np.dtypes.StringDType(), dtype]) == dtype
