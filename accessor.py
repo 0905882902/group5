@@ -1,340 +1,414 @@
-"""
-
-accessor.py contains base classes for implementing accessor properties
-that can be mixed into or pinned onto other pandas classes.
-
-"""
+"""Sparse accessor"""
 from __future__ import annotations
 
-from typing import (
-    Callable,
-    final,
+from typing import TYPE_CHECKING
+
+import numpy as np
+
+from pandas.compat._optional import import_optional_dependency
+
+from pandas.core.dtypes.cast import find_common_type
+from pandas.core.dtypes.dtypes import SparseDtype
+
+from pandas.core.accessor import (
+    PandasDelegate,
+    delegate_names,
 )
-import warnings
+from pandas.core.arrays.sparse.array import SparseArray
 
-from pandas.util._decorators import doc
-from pandas.util._exceptions import find_stack_level
-
-
-class DirNamesMixin:
-    _accessors: set[str] = set()
-    _hidden_attrs: frozenset[str] = frozenset()
-
-    @final
-    def _dir_deletions(self) -> set[str]:
-        """
-        Delete unwanted __dir__ for this object.
-        """
-        return self._accessors | self._hidden_attrs
-
-    def _dir_additions(self) -> set[str]:
-        """
-        Add additional __dir__ for this object.
-        """
-        return {accessor for accessor in self._accessors if hasattr(self, accessor)}
-
-    def __dir__(self) -> list[str]:
-        """
-        Provide method name lookup and completion.
-
-        Notes
-        -----
-        Only provide 'public' methods.
-        """
-        rv = set(super().__dir__())
-        rv = (rv - self._dir_deletions()) | self._dir_additions()
-        return sorted(rv)
+if TYPE_CHECKING:
+    from pandas import (
+        DataFrame,
+        Series,
+    )
 
 
-class PandasDelegate:
+class BaseAccessor:
+    _validation_msg = "Can only use the '.sparse' accessor with Sparse data."
+
+    def __init__(self, data=None) -> None:
+        self._parent = data
+        self._validate(data)
+
+    def _validate(self, data):
+        raise NotImplementedError
+
+
+@delegate_names(
+    SparseArray, ["npoints", "density", "fill_value", "sp_values"], typ="property"
+)
+class SparseAccessor(BaseAccessor, PandasDelegate):
     """
-    Abstract base class for delegating methods/properties.
+    Accessor for SparseSparse from other sparse matrix data types.
+
+    Examples
+    --------
+    >>> ser = pd.Series([0, 0, 2, 2, 2], dtype="Sparse[int]")
+    >>> ser.sparse.density
+    0.6
+    >>> ser.sparse.sp_values
+    array([2, 2, 2])
     """
+
+    def _validate(self, data):
+        if not isinstance(data.dtype, SparseDtype):
+            raise AttributeError(self._validation_msg)
 
     def _delegate_property_get(self, name: str, *args, **kwargs):
-        raise TypeError(f"You cannot access the property {name}")
-
-    def _delegate_property_set(self, name: str, value, *args, **kwargs):
-        raise TypeError(f"The property {name} cannot be set")
+        return getattr(self._parent.array, name)
 
     def _delegate_method(self, name: str, *args, **kwargs):
-        raise TypeError(f"You cannot call method {name}")
+        if name == "from_coo":
+            return self.from_coo(*args, **kwargs)
+        elif name == "to_coo":
+            return self.to_coo(*args, **kwargs)
+        else:
+            raise ValueError
 
     @classmethod
-    def _add_delegate_accessors(
-        cls,
-        delegate,
-        accessors: list[str],
-        typ: str,
-        overwrite: bool = False,
-        accessor_mapping: Callable[[str], str] = lambda x: x,
-        raise_on_missing: bool = True,
-    ) -> None:
+    def from_coo(cls, A, dense_index: bool = False) -> Series:
         """
-        Add accessors to cls from the delegate class.
+        Create a Series with sparse values from a scipy.sparse.coo_matrix.
 
         Parameters
         ----------
-        cls
-            Class to add the methods/properties to.
-        delegate
-            Class to get methods/properties and doc-strings.
-        accessors : list of str
-            List of accessors to add.
-        typ : {'property', 'method'}
-        overwrite : bool, default False
-            Overwrite the method/property in the target class if it exists.
-        accessor_mapping: Callable, default lambda x: x
-            Callable to map the delegate's function to the cls' function.
-        raise_on_missing: bool, default True
-            Raise if an accessor does not exist on delegate.
-            False skips the missing accessor.
+        A : scipy.sparse.coo_matrix
+        dense_index : bool, default False
+            If False (default), the index consists of only the
+            coords of the non-null entries of the original coo_matrix.
+            If True, the index consists of the full sorted
+            (row, col) coordinates of the coo_matrix.
+
+        Returns
+        -------
+        s : Series
+            A Series with sparse values.
+
+        Examples
+        --------
+        >>> from scipy import sparse
+
+        >>> A = sparse.coo_matrix(
+        ...     ([3.0, 1.0, 2.0], ([1, 0, 0], [0, 2, 3])), shape=(3, 4)
+        ... )
+        >>> A
+        <COOrdinate sparse matrix of dtype 'float64'
+            with 3 stored elements and shape (3, 4)>
+
+        >>> A.todense()
+        matrix([[0., 0., 1., 2.],
+        [3., 0., 0., 0.],
+        [0., 0., 0., 0.]])
+
+        >>> ss = pd.Series.sparse.from_coo(A)
+        >>> ss
+        0  2    1.0
+           3    2.0
+        1  0    3.0
+        dtype: Sparse[float64, nan]
         """
+        from pandas import Series
+        from pandas.core.arrays.sparse.scipy_sparse import coo_to_sparse_series
 
-        def _create_delegator_property(name: str):
-            def _getter(self):
-                return self._delegate_property_get(name)
+        result = coo_to_sparse_series(A, dense_index=dense_index)
+        result = Series(result.array, index=result.index, copy=False)
 
-            def _setter(self, new_values):
-                return self._delegate_property_set(name, new_values)
+        return result
 
-            _getter.__name__ = name
-            _setter.__name__ = name
+    def to_coo(self, row_levels=(0,), column_levels=(1,), sort_labels: bool = False):
+        """
+        Create a scipy.sparse.coo_matrix from a Series with MultiIndex.
 
-            return property(
-                fget=_getter,
-                fset=_setter,
-                doc=getattr(delegate, accessor_mapping(name)).__doc__,
-            )
+        Use row_levels and column_levels to determine the row and column
+        coordinates respectively. row_levels and column_levels are the names
+        (labels) or numbers of the levels. {row_levels, column_levels} must be
+        a partition of the MultiIndex level names (or numbers).
 
-        def _create_delegator_method(name: str):
-            def f(self, *args, **kwargs):
-                return self._delegate_method(name, *args, **kwargs)
+        Parameters
+        ----------
+        row_levels : tuple/list
+        column_levels : tuple/list
+        sort_labels : bool, default False
+            Sort the row and column labels before forming the sparse matrix.
+            When `row_levels` and/or `column_levels` refer to a single level,
+            set to `True` for a faster execution.
 
-            f.__name__ = name
-            f.__doc__ = getattr(delegate, accessor_mapping(name)).__doc__
+        Returns
+        -------
+        y : scipy.sparse.coo_matrix
+        rows : list (row labels)
+        columns : list (column labels)
 
-            return f
+        Examples
+        --------
+        >>> s = pd.Series([3.0, np.nan, 1.0, 3.0, np.nan, np.nan])
+        >>> s.index = pd.MultiIndex.from_tuples(
+        ...     [
+        ...         (1, 2, "a", 0),
+        ...         (1, 2, "a", 1),
+        ...         (1, 1, "b", 0),
+        ...         (1, 1, "b", 1),
+        ...         (2, 1, "b", 0),
+        ...         (2, 1, "b", 1)
+        ...     ],
+        ...     names=["A", "B", "C", "D"],
+        ... )
+        >>> s
+        A  B  C  D
+        1  2  a  0    3.0
+                 1    NaN
+           1  b  0    1.0
+                 1    3.0
+        2  1  b  0    NaN
+                 1    NaN
+        dtype: float64
 
-        for name in accessors:
-            if (
-                not raise_on_missing
-                and getattr(delegate, accessor_mapping(name), None) is None
-            ):
-                continue
+        >>> ss = s.astype("Sparse")
+        >>> ss
+        A  B  C  D
+        1  2  a  0    3.0
+                 1    NaN
+           1  b  0    1.0
+                 1    3.0
+        2  1  b  0    NaN
+                 1    NaN
+        dtype: Sparse[float64, nan]
 
-            if typ == "property":
-                f = _create_delegator_property(name)
-            else:
-                f = _create_delegator_method(name)
+        >>> A, rows, columns = ss.sparse.to_coo(
+        ...     row_levels=["A", "B"], column_levels=["C", "D"], sort_labels=True
+        ... )
+        >>> A
+        <COOrdinate sparse matrix of dtype 'float64'
+            with 3 stored elements and shape (3, 4)>
+        >>> A.todense()
+        matrix([[0., 0., 1., 3.],
+        [3., 0., 0., 0.],
+        [0., 0., 0., 0.]])
 
-            # don't overwrite existing methods/properties
-            if overwrite or not hasattr(cls, name):
-                setattr(cls, name, f)
+        >>> rows
+        [(1, 1), (1, 2), (2, 1)]
+        >>> columns
+        [('a', 0), ('a', 1), ('b', 0), ('b', 1)]
+        """
+        from pandas.core.arrays.sparse.scipy_sparse import sparse_series_to_coo
 
-
-def delegate_names(
-    delegate,
-    accessors: list[str],
-    typ: str,
-    overwrite: bool = False,
-    accessor_mapping: Callable[[str], str] = lambda x: x,
-    raise_on_missing: bool = True,
-):
-    """
-    Add delegated names to a class using a class decorator.  This provides
-    an alternative usage to directly calling `_add_delegate_accessors`
-    below a class definition.
-
-    Parameters
-    ----------
-    delegate : object
-        The class to get methods/properties & doc-strings.
-    accessors : Sequence[str]
-        List of accessor to add.
-    typ : {'property', 'method'}
-    overwrite : bool, default False
-       Overwrite the method/property in the target class if it exists.
-    accessor_mapping: Callable, default lambda x: x
-        Callable to map the delegate's function to the cls' function.
-    raise_on_missing: bool, default True
-        Raise if an accessor does not exist on delegate.
-        False skips the missing accessor.
-
-    Returns
-    -------
-    callable
-        A class decorator.
-
-    Examples
-    --------
-    @delegate_names(Categorical, ["categories", "ordered"], "property")
-    class CategoricalAccessor(PandasDelegate):
-        [...]
-    """
-
-    def add_delegate_accessors(cls):
-        cls._add_delegate_accessors(
-            delegate,
-            accessors,
-            typ,
-            overwrite=overwrite,
-            accessor_mapping=accessor_mapping,
-            raise_on_missing=raise_on_missing,
+        A, rows, columns = sparse_series_to_coo(
+            self._parent, row_levels, column_levels, sort_labels=sort_labels
         )
-        return cls
+        return A, rows, columns
 
-    return add_delegate_accessors
+    def to_dense(self) -> Series:
+        """
+        Convert a Series from sparse values to dense.
+
+        Returns
+        -------
+        Series:
+            A Series with the same values, stored as a dense array.
+
+        Examples
+        --------
+        >>> series = pd.Series(pd.arrays.SparseArray([0, 1, 0]))
+        >>> series
+        0    0
+        1    1
+        2    0
+        dtype: Sparse[int64, 0]
+
+        >>> series.sparse.to_dense()
+        0    0
+        1    1
+        2    0
+        dtype: int64
+        """
+        from pandas import Series
+
+        return Series(
+            self._parent.array.to_dense(),
+            index=self._parent.index,
+            name=self._parent.name,
+            copy=False,
+        )
 
 
-# Ported with modifications from xarray; licence at LICENSES/XARRAY_LICENSE
-# https://github.com/pydata/xarray/blob/master/xarray/core/extensions.py
-# 1. We don't need to catch and re-raise AttributeErrors as RuntimeErrors
-# 2. We use a UserWarning instead of a custom Warning
-
-
-class CachedAccessor:
+class SparseFrameAccessor(BaseAccessor, PandasDelegate):
     """
-    Custom property-like object.
-
-    A descriptor for caching accessors.
-
-    Parameters
-    ----------
-    name : str
-        Namespace that will be accessed under, e.g. ``df.foo``.
-    accessor : cls
-        Class with the extension methods.
-
-    Notes
-    -----
-    For accessor, The class's __init__ method assumes that one of
-    ``Series``, ``DataFrame`` or ``Index`` as the
-    single argument ``data``.
-    """
-
-    def __init__(self, name: str, accessor) -> None:
-        self._name = name
-        self._accessor = accessor
-
-    def __get__(self, obj, cls):
-        if obj is None:
-            # we're accessing the attribute of the class, i.e., Dataset.geo
-            return self._accessor
-        accessor_obj = self._accessor(obj)
-        # Replace the property with the accessor object. Inspired by:
-        # https://www.pydanny.com/cached-property.html
-        # We need to use object.__setattr__ because we overwrite __setattr__ on
-        # NDFrame
-        object.__setattr__(obj, self._name, accessor_obj)
-        return accessor_obj
-
-
-@doc(klass="", others="")
-def _register_accessor(name: str, cls):
-    """
-    Register a custom accessor on {klass} objects.
-
-    Parameters
-    ----------
-    name : str
-        Name under which the accessor should be registered. A warning is issued
-        if this name conflicts with a preexisting attribute.
-
-    Returns
-    -------
-    callable
-        A class decorator.
-
-    See Also
-    --------
-    register_dataframe_accessor : Register a custom accessor on DataFrame objects.
-    register_series_accessor : Register a custom accessor on Series objects.
-    register_index_accessor : Register a custom accessor on Index objects.
-
-    Notes
-    -----
-    When accessed, your accessor will be initialized with the pandas object
-    the user is interacting with. So the signature must be
-
-    .. code-block:: python
-
-        def __init__(self, pandas_object):  # noqa: E999
-            ...
-
-    For consistency with pandas methods, you should raise an ``AttributeError``
-    if the data passed to your accessor has an incorrect dtype.
-
-    >>> pd.Series(['a', 'b']).dt
-    Traceback (most recent call last):
-    ...
-    AttributeError: Can only use .dt accessor with datetimelike values
+    DataFrame accessor for sparse data.
 
     Examples
     --------
-    In your library code::
-
-        import pandas as pd
-
-        @pd.api.extensions.register_dataframe_accessor("geo")
-        class GeoAccessor:
-            def __init__(self, pandas_obj):
-                self._obj = pandas_obj
-
-            @property
-            def center(self):
-                # return the geographic center point of this DataFrame
-                lat = self._obj.latitude
-                lon = self._obj.longitude
-                return (float(lon.mean()), float(lat.mean()))
-
-            def plot(self):
-                # plot this array's data on a map, e.g., using Cartopy
-                pass
-
-    Back in an interactive IPython session:
-
-        .. code-block:: ipython
-
-            In [1]: ds = pd.DataFrame({{"longitude": np.linspace(0, 10),
-               ...:                    "latitude": np.linspace(0, 20)}})
-            In [2]: ds.geo.center
-            Out[2]: (5.0, 10.0)
-            In [3]: ds.geo.plot()  # plots data on a map
+    >>> df = pd.DataFrame({"a": [1, 2, 0, 0],
+    ...                   "b": [3, 0, 0, 4]}, dtype="Sparse[int]")
+    >>> df.sparse.density
+    0.5
     """
 
-    def decorator(accessor):
-        if hasattr(cls, name):
-            warnings.warn(
-                f"registration of accessor {repr(accessor)} under name "
-                f"{repr(name)} for type {repr(cls)} is overriding a preexisting "
-                f"attribute with the same name.",
-                UserWarning,
-                stacklevel=find_stack_level(),
-            )
-        setattr(cls, name, CachedAccessor(name, accessor))
-        cls._accessors.add(name)
-        return accessor
+    def _validate(self, data):
+        dtypes = data.dtypes
+        if not all(isinstance(t, SparseDtype) for t in dtypes):
+            raise AttributeError(self._validation_msg)
 
-    return decorator
+    @classmethod
+    def from_spmatrix(cls, data, index=None, columns=None) -> DataFrame:
+        """
+        Create a new DataFrame from a scipy sparse matrix.
 
+        Parameters
+        ----------
+        data : scipy.sparse.spmatrix
+            Must be convertible to csc format.
+        index, columns : Index, optional
+            Row and column labels to use for the resulting DataFrame.
+            Defaults to a RangeIndex.
 
-@doc(_register_accessor, klass="DataFrame")
-def register_dataframe_accessor(name: str):
-    from pandas import DataFrame
+        Returns
+        -------
+        DataFrame
+            Each column of the DataFrame is stored as a
+            :class:`arrays.SparseArray`.
 
-    return _register_accessor(name, DataFrame)
+        Examples
+        --------
+        >>> import scipy.sparse
+        >>> mat = scipy.sparse.eye(3, dtype=float)
+        >>> pd.DataFrame.sparse.from_spmatrix(mat)
+             0    1    2
+        0  1.0    0    0
+        1    0  1.0    0
+        2    0    0  1.0
+        """
+        from pandas._libs.sparse import IntIndex
 
+        from pandas import DataFrame
 
-@doc(_register_accessor, klass="Series")
-def register_series_accessor(name: str):
-    from pandas import Series
+        data = data.tocsc()
+        index, columns = cls._prep_index(data, index, columns)
+        n_rows, n_columns = data.shape
+        # We need to make sure indices are sorted, as we create
+        # IntIndex with no input validation (i.e. check_integrity=False ).
+        # Indices may already be sorted in scipy in which case this adds
+        # a small overhead.
+        data.sort_indices()
+        indices = data.indices
+        indptr = data.indptr
+        array_data = data.data
+        dtype = SparseDtype(array_data.dtype, 0)
+        arrays = []
+        for i in range(n_columns):
+            sl = slice(indptr[i], indptr[i + 1])
+            idx = IntIndex(n_rows, indices[sl], check_integrity=False)
+            arr = SparseArray._simple_new(array_data[sl], idx, dtype)
+            arrays.append(arr)
+        return DataFrame._from_arrays(
+            arrays, columns=columns, index=index, verify_integrity=False
+        )
 
-    return _register_accessor(name, Series)
+    def to_dense(self) -> DataFrame:
+        """
+        Convert a DataFrame with sparse values to dense.
 
+        Returns
+        -------
+        DataFrame
+            A DataFrame with the same values stored as dense arrays.
 
-@doc(_register_accessor, klass="Index")
-def register_index_accessor(name: str):
-    from pandas import Index
+        Examples
+        --------
+        >>> df = pd.DataFrame({"A": pd.arrays.SparseArray([0, 1, 0])})
+        >>> df.sparse.to_dense()
+           A
+        0  0
+        1  1
+        2  0
+        """
+        from pandas import DataFrame
 
-    return _register_accessor(name, Index)
+        data = {k: v.array.to_dense() for k, v in self._parent.items()}
+        return DataFrame(data, index=self._parent.index, columns=self._parent.columns)
+
+    def to_coo(self):
+        """
+        Return the contents of the frame as a sparse SciPy COO matrix.
+
+        Returns
+        -------
+        scipy.sparse.spmatrix
+            If the caller is heterogeneous and contains booleans or objects,
+            the result will be of dtype=object. See Notes.
+
+        Notes
+        -----
+        The dtype will be the lowest-common-denominator type (implicit
+        upcasting); that is to say if the dtypes (even of numeric types)
+        are mixed, the one that accommodates all will be chosen.
+
+        e.g. If the dtypes are float16 and float32, dtype will be upcast to
+        float32. By numpy.find_common_type convention, mixing int64 and
+        and uint64 will result in a float64 dtype.
+
+        Examples
+        --------
+        >>> df = pd.DataFrame({"A": pd.arrays.SparseArray([0, 1, 0, 1])})
+        >>> df.sparse.to_coo()
+        <COOrdinate sparse matrix of dtype 'int64'
+            with 2 stored elements and shape (4, 1)>
+        """
+        import_optional_dependency("scipy")
+        from scipy.sparse import coo_matrix
+
+        dtype = find_common_type(self._parent.dtypes.to_list())
+        if isinstance(dtype, SparseDtype):
+            dtype = dtype.subtype
+
+        cols, rows, data = [], [], []
+        for col, (_, ser) in enumerate(self._parent.items()):
+            sp_arr = ser.array
+            if sp_arr.fill_value != 0:
+                raise ValueError("fill value must be 0 when converting to COO matrix")
+
+            row = sp_arr.sp_index.indices
+            cols.append(np.repeat(col, len(row)))
+            rows.append(row)
+            data.append(sp_arr.sp_values.astype(dtype, copy=False))
+
+        cols = np.concatenate(cols)
+        rows = np.concatenate(rows)
+        data = np.concatenate(data)
+        return coo_matrix((data, (rows, cols)), shape=self._parent.shape)
+
+    @property
+    def density(self) -> float:
+        """
+        Ratio of non-sparse points to total (dense) data points.
+
+        Examples
+        --------
+        >>> df = pd.DataFrame({"A": pd.arrays.SparseArray([0, 1, 0, 1])})
+        >>> df.sparse.density
+        0.5
+        """
+        tmp = np.mean([column.array.density for _, column in self._parent.items()])
+        return tmp
+
+    @staticmethod
+    def _prep_index(data, index, columns):
+        from pandas.core.indexes.api import (
+            default_index,
+            ensure_index,
+        )
+
+        N, K = data.shape
+        if index is None:
+            index = default_index(N)
+        else:
+            index = ensure_index(index)
+        if columns is None:
+            columns = default_index(K)
+        else:
+            columns = ensure_index(columns)
+
+        if len(columns) != K:
+            raise ValueError(f"Column length mismatch: {len(columns)} vs. {K}")
+        if len(index) != N:
+            raise ValueError(f"Index length mismatch: {len(index)} vs. {N}")
+        return index, columns
