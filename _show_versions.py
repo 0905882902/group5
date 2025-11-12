@@ -1,57 +1,36 @@
 """
-Utility methods to print system info for debugging
-
-adapted from :func:`pandas.show_versions`
+Utility method which prints system info to help with debugging,
+and filing issues on GitHub.
+Adapted from :func:`sklearn.show_versions`,
+which was adapted from :func:`pandas.show_versions`
 """
-# License: BSD 3 clause
 
-import platform
+# Author: Alexander L. Hayes <hayesall@iu.edu>
+# License: MIT
+
 import sys
 import importlib
-
-from ._openmp_helpers import _openmp_parallelism_enabled
-
-
-def _get_sys_info():
-    """System information
-
-    Returns
-    -------
-    sys_info : dict
-        system and Python version information
-
-    """
-    python = sys.version.replace("\n", " ")
-
-    blob = [
-        ("python", python),
-        ("executable", sys.executable),
-        ("machine", platform.platform()),
-    ]
-
-    return dict(blob)
 
 
 def _get_deps_info():
     """Overview of the installed version of main dependencies
-
     Returns
     -------
     deps_info: dict
         version information on relevant Python libraries
-
     """
     deps = [
         "pip",
         "setuptools",
+        "imblearn",
         "sklearn",
         "numpy",
         "scipy",
         "Cython",
         "pandas",
-        "matplotlib",
+        "keras",
+        "tensorflow",
         "joblib",
-        "threadpoolctl",
     ]
 
     def get_version(module):
@@ -73,25 +52,49 @@ def _get_deps_info():
     return deps_info
 
 
-def show_versions():
-    """Print useful debugging information"
+def show_versions(github=False):
+    """Print debugging information.
 
-    .. versionadded:: 0.20
+    .. versionadded:: 0.5
+
+    Parameters
+    ----------
+    github : bool,
+        If true, wrap system info with GitHub markup.
     """
 
-    sys_info = _get_sys_info()
-    deps_info = _get_deps_info()
+    from sklearn.utils._show_versions import _get_sys_info
 
-    print("\nSystem:")
-    for k, stat in sys_info.items():
-        print("{k:>10}: {stat}".format(k=k, stat=stat))
-
-    print("\nPython dependencies:")
-    for k, stat in deps_info.items():
-        print("{k:>13}: {stat}".format(k=k, stat=stat))
-
-    print(
-        "\n{k}: {stat}".format(
-            k="Built with OpenMP", stat=_openmp_parallelism_enabled()
-        )
+    _sys_info = _get_sys_info()
+    _deps_info = _get_deps_info()
+    _github_markup = (
+        "<details>"
+        "<summary>System, Dependency Information</summary>\n\n"
+        "**System Information**\n\n"
+        "{0}\n"
+        "**Python Dependencies**\n\n"
+        "{1}\n"
+        "</details>"
     )
+
+    if github:
+
+        _sys_markup = ""
+        _deps_markup = ""
+
+        for k, stat in _sys_info.items():
+            _sys_markup += f"* {k:<10}: `{stat}`\n"
+        for k, stat in _deps_info.items():
+            _deps_markup += f"* {k:<10}: `{stat}`\n"
+
+        print(_github_markup.format(_sys_markup, _deps_markup))
+
+    else:
+
+        print("\nSystem:")
+        for k, stat in _sys_info.items():
+            print(f"{k:>11}: {stat}")
+
+        print("\nPython dependencies:")
+        for k, stat in _deps_info.items():
+            print(f"{k:>11}: {stat}")
