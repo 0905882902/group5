@@ -1,22 +1,32 @@
-from os.path import join
-from io import BufferedReader, BytesIO
+import pytest
 
-from numpy.compat import isfileobj
-from numpy.testing import assert_
-from numpy.testing import tempdir
+from pandas.compat._optional import VERSIONS
+
+import pandas as pd
+from pandas.core.computation import expr
+from pandas.core.computation.engines import ENGINES
+from pandas.util.version import Version
 
 
-def test_isfileobj():
-    with tempdir(prefix="numpy_test_compat_") as folder:
-        filename = join(folder, 'a.bin')
+def test_compat():
+    # test we have compat with our version of numexpr
 
-        with open(filename, 'wb') as f:
-            assert_(isfileobj(f))
+    from pandas.core.computation.check import NUMEXPR_INSTALLED
 
-        with open(filename, 'ab') as f:
-            assert_(isfileobj(f))
+    ne = pytest.importorskip("numexpr")
 
-        with open(filename, 'rb') as f:
-            assert_(isfileobj(f))
+    ver = ne.__version__
+    if Version(ver) < Version(VERSIONS["numexpr"]):
+        assert not NUMEXPR_INSTALLED
+    else:
+        assert NUMEXPR_INSTALLED
 
-        assert_(isfileobj(BufferedReader(BytesIO())) is False)
+
+@pytest.mark.parametrize("engine", ENGINES)
+@pytest.mark.parametrize("parser", expr.PARSERS)
+def test_invalid_numexpr_version(engine, parser):
+    if engine == "numexpr":
+        pytest.importorskip("numexpr")
+    a, b = 1, 2  # noqa: F841
+    res = pd.eval("a + b", engine=engine, parser=parser)
+    assert res == 3

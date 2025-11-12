@@ -1,100 +1,72 @@
+import itertools
+
 import numpy as np
 import pytest
 
 from pandas import (
     DataFrame,
-    Index,
-    NaT,
-    date_range,
+    Series,
+    notna,
 )
 
 
-@pytest.fixture
-def datetime_frame() -> DataFrame:
+def create_series():
+    return [
+        Series(dtype=np.float64, name="a"),
+        Series([np.nan] * 5),
+        Series([1.0] * 5),
+        Series(range(5, 0, -1)),
+        Series(range(5)),
+        Series([np.nan, 1.0, np.nan, 1.0, 1.0]),
+        Series([np.nan, 1.0, np.nan, 2.0, 3.0]),
+        Series([np.nan, 1.0, np.nan, 3.0, 2.0]),
+    ]
+
+
+def create_dataframes():
+    return [
+        DataFrame(columns=["a", "a"]),
+        DataFrame(np.arange(15).reshape((5, 3)), columns=["a", "a", 99]),
+    ] + [DataFrame(s) for s in create_series()]
+
+
+def is_constant(x):
+    values = x.values.ravel("K")
+    return len(set(values[notna(values)])) == 1
+
+
+@pytest.fixture(
+    params=(
+        obj
+        for obj in itertools.chain(create_series(), create_dataframes())
+        if is_constant(obj)
+    ),
+)
+def consistent_data(request):
+    return request.param
+
+
+@pytest.fixture(params=create_series())
+def series_data(request):
+    return request.param
+
+
+@pytest.fixture(params=itertools.chain(create_series(), create_dataframes()))
+def all_data(request):
     """
-    Fixture for DataFrame of floats with DatetimeIndex
-
-    Columns are ['A', 'B', 'C', 'D']
+    Test:
+        - Empty Series / DataFrame
+        - All NaN
+        - All consistent value
+        - Monotonically decreasing
+        - Monotonically increasing
+        - Monotonically consistent with NaNs
+        - Monotonically increasing with NaNs
+        - Monotonically decreasing with NaNs
     """
-    return DataFrame(
-        np.random.default_rng(2).standard_normal((100, 4)),
-        columns=Index(list("ABCD")),
-        index=date_range("2000-01-01", periods=100, freq="B"),
-    )
+    return request.param
 
 
-@pytest.fixture
-def float_string_frame():
-    """
-    Fixture for DataFrame of floats and strings with index of unique strings
-
-    Columns are ['A', 'B', 'C', 'D', 'foo'].
-    """
-    df = DataFrame(
-        np.random.default_rng(2).standard_normal((30, 4)),
-        index=Index([f"foo_{i}" for i in range(30)], dtype=object),
-        columns=Index(list("ABCD")),
-    )
-    df["foo"] = "bar"
-    return df
-
-
-@pytest.fixture
-def mixed_float_frame():
-    """
-    Fixture for DataFrame of different float types with index of unique strings
-
-    Columns are ['A', 'B', 'C', 'D'].
-    """
-    df = DataFrame(
-        {
-            col: np.random.default_rng(2).random(30, dtype=dtype)
-            for col, dtype in zip(
-                list("ABCD"), ["float32", "float32", "float32", "float64"]
-            )
-        },
-        index=Index([f"foo_{i}" for i in range(30)], dtype=object),
-    )
-    # not supported by numpy random
-    df["C"] = df["C"].astype("float16")
-    return df
-
-
-@pytest.fixture
-def mixed_int_frame():
-    """
-    Fixture for DataFrame of different int types with index of unique strings
-
-    Columns are ['A', 'B', 'C', 'D'].
-    """
-    return DataFrame(
-        {
-            col: np.ones(30, dtype=dtype)
-            for col, dtype in zip(list("ABCD"), ["int32", "uint64", "uint8", "int64"])
-        },
-        index=Index([f"foo_{i}" for i in range(30)], dtype=object),
-    )
-
-
-@pytest.fixture
-def timezone_frame():
-    """
-    Fixture for DataFrame of date_range Series with different time zones
-
-    Columns are ['A', 'B', 'C']; some entries are missing
-
-               A                         B                         C
-    0 2013-01-01 2013-01-01 00:00:00-05:00 2013-01-01 00:00:00+01:00
-    1 2013-01-02                       NaT                       NaT
-    2 2013-01-03 2013-01-03 00:00:00-05:00 2013-01-03 00:00:00+01:00
-    """
-    df = DataFrame(
-        {
-            "A": date_range("20130101", periods=3),
-            "B": date_range("20130101", periods=3, tz="US/Eastern"),
-            "C": date_range("20130101", periods=3, tz="CET"),
-        }
-    )
-    df.iloc[1, 1] = NaT
-    df.iloc[1, 2] = NaT
-    return df
+@pytest.fixture(params=[0, 2])
+def min_periods(request):
+    return request.param
