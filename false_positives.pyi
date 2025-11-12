@@ -1,11 +1,18 @@
+import sys
+from typing import Any
+
 import numpy as np
 import numpy.typing as npt
 
-AR_f8: npt.NDArray[np.float64]
+if sys.version_info >= (3, 11):
+    from typing import assert_type
+else:
+    from typing_extensions import assert_type
 
-# NOTE: Mypy bug presumably due to the special-casing of heterogeneous tuples;
-# xref numpy/numpy#20901
+AR_Any: npt.NDArray[Any]
+
+# Mypy bug where overload ambiguity is ignored for `Any`-parametrized types;
+# xref numpy/numpy#20099 and python/mypy#11347
 #
-# The expected output should be no different than, e.g., when using a
-# list instead of a tuple
-np.concatenate(([1], AR_f8))  # E: Argument 1 to "concatenate" has incompatible type
+# The expected output would be something akin to `npt.NDArray[Any]`
+assert_type(AR_Any + 2, npt.NDArray[np.signedinteger[Any]])

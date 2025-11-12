@@ -1,16 +1,31 @@
+import sys
+import contextlib
 from collections.abc import Callable
 from typing import Any
 
 import numpy as np
 import numpy.typing as npt
+from numpy._core.arrayprint import _FormatOptions
 
-AR: npt.NDArray[np.float64]
-func1: Callable[[Any], str]
-func2: Callable[[np.integer[Any]], str]
+if sys.version_info >= (3, 11):
+    from typing import assert_type
+else:
+    from typing_extensions import assert_type
 
-np.array2string(AR, style=None)  # E: Unexpected keyword argument
-np.array2string(AR, legacy="1.14")  # E: incompatible type
-np.array2string(AR, sign="*")  # E: incompatible type
-np.array2string(AR, floatmode="default")  # E: incompatible type
-np.array2string(AR, formatter={"A": func1})  # E: incompatible type
-np.array2string(AR, formatter={"float": func2})  # E: Incompatible types
+AR: npt.NDArray[np.int64]
+func_float: Callable[[np.floating[Any]], str]
+func_int: Callable[[np.integer[Any]], str]
+
+assert_type(np.get_printoptions(), _FormatOptions)
+assert_type(
+    np.array2string(AR, formatter={'float_kind': func_float, 'int_kind': func_int}),
+    str,
+)
+assert_type(np.format_float_scientific(1.0), str)
+assert_type(np.format_float_positional(1), str)
+assert_type(np.array_repr(AR), str)
+assert_type(np.array_str(AR), str)
+
+assert_type(np.printoptions(), contextlib._GeneratorContextManager[_FormatOptions])
+with np.printoptions() as dct:
+    assert_type(dct, _FormatOptions)

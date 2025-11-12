@@ -1,21 +1,37 @@
+import sys
+from typing import Any
+
 import numpy as np
 import numpy.typing as npt
 
-AR_c: npt.NDArray[np.complex128]
-AR_m: npt.NDArray[np.timedelta64]
-AR_M: npt.NDArray[np.datetime64]
-AR_O: npt.NDArray[np.object_]
+if sys.version_info >= (3, 11):
+    from typing import assert_type
+else:
+    from typing_extensions import assert_type
 
-np.fix(AR_c)  # E: incompatible type
-np.fix(AR_m)  # E: incompatible type
-np.fix(AR_M)  # E: incompatible type
+AR_LIKE_b: list[bool]
+AR_LIKE_u: list[np.uint32]
+AR_LIKE_i: list[int]
+AR_LIKE_f: list[float]
+AR_LIKE_O: list[np.object_]
 
-np.isposinf(AR_c)  # E: incompatible type
-np.isposinf(AR_m)  # E: incompatible type
-np.isposinf(AR_M)  # E: incompatible type
-np.isposinf(AR_O)  # E: incompatible type
+AR_U: npt.NDArray[np.str_]
 
-np.isneginf(AR_c)  # E: incompatible type
-np.isneginf(AR_m)  # E: incompatible type
-np.isneginf(AR_M)  # E: incompatible type
-np.isneginf(AR_O)  # E: incompatible type
+assert_type(np.fix(AR_LIKE_b), npt.NDArray[np.floating[Any]])
+assert_type(np.fix(AR_LIKE_u), npt.NDArray[np.floating[Any]])
+assert_type(np.fix(AR_LIKE_i), npt.NDArray[np.floating[Any]])
+assert_type(np.fix(AR_LIKE_f), npt.NDArray[np.floating[Any]])
+assert_type(np.fix(AR_LIKE_O), npt.NDArray[np.object_])
+assert_type(np.fix(AR_LIKE_f, out=AR_U), npt.NDArray[np.str_])
+
+assert_type(np.isposinf(AR_LIKE_b), npt.NDArray[np.bool])
+assert_type(np.isposinf(AR_LIKE_u), npt.NDArray[np.bool])
+assert_type(np.isposinf(AR_LIKE_i), npt.NDArray[np.bool])
+assert_type(np.isposinf(AR_LIKE_f), npt.NDArray[np.bool])
+assert_type(np.isposinf(AR_LIKE_f, out=AR_U), npt.NDArray[np.str_])
+
+assert_type(np.isneginf(AR_LIKE_b), npt.NDArray[np.bool])
+assert_type(np.isneginf(AR_LIKE_u), npt.NDArray[np.bool])
+assert_type(np.isneginf(AR_LIKE_i), npt.NDArray[np.bool])
+assert_type(np.isneginf(AR_LIKE_f), npt.NDArray[np.bool])
+assert_type(np.isneginf(AR_LIKE_f, out=AR_U), npt.NDArray[np.str_])

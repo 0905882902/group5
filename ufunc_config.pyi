@@ -1,21 +1,37 @@
-"""Typing tests for `numpy._core._ufunc_config`."""
+"""Typing tests for `_core._ufunc_config`."""
+
+import sys
+from typing import Any, Protocol
+from collections.abc import Callable
 
 import numpy as np
 
-def func1(a: str, b: int, c: float) -> None: ...
-def func2(a: str, *, b: int) -> None: ...
+if sys.version_info >= (3, 11):
+    from typing import assert_type
+else:
+    from typing_extensions import assert_type
 
-class Write1:
-    def write1(self, a: str) -> None: ...
+def func(a: str, b: int) -> None: ...
 
-class Write2:
-    def write(self, a: str, b: str) -> None: ...
+class Write:
+    def write(self, value: str) -> None: ...
 
-class Write3:
-    def write(self, *, a: str) -> None: ...
+class SupportsWrite(Protocol):
+    def write(self, s: str, /) -> object: ...
 
-np.seterrcall(func1)  # E: Argument 1 to "seterrcall" has incompatible type
-np.seterrcall(func2)  # E: Argument 1 to "seterrcall" has incompatible type
-np.seterrcall(Write1())  # E: Argument 1 to "seterrcall" has incompatible type
-np.seterrcall(Write2())  # E: Argument 1 to "seterrcall" has incompatible type
-np.seterrcall(Write3())  # E: Argument 1 to "seterrcall" has incompatible type
+assert_type(np.seterr(all=None), np._core._ufunc_config._ErrDict)
+assert_type(np.seterr(divide="ignore"), np._core._ufunc_config._ErrDict)
+assert_type(np.seterr(over="warn"), np._core._ufunc_config._ErrDict)
+assert_type(np.seterr(under="call"), np._core._ufunc_config._ErrDict)
+assert_type(np.seterr(invalid="raise"), np._core._ufunc_config._ErrDict)
+assert_type(np.geterr(), np._core._ufunc_config._ErrDict)
+
+assert_type(np.setbufsize(4096), int)
+assert_type(np.getbufsize(), int)
+
+assert_type(np.seterrcall(func), Callable[[str, int], Any] | None | SupportsWrite)
+assert_type(np.seterrcall(Write()), Callable[[str, int], Any] | None | SupportsWrite)
+assert_type(np.geterrcall(), Callable[[str, int], Any] | None | SupportsWrite)
+
+assert_type(np.errstate(call=func, all="call"), np.errstate)
+assert_type(np.errstate(call=Write(), divide="log", over="log"), np.errstate)

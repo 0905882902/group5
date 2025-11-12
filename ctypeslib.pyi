@@ -1,253 +1,96 @@
-# NOTE: Numpy's mypy plugin is used for importing the correct
-# platform-specific `ctypes._SimpleCData[int]` sub-type
-from ctypes import c_int64 as _c_intp
-
-import os
-import ctypes
-from collections.abc import Iterable, Sequence
-from typing import (
-    Literal as L,
-    Any,
-    TypeVar,
-    Generic,
-    overload,
-    ClassVar,
-)
+import sys
+import ctypes as ct
+from typing import Any
 
 import numpy as np
-from numpy import (
-    ndarray,
-    dtype,
-    generic,
-    byte,
-    short,
-    intc,
-    long,
-    longlong,
-    intp,
-    ubyte,
-    ushort,
-    uintc,
-    ulong,
-    ulonglong,
-    uintp,
-    single,
-    double,
-    longdouble,
-    void,
-)
-from numpy._core._internal import _ctypes
-from numpy._core.multiarray import flagsobj
-from numpy._typing import (
-    # Arrays
-    NDArray,
-    _ArrayLike,
+import numpy.typing as npt
+from numpy import ctypeslib
 
-    # Shapes
-    _ShapeLike,
+if sys.version_info >= (3, 11):
+    from typing import assert_type
+else:
+    from typing_extensions import assert_type
 
-    # DTypes
-    DTypeLike,
-    _DTypeLike,
-    _VoidDTypeLike,
-    _BoolCodes,
-    _UByteCodes,
-    _UShortCodes,
-    _UIntCCodes,
-    _ULongCodes,
-    _ULongLongCodes,
-    _ByteCodes,
-    _ShortCodes,
-    _IntCCodes,
-    _LongCodes,
-    _LongLongCodes,
-    _SingleCodes,
-    _DoubleCodes,
-    _LongDoubleCodes,
-)
+AR_bool: npt.NDArray[np.bool]
+AR_ubyte: npt.NDArray[np.ubyte]
+AR_ushort: npt.NDArray[np.ushort]
+AR_uintc: npt.NDArray[np.uintc]
+AR_ulong: npt.NDArray[np.ulong]
+AR_ulonglong: npt.NDArray[np.ulonglong]
+AR_byte: npt.NDArray[np.byte]
+AR_short: npt.NDArray[np.short]
+AR_intc: npt.NDArray[np.intc]
+AR_long: npt.NDArray[np.long]
+AR_longlong: npt.NDArray[np.longlong]
+AR_single: npt.NDArray[np.single]
+AR_double: npt.NDArray[np.double]
+AR_longdouble: npt.NDArray[np.longdouble]
+AR_void: npt.NDArray[np.void]
 
-# TODO: Add a proper `_Shape` bound once we've got variadic typevars
-_DType = TypeVar("_DType", bound=dtype[Any])
-_DTypeOptional = TypeVar("_DTypeOptional", bound=None | dtype[Any])
-_SCT = TypeVar("_SCT", bound=generic)
+pointer: ct._Pointer[Any]
 
-_FlagsKind = L[
-    'C_CONTIGUOUS', 'CONTIGUOUS', 'C',
-    'F_CONTIGUOUS', 'FORTRAN', 'F',
-    'ALIGNED', 'A',
-    'WRITEABLE', 'W',
-    'OWNDATA', 'O',
-    'WRITEBACKIFCOPY', 'X',
-]
+assert_type(np.ctypeslib.c_intp(), ctypeslib.c_intp)
 
-# TODO: Add a shape typevar once we have variadic typevars (PEP 646)
-class _ndptr(ctypes.c_void_p, Generic[_DTypeOptional]):
-    # In practice these 4 classvars are defined in the dynamic class
-    # returned by `ndpointer`
-    _dtype_: ClassVar[_DTypeOptional]
-    _shape_: ClassVar[None]
-    _ndim_: ClassVar[None | int]
-    _flags_: ClassVar[None | list[_FlagsKind]]
+assert_type(np.ctypeslib.ndpointer(), type[ctypeslib._ndptr[None]])
+assert_type(np.ctypeslib.ndpointer(dtype=np.float64), type[ctypeslib._ndptr[np.dtype[np.float64]]])
+assert_type(np.ctypeslib.ndpointer(dtype=float), type[ctypeslib._ndptr[np.dtype[Any]]])
+assert_type(np.ctypeslib.ndpointer(shape=(10, 3)), type[ctypeslib._ndptr[None]])
+assert_type(np.ctypeslib.ndpointer(np.int64, shape=(10, 3)), type[ctypeslib._concrete_ndptr[np.dtype[np.int64]]])
+assert_type(np.ctypeslib.ndpointer(int, shape=(1,)), type[np.ctypeslib._concrete_ndptr[np.dtype[Any]]])
 
-    @overload
-    @classmethod
-    def from_param(cls: type[_ndptr[None]], obj: NDArray[Any]) -> _ctypes[Any]: ...
-    @overload
-    @classmethod
-    def from_param(cls: type[_ndptr[_DType]], obj: ndarray[Any, _DType]) -> _ctypes[Any]: ...
+assert_type(np.ctypeslib.as_ctypes_type(np.bool), type[ct.c_bool])
+assert_type(np.ctypeslib.as_ctypes_type(np.ubyte), type[ct.c_ubyte])
+assert_type(np.ctypeslib.as_ctypes_type(np.ushort), type[ct.c_ushort])
+assert_type(np.ctypeslib.as_ctypes_type(np.uintc), type[ct.c_uint])
+assert_type(np.ctypeslib.as_ctypes_type(np.byte), type[ct.c_byte])
+assert_type(np.ctypeslib.as_ctypes_type(np.short), type[ct.c_short])
+assert_type(np.ctypeslib.as_ctypes_type(np.intc), type[ct.c_int])
+assert_type(np.ctypeslib.as_ctypes_type(np.single), type[ct.c_float])
+assert_type(np.ctypeslib.as_ctypes_type(np.double), type[ct.c_double])
+assert_type(np.ctypeslib.as_ctypes_type(ct.c_double), type[ct.c_double])
+assert_type(np.ctypeslib.as_ctypes_type("q"), type[ct.c_longlong])
+assert_type(np.ctypeslib.as_ctypes_type([("i8", np.int64), ("f8", np.float64)]), type[Any])
+assert_type(np.ctypeslib.as_ctypes_type("i8"), type[Any])
+assert_type(np.ctypeslib.as_ctypes_type("f8"), type[Any])
 
-class _concrete_ndptr(_ndptr[_DType]):
-    _dtype_: ClassVar[_DType]
-    _shape_: ClassVar[tuple[int, ...]]
-    @property
-    def contents(self) -> ndarray[Any, _DType]: ...
+assert_type(np.ctypeslib.as_ctypes(AR_bool.take(0)), ct.c_bool)
+assert_type(np.ctypeslib.as_ctypes(AR_ubyte.take(0)), ct.c_ubyte)
+assert_type(np.ctypeslib.as_ctypes(AR_ushort.take(0)), ct.c_ushort)
+assert_type(np.ctypeslib.as_ctypes(AR_uintc.take(0)), ct.c_uint)
 
-def load_library(
-    libname: str | bytes | os.PathLike[str] | os.PathLike[bytes],
-    loader_path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
-) -> ctypes.CDLL: ...
+assert_type(np.ctypeslib.as_ctypes(AR_byte.take(0)), ct.c_byte)
+assert_type(np.ctypeslib.as_ctypes(AR_short.take(0)), ct.c_short)
+assert_type(np.ctypeslib.as_ctypes(AR_intc.take(0)), ct.c_int)
+assert_type(np.ctypeslib.as_ctypes(AR_single.take(0)), ct.c_float)
+assert_type(np.ctypeslib.as_ctypes(AR_double.take(0)), ct.c_double)
+assert_type(np.ctypeslib.as_ctypes(AR_void.take(0)), Any)
+assert_type(np.ctypeslib.as_ctypes(AR_bool), ct.Array[ct.c_bool])
+assert_type(np.ctypeslib.as_ctypes(AR_ubyte), ct.Array[ct.c_ubyte])
+assert_type(np.ctypeslib.as_ctypes(AR_ushort), ct.Array[ct.c_ushort])
+assert_type(np.ctypeslib.as_ctypes(AR_uintc), ct.Array[ct.c_uint])
+assert_type(np.ctypeslib.as_ctypes(AR_byte), ct.Array[ct.c_byte])
+assert_type(np.ctypeslib.as_ctypes(AR_short), ct.Array[ct.c_short])
+assert_type(np.ctypeslib.as_ctypes(AR_intc), ct.Array[ct.c_int])
+assert_type(np.ctypeslib.as_ctypes(AR_single), ct.Array[ct.c_float])
+assert_type(np.ctypeslib.as_ctypes(AR_double), ct.Array[ct.c_double])
+assert_type(np.ctypeslib.as_ctypes(AR_void), ct.Array[Any])
 
-__all__: list[str]
+assert_type(np.ctypeslib.as_array(AR_ubyte), npt.NDArray[np.ubyte])
+assert_type(np.ctypeslib.as_array(1), npt.NDArray[Any])
+assert_type(np.ctypeslib.as_array(pointer), npt.NDArray[Any])
 
-c_intp = _c_intp
-
-@overload
-def ndpointer(
-    dtype: None = ...,
-    ndim: int = ...,
-    shape: None | _ShapeLike = ...,
-    flags: None | _FlagsKind | Iterable[_FlagsKind] | int | flagsobj = ...,
-) -> type[_ndptr[None]]: ...
-@overload
-def ndpointer(
-    dtype: _DTypeLike[_SCT],
-    ndim: int = ...,
-    *,
-    shape: _ShapeLike,
-    flags: None | _FlagsKind | Iterable[_FlagsKind] | int | flagsobj = ...,
-) -> type[_concrete_ndptr[dtype[_SCT]]]: ...
-@overload
-def ndpointer(
-    dtype: DTypeLike,
-    ndim: int = ...,
-    *,
-    shape: _ShapeLike,
-    flags: None | _FlagsKind | Iterable[_FlagsKind] | int | flagsobj = ...,
-) -> type[_concrete_ndptr[dtype[Any]]]: ...
-@overload
-def ndpointer(
-    dtype: _DTypeLike[_SCT],
-    ndim: int = ...,
-    shape: None = ...,
-    flags: None | _FlagsKind | Iterable[_FlagsKind] | int | flagsobj = ...,
-) -> type[_ndptr[dtype[_SCT]]]: ...
-@overload
-def ndpointer(
-    dtype: DTypeLike,
-    ndim: int = ...,
-    shape: None = ...,
-    flags: None | _FlagsKind | Iterable[_FlagsKind] | int | flagsobj = ...,
-) -> type[_ndptr[dtype[Any]]]: ...
-
-@overload
-def as_ctypes_type(dtype: _BoolCodes | _DTypeLike[np.bool] | type[ctypes.c_bool]) -> type[ctypes.c_bool]: ...
-@overload
-def as_ctypes_type(dtype: _ByteCodes | _DTypeLike[byte] | type[ctypes.c_byte]) -> type[ctypes.c_byte]: ...
-@overload
-def as_ctypes_type(dtype: _ShortCodes | _DTypeLike[short] | type[ctypes.c_short]) -> type[ctypes.c_short]: ...
-@overload
-def as_ctypes_type(dtype: _IntCCodes | _DTypeLike[intc] | type[ctypes.c_int]) -> type[ctypes.c_int]: ...
-@overload
-def as_ctypes_type(dtype: _LongCodes | _DTypeLike[long] | type[ctypes.c_long]) -> type[ctypes.c_long]: ...
-@overload
-def as_ctypes_type(dtype: type[int]) -> type[c_intp]: ...
-@overload
-def as_ctypes_type(dtype: _LongLongCodes | _DTypeLike[longlong] | type[ctypes.c_longlong]) -> type[ctypes.c_longlong]: ...
-@overload
-def as_ctypes_type(dtype: _UByteCodes | _DTypeLike[ubyte] | type[ctypes.c_ubyte]) -> type[ctypes.c_ubyte]: ...
-@overload
-def as_ctypes_type(dtype: _UShortCodes | _DTypeLike[ushort] | type[ctypes.c_ushort]) -> type[ctypes.c_ushort]: ...
-@overload
-def as_ctypes_type(dtype: _UIntCCodes | _DTypeLike[uintc] | type[ctypes.c_uint]) -> type[ctypes.c_uint]: ...
-@overload
-def as_ctypes_type(dtype: _ULongCodes | _DTypeLike[ulong] | type[ctypes.c_ulong]) -> type[ctypes.c_ulong]: ...
-@overload
-def as_ctypes_type(dtype: _ULongLongCodes | _DTypeLike[ulonglong] | type[ctypes.c_ulonglong]) -> type[ctypes.c_ulonglong]: ...
-@overload
-def as_ctypes_type(dtype: _SingleCodes | _DTypeLike[single] | type[ctypes.c_float]) -> type[ctypes.c_float]: ...
-@overload
-def as_ctypes_type(dtype: _DoubleCodes | _DTypeLike[double] | type[float | ctypes.c_double]) -> type[ctypes.c_double]: ...
-@overload
-def as_ctypes_type(dtype: _LongDoubleCodes | _DTypeLike[longdouble] | type[ctypes.c_longdouble]) -> type[ctypes.c_longdouble]: ...
-@overload
-def as_ctypes_type(dtype: _VoidDTypeLike) -> type[Any]: ...  # `ctypes.Union` or `ctypes.Structure`
-@overload
-def as_ctypes_type(dtype: str) -> type[Any]: ...
-
-@overload
-def as_array(obj: ctypes._PointerLike, shape: Sequence[int]) -> NDArray[Any]: ...
-@overload
-def as_array(obj: _ArrayLike[_SCT], shape: None | _ShapeLike = ...) -> NDArray[_SCT]: ...
-@overload
-def as_array(obj: object, shape: None | _ShapeLike = ...) -> NDArray[Any]: ...
-
-@overload
-def as_ctypes(obj: np.bool) -> ctypes.c_bool: ...
-@overload
-def as_ctypes(obj: byte) -> ctypes.c_byte: ...
-@overload
-def as_ctypes(obj: short) -> ctypes.c_short: ...
-@overload
-def as_ctypes(obj: intc) -> ctypes.c_int: ...
-@overload
-def as_ctypes(obj: long) -> ctypes.c_long: ...
-@overload
-def as_ctypes(obj: longlong) -> ctypes.c_longlong: ...
-@overload
-def as_ctypes(obj: ubyte) -> ctypes.c_ubyte: ...
-@overload
-def as_ctypes(obj: ushort) -> ctypes.c_ushort: ...
-@overload
-def as_ctypes(obj: uintc) -> ctypes.c_uint: ...
-@overload
-def as_ctypes(obj: ulong) -> ctypes.c_ulong: ...
-@overload
-def as_ctypes(obj: ulonglong) -> ctypes.c_ulonglong: ...
-@overload
-def as_ctypes(obj: single) -> ctypes.c_float: ...
-@overload
-def as_ctypes(obj: double) -> ctypes.c_double: ...
-@overload
-def as_ctypes(obj: longdouble) -> ctypes.c_longdouble: ...
-@overload
-def as_ctypes(obj: void) -> Any: ...  # `ctypes.Union` or `ctypes.Structure`
-@overload
-def as_ctypes(obj: NDArray[np.bool]) -> ctypes.Array[ctypes.c_bool]: ...
-@overload
-def as_ctypes(obj: NDArray[byte]) -> ctypes.Array[ctypes.c_byte]: ...
-@overload
-def as_ctypes(obj: NDArray[short]) -> ctypes.Array[ctypes.c_short]: ...
-@overload
-def as_ctypes(obj: NDArray[intc]) -> ctypes.Array[ctypes.c_int]: ...
-@overload
-def as_ctypes(obj: NDArray[long]) -> ctypes.Array[ctypes.c_long]: ...
-@overload
-def as_ctypes(obj: NDArray[longlong]) -> ctypes.Array[ctypes.c_longlong]: ...
-@overload
-def as_ctypes(obj: NDArray[ubyte]) -> ctypes.Array[ctypes.c_ubyte]: ...
-@overload
-def as_ctypes(obj: NDArray[ushort]) -> ctypes.Array[ctypes.c_ushort]: ...
-@overload
-def as_ctypes(obj: NDArray[uintc]) -> ctypes.Array[ctypes.c_uint]: ...
-@overload
-def as_ctypes(obj: NDArray[ulong]) -> ctypes.Array[ctypes.c_ulong]: ...
-@overload
-def as_ctypes(obj: NDArray[ulonglong]) -> ctypes.Array[ctypes.c_ulonglong]: ...
-@overload
-def as_ctypes(obj: NDArray[single]) -> ctypes.Array[ctypes.c_float]: ...
-@overload
-def as_ctypes(obj: NDArray[double]) -> ctypes.Array[ctypes.c_double]: ...
-@overload
-def as_ctypes(obj: NDArray[longdouble]) -> ctypes.Array[ctypes.c_longdouble]: ...
-@overload
-def as_ctypes(obj: NDArray[void]) -> ctypes.Array[Any]: ...  # `ctypes.Union` or `ctypes.Structure`
+if sys.platform == "win32":
+    # Mainly on windows int is the same size as long but gets picked first:
+    assert_type(np.ctypeslib.as_ctypes_type(np.long), type[ct.c_int])
+    assert_type(np.ctypeslib.as_ctypes_type(np.ulong), type[ct.c_uint])
+    assert_type(np.ctypeslib.as_ctypes(AR_ulong), ct.Array[ct.c_uint])
+    assert_type(np.ctypeslib.as_ctypes(AR_long), ct.Array[ct.c_int])
+    assert_type(np.ctypeslib.as_ctypes(AR_long.take(0)), ct.c_int)
+    assert_type(np.ctypeslib.as_ctypes(AR_ulong.take(0)), ct.c_uint)
+else:
+    assert_type(np.ctypeslib.as_ctypes_type(np.long), type[ct.c_long])
+    assert_type(np.ctypeslib.as_ctypes_type(np.ulong), type[ct.c_ulong])
+    assert_type(np.ctypeslib.as_ctypes(AR_ulong), ct.Array[ct.c_ulong])
+    assert_type(np.ctypeslib.as_ctypes(AR_long), ct.Array[ct.c_long])
+    assert_type(np.ctypeslib.as_ctypes(AR_long.take(0)), ct.c_long)
+    assert_type(np.ctypeslib.as_ctypes(AR_ulong.take(0)), ct.c_ulong)

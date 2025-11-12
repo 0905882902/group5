@@ -1,92 +1,158 @@
 import sys
-import numpy as np
+from typing import Any, Literal
 
-f2: np.float16
+import numpy as np
+import numpy.typing as npt
+
+if sys.version_info >= (3, 11):
+    from typing import assert_type
+else:
+    from typing_extensions import assert_type
+
+b: np.bool
+u8: np.uint64
+i8: np.int64
 f8: np.float64
 c8: np.complex64
+c16: np.complex128
+m: np.timedelta64
+U: np.str_
+S: np.bytes_
+V: np.void
 
-# Construction
+assert_type(c8.real, np.float32)
+assert_type(c8.imag, np.float32)
 
-np.float32(3j)  # E: incompatible type
+assert_type(c8.real.real, np.float32)
+assert_type(c8.real.imag, np.float32)
 
-# Technically the following examples are valid NumPy code. But they
-# are not considered a best practice, and people who wish to use the
-# stubs should instead do
-#
-# np.array([1.0, 0.0, 0.0], dtype=np.float32)
-# np.array([], dtype=np.complex64)
-#
-# See e.g. the discussion on the mailing list
-#
-# https://mail.python.org/pipermail/numpy-discussion/2020-April/080566.html
-#
-# and the issue
-#
-# https://github.com/numpy/numpy-stubs/issues/41
-#
-# for more context.
-np.float32([1.0, 0.0, 0.0])  # E: incompatible type
-np.complex64([])  # E: incompatible type
+assert_type(c8.itemsize, int)
+assert_type(c8.shape, tuple[()])
+assert_type(c8.strides, tuple[()])
 
-np.complex64(1, 2)  # E: Too many arguments
-# TODO: protocols (can't check for non-existent protocols w/ __getattr__)
+assert_type(c8.ndim, Literal[0])
+assert_type(c8.size, Literal[1])
 
-np.datetime64(0)  # E: No overload variant
+assert_type(c8.squeeze(), np.complex64)
+assert_type(c8.byteswap(), np.complex64)
+assert_type(c8.transpose(), np.complex64)
 
-class A:
-    def __float__(self):
-        return 1.0
+assert_type(c8.dtype, np.dtype[np.complex64])
 
+assert_type(c8.real, np.float32)
+assert_type(c16.imag, np.float64)
 
-np.int8(A())  # E: incompatible type
-np.int16(A())  # E: incompatible type
-np.int32(A())  # E: incompatible type
-np.int64(A())  # E: incompatible type
-np.uint8(A())  # E: incompatible type
-np.uint16(A())  # E: incompatible type
-np.uint32(A())  # E: incompatible type
-np.uint64(A())  # E: incompatible type
+assert_type(np.str_('foo'), np.str_)
 
-np.void("test")  # E: No overload variant
-np.void("test", dtype=None)  # E: No overload variant
+assert_type(V[0], Any)
+assert_type(V["field1"], Any)
+assert_type(V[["field1", "field2"]], np.void)
+V[0] = 5
 
-np.generic(1)  # E: Cannot instantiate abstract class
-np.number(1)  # E: Cannot instantiate abstract class
-np.integer(1)  # E: Cannot instantiate abstract class
-np.inexact(1)  # E: Cannot instantiate abstract class
-np.character("test")  # E: Cannot instantiate abstract class
-np.flexible(b"test")  # E: Cannot instantiate abstract class
+# Aliases
+assert_type(np.bool_(), np.bool)
+assert_type(np.byte(), np.byte)
+assert_type(np.short(), np.short)
+assert_type(np.intc(), np.intc)
+assert_type(np.intp(), np.intp)
+assert_type(np.int_(), np.int_)
+assert_type(np.long(), np.long)
+assert_type(np.longlong(), np.longlong)
 
-np.float64(value=0.0)  # E: Unexpected keyword argument
-np.int64(value=0)  # E: Unexpected keyword argument
-np.uint64(value=0)  # E: Unexpected keyword argument
-np.complex128(value=0.0j)  # E: Unexpected keyword argument
-np.str_(value='bob')  # E: No overload variant
-np.bytes_(value=b'test')  # E: No overload variant
-np.void(value=b'test')  # E: No overload variant
-np.bool(value=True)  # E: Unexpected keyword argument
-np.datetime64(value="2019")  # E: No overload variant
-np.timedelta64(value=0)  # E: Unexpected keyword argument
+assert_type(np.ubyte(), np.ubyte)
+assert_type(np.ushort(), np.ushort)
+assert_type(np.uintc(), np.uintc)
+assert_type(np.uintp(), np.uintp)
+assert_type(np.uint(), np.uint)
+assert_type(np.ulong(), np.ulong)
+assert_type(np.ulonglong(), np.ulonglong)
 
-np.bytes_(b"hello", encoding='utf-8')  # E: No overload variant
-np.str_("hello", encoding='utf-8')  # E: No overload variant
+assert_type(np.half(), np.half)
+assert_type(np.single(), np.single)
+assert_type(np.double(), np.double)
+assert_type(np.longdouble(), np.longdouble)
 
-f8.item(1)  # E: incompatible type
-f8.item((0, 1))  # E: incompatible type
-f8.squeeze(axis=1)  # E: incompatible type
-f8.squeeze(axis=(0, 1))  # E: incompatible type
-f8.transpose(1)  # E: incompatible type
+assert_type(np.csingle(), np.csingle)
+assert_type(np.cdouble(), np.cdouble)
+assert_type(np.clongdouble(), np.clongdouble)
 
-def func(a: np.float32) -> None: ...
+assert_type(b.item(), bool)
+assert_type(i8.item(), int)
+assert_type(u8.item(), int)
+assert_type(f8.item(), float)
+assert_type(c16.item(), complex)
+assert_type(U.item(), str)
+assert_type(S.item(), bytes)
 
-func(f2)  # E: incompatible type
-func(f8)  # E: incompatible type
+assert_type(b.tolist(), bool)
+assert_type(i8.tolist(), int)
+assert_type(u8.tolist(), int)
+assert_type(f8.tolist(), float)
+assert_type(c16.tolist(), complex)
+assert_type(U.tolist(), str)
+assert_type(S.tolist(), bytes)
 
-round(c8)  # E: No overload variant
+assert_type(b.ravel(), npt.NDArray[np.bool])
+assert_type(i8.ravel(), npt.NDArray[np.int64])
+assert_type(u8.ravel(), npt.NDArray[np.uint64])
+assert_type(f8.ravel(), npt.NDArray[np.float64])
+assert_type(c16.ravel(), npt.NDArray[np.complex128])
+assert_type(U.ravel(), npt.NDArray[np.str_])
+assert_type(S.ravel(), npt.NDArray[np.bytes_])
 
-c8.__getnewargs__()  # E: Invalid self argument
-f2.__getnewargs__()  # E: Invalid self argument
-f2.hex()  # E: Invalid self argument
-np.float16.fromhex("0x0.0p+0")  # E: Invalid self argument
-f2.__trunc__()  # E: Invalid self argument
-f2.__getformat__("float")  # E: Invalid self argument
+assert_type(b.flatten(), npt.NDArray[np.bool])
+assert_type(i8.flatten(), npt.NDArray[np.int64])
+assert_type(u8.flatten(), npt.NDArray[np.uint64])
+assert_type(f8.flatten(), npt.NDArray[np.float64])
+assert_type(c16.flatten(), npt.NDArray[np.complex128])
+assert_type(U.flatten(), npt.NDArray[np.str_])
+assert_type(S.flatten(), npt.NDArray[np.bytes_])
+
+assert_type(b.reshape(1), npt.NDArray[np.bool])
+assert_type(i8.reshape(1), npt.NDArray[np.int64])
+assert_type(u8.reshape(1), npt.NDArray[np.uint64])
+assert_type(f8.reshape(1), npt.NDArray[np.float64])
+assert_type(c16.reshape(1), npt.NDArray[np.complex128])
+assert_type(U.reshape(1), npt.NDArray[np.str_])
+assert_type(S.reshape(1), npt.NDArray[np.bytes_])
+
+assert_type(i8.astype(float), Any)
+assert_type(i8.astype(np.float64), np.float64)
+
+assert_type(i8.view(), np.int64)
+assert_type(i8.view(np.float64), np.float64)
+assert_type(i8.view(float), Any)
+assert_type(i8.view(np.float64, np.ndarray), np.float64)
+
+assert_type(i8.getfield(float), Any)
+assert_type(i8.getfield(np.float64), np.float64)
+assert_type(i8.getfield(np.float64, 8), np.float64)
+
+assert_type(f8.as_integer_ratio(), tuple[int, int])
+assert_type(f8.is_integer(), bool)
+assert_type(f8.__trunc__(), int)
+assert_type(f8.__getformat__("float"), str)
+assert_type(f8.hex(), str)
+assert_type(np.float64.fromhex("0x0.0p+0"), np.float64)
+
+assert_type(f8.__getnewargs__(), tuple[float])
+assert_type(c16.__getnewargs__(), tuple[float, float])
+
+assert_type(i8.numerator, np.int64)
+assert_type(i8.denominator, Literal[1])
+assert_type(u8.numerator, np.uint64)
+assert_type(u8.denominator, Literal[1])
+assert_type(m.numerator, np.timedelta64)
+assert_type(m.denominator, Literal[1])
+
+assert_type(round(i8), int)
+assert_type(round(i8, 3), np.int64)
+assert_type(round(u8), int)
+assert_type(round(u8, 3), np.uint64)
+assert_type(round(f8), int)
+assert_type(round(f8, 3), np.float64)
+
+assert_type(f8.__ceil__(), int)
+assert_type(f8.__floor__(), int)
+
+assert_type(i8.is_integer(), Literal[True])

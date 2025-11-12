@@ -1,25 +1,31 @@
+import sys
 from typing import Any
 
 import numpy as np
-import numpy._typing as npt
+import numpy.typing as npt
 
+if sys.version_info >= (3, 11):
+    from typing import assert_type
+else:
+    from typing_extensions import assert_type
 
-class Index:
-    def __index__(self) -> int:
-        ...
+a: np.flatiter[npt.NDArray[np.str_]]
 
-
-a: np.flatiter[npt.NDArray[np.float64]]
-supports_array: npt._SupportsArray[np.dtype[np.float64]]
-
-a.base = Any  # E: Property "base" defined in "flatiter" is read-only
-a.coords = Any  # E: Property "coords" defined in "flatiter" is read-only
-a.index = Any  # E: Property "index" defined in "flatiter" is read-only
-a.copy(order='C')  # E: Unexpected keyword argument
-
-# NOTE: Contrary to `ndarray.__getitem__` its counterpart in `flatiter`
-# does not accept objects with the `__array__` or `__index__` protocols;
-# boolean indexing is just plain broken (gh-17175)
-a[np.bool()]  # E: No overload variant of "__getitem__"
-a[Index()]  # E: No overload variant of "__getitem__"
-a[supports_array]  # E: No overload variant of "__getitem__"
+assert_type(a.base, npt.NDArray[np.str_])
+assert_type(a.copy(), npt.NDArray[np.str_])
+assert_type(a.coords, tuple[int, ...])
+assert_type(a.index, int)
+assert_type(iter(a), np.flatiter[npt.NDArray[np.str_]])
+assert_type(next(a), np.str_)
+assert_type(a[0], np.str_)
+assert_type(a[[0, 1, 2]], npt.NDArray[np.str_])
+assert_type(a[...], npt.NDArray[np.str_])
+assert_type(a[:], npt.NDArray[np.str_])
+assert_type(a[(...,)], npt.NDArray[np.str_])
+assert_type(a[(0,)], np.str_)
+assert_type(a.__array__(), npt.NDArray[np.str_])
+assert_type(a.__array__(np.dtype(np.float64)), npt.NDArray[np.float64])
+a[0] = "a"
+a[:5] = "a"
+a[...] = "a"
+a[(...,)] = "a"
