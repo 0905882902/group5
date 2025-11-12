@@ -1,213 +1,176 @@
-"""Wheels support."""
-
-from distutils.util import get_platform
-from distutils import log
-import email
-import itertools
+import logging
 import os
-import posixpath
-import re
-import zipfile
+import shutil
+from optparse import Values
 
-import pkg_resources
-import setuptools
-from pkg_resources import parse_version
-from setuptools.extern.packaging.tags import sys_tags
-from setuptools.extern.packaging.utils import canonicalize_name
-from setuptools.command.egg_info import write_requirements
+from pip._internal.cache import WheelCache
+from pip._internal.cli import cmdoptions
+from pip._internal.cli.req_command import RequirementCommand, with_cleanup
+from pip._internal.cli.status_codes import SUCCESS
+from pip._internal.exceptions import CommandError
+from pip._internal.operations.build.build_tracker import get_build_tracker
+from pip._internal.req.req_install import (
+    InstallRequirement,
+)
+from pip._internal.utils.misc import ensure_dir, normalize_path
+from pip._internal.utils.temp_dir import TempDirectory
+from pip._internal.wheel_builder import build
 
-
-WHEEL_NAME = re.compile(
-    r"""^(?P<project_name>.+?)-(?P<version>\d.*?)
-    ((-(?P<build>\d.*?))?-(?P<py_version>.+?)-(?P<abi>.+?)-(?P<platform>.+?)
-    )\.whl$""",
-    re.VERBOSE).match
-
-NAMESPACE_PACKAGE_INIT = \
-    "__import__('pkg_resources').declare_namespace(__name__)\n"
+logger = logging.getLogger(__name__)
 
 
-def unpack(src_dir, dst_dir):
-    '''Move everything under `src_dir` to `dst_dir`, and delete the former.'''
-    for dirpath, dirnames, filenames in os.walk(src_dir):
-        subdir = os.path.relpath(dirpath, src_dir)
-        for f in filenames:
-            src = os.path.join(dirpath, f)
-            dst = os.path.join(dst_dir, subdir, f)
-            os.renames(src, dst)
-        for n, d in reversed(list(enumerate(dirnames))):
-            src = os.path.join(dirpath, d)
-            dst = os.path.join(dst_dir, subdir, d)
-            if not os.path.exists(dst):
-                # Directory does not exist in destination,
-                # rename it and prune it from os.walk list.
-                os.renames(src, dst)
-                del dirnames[n]
-    # Cleanup.
-    for dirpath, dirnames, filenames in os.walk(src_dir, topdown=True):
-        assert not filenames
-        os.rmdir(dirpath)
+class WheelCommand(RequirementCommand):
+    """
+    Build Wheel archives for your requirements and dependencies.
 
+    Wheel is a built-package format, and offers the advantage of not
+    recompiling your software during every install. For more details, see the
+    wheel docs: https://wheel.readthedocs.io/en/latest/
 
-class Wheel:
+    'pip wheel' uses the build system interface as described here:
+    https://pip.pypa.io/en/stable/reference/build-system/
 
-    def __init__(self, filename):
-        match = WHEEL_NAME(os.path.basename(filename))
-        if match is None:
-            raise ValueError('invalid wheel name: %r' % filename)
-        self.filename = filename
-        for k, v in match.groupdict().items():
-            setattr(self, k, v)
+    """
 
-    def tags(self):
-        '''List tags (py_version, abi, platform) supported by this wheel.'''
-        return itertools.product(
-            self.py_version.split('.'),
-            self.abi.split('.'),
-            self.platform.split('.'),
-        )
+    usage = """
+      %prog [options] <requirement specifier> ...
+      %prog [options] -r <requirements file> ...
+      %prog [options] [-e] <vcs project url> ...
+      %prog [options] [-e] <local project path> ...
+      %prog [options] <archive url/path> ..."""
 
-    def is_compatible(self):
-        '''Is the wheel is compatible with the current platform?'''
-        supported_tags = set(
-            (t.interpreter, t.abi, t.platform) for t in sys_tags())
-        return next((True for t in self.tags() if t in supported_tags), False)
-
-    def egg_name(self):
-        return pkg_resources.Distribution(
-            project_name=self.project_name, version=self.version,
-            platform=(None if self.platform == 'any' else get_platform()),
-        ).egg_name() + '.egg'
-
-    def get_dist_info(self, zf):
-        # find the correct name of the .dist-info dir in the wheel file
-        for member in zf.namelist():
-            dirname = posixpath.dirname(member)
-            if (dirname.endswith('.dist-info') and
-                    canonicalize_name(dirname).startswith(
-                        canonicalize_name(self.project_name))):
-                return dirname
-        raise ValueError("unsupported wheel format. .dist-info not found")
-
-    def install_as_egg(self, destination_eggdir):
-        '''Install wheel as an egg directory.'''
-        with zipfile.ZipFile(self.filename) as zf:
-            self._install_as_egg(destination_eggdir, zf)
-
-    def _install_as_egg(self, destination_eggdir, zf):
-        dist_basename = '%s-%s' % (self.project_name, self.version)
-        dist_info = self.get_dist_info(zf)
-        dist_data = '%s.data' % dist_basename
-        egg_info = os.path.join(destination_eggdir, 'EGG-INFO')
-
-        self._convert_metadata(zf, destination_eggdir, dist_info, egg_info)
-        self._move_data_entries(destination_eggdir, dist_data)
-        self._fix_namespace_packages(egg_info, destination_eggdir)
-
-    @staticmethod
-    def _convert_metadata(zf, destination_eggdir, dist_info, egg_info):
-        def get_metadata(name):
-            with zf.open(posixpath.join(dist_info, name)) as fp:
-                value = fp.read().decode('utf-8')
-                return email.parser.Parser().parsestr(value)
-
-        wheel_metadata = get_metadata('WHEEL')
-        # Check wheel format version is supported.
-        wheel_version = parse_version(wheel_metadata.get('Wheel-Version'))
-        wheel_v1 = (
-            parse_version('1.0') <= wheel_version < parse_version('2.0dev0')
-        )
-        if not wheel_v1:
-            raise ValueError(
-                'unsupported wheel format version: %s' % wheel_version)
-        # Extract to target directory.
-        os.mkdir(destination_eggdir)
-        zf.extractall(destination_eggdir)
-        # Convert metadata.
-        dist_info = os.path.join(destination_eggdir, dist_info)
-        dist = pkg_resources.Distribution.from_location(
-            destination_eggdir, dist_info,
-            metadata=pkg_resources.PathMetadata(destination_eggdir, dist_info),
-        )
-
-        # Note: Evaluate and strip markers now,
-        # as it's difficult to convert back from the syntax:
-        # foobar; "linux" in sys_platform and extra == 'test'
-        def raw_req(req):
-            req.marker = None
-            return str(req)
-        install_requires = list(sorted(map(raw_req, dist.requires())))
-        extras_require = {
-            extra: sorted(
-                req
-                for req in map(raw_req, dist.requires((extra,)))
-                if req not in install_requires
-            )
-            for extra in dist.extras
-        }
-        os.rename(dist_info, egg_info)
-        os.rename(
-            os.path.join(egg_info, 'METADATA'),
-            os.path.join(egg_info, 'PKG-INFO'),
-        )
-        setup_dist = setuptools.Distribution(
-            attrs=dict(
-                install_requires=install_requires,
-                extras_require=extras_require,
+    def add_options(self) -> None:
+        self.cmd_opts.add_option(
+            "-w",
+            "--wheel-dir",
+            dest="wheel_dir",
+            metavar="dir",
+            default=os.curdir,
+            help=(
+                "Build wheels into <dir>, where the default is the "
+                "current working directory."
             ),
         )
-        # Temporarily disable info traces.
-        log_threshold = log._global_log.threshold
-        log.set_threshold(log.WARN)
-        try:
-            write_requirements(
-                setup_dist.get_command_obj('egg_info'),
-                None,
-                os.path.join(egg_info, 'requires.txt'),
-            )
-        finally:
-            log.set_threshold(log_threshold)
+        self.cmd_opts.add_option(cmdoptions.no_binary())
+        self.cmd_opts.add_option(cmdoptions.only_binary())
+        self.cmd_opts.add_option(cmdoptions.prefer_binary())
+        self.cmd_opts.add_option(cmdoptions.no_build_isolation())
+        self.cmd_opts.add_option(cmdoptions.use_pep517())
+        self.cmd_opts.add_option(cmdoptions.check_build_deps())
+        self.cmd_opts.add_option(cmdoptions.constraints())
+        self.cmd_opts.add_option(cmdoptions.build_constraints())
+        self.cmd_opts.add_option(cmdoptions.editable())
+        self.cmd_opts.add_option(cmdoptions.requirements())
+        self.cmd_opts.add_option(cmdoptions.src())
+        self.cmd_opts.add_option(cmdoptions.ignore_requires_python())
+        self.cmd_opts.add_option(cmdoptions.no_deps())
+        self.cmd_opts.add_option(cmdoptions.progress_bar())
 
-    @staticmethod
-    def _move_data_entries(destination_eggdir, dist_data):
-        """Move data entries to their correct location."""
-        dist_data = os.path.join(destination_eggdir, dist_data)
-        dist_data_scripts = os.path.join(dist_data, 'scripts')
-        if os.path.exists(dist_data_scripts):
-            egg_info_scripts = os.path.join(
-                destination_eggdir, 'EGG-INFO', 'scripts')
-            os.mkdir(egg_info_scripts)
-            for entry in os.listdir(dist_data_scripts):
-                # Remove bytecode, as it's not properly handled
-                # during easy_install scripts install phase.
-                if entry.endswith('.pyc'):
-                    os.unlink(os.path.join(dist_data_scripts, entry))
-                else:
-                    os.rename(
-                        os.path.join(dist_data_scripts, entry),
-                        os.path.join(egg_info_scripts, entry),
-                    )
-            os.rmdir(dist_data_scripts)
-        for subdir in filter(os.path.exists, (
-            os.path.join(dist_data, d)
-            for d in ('data', 'headers', 'purelib', 'platlib')
-        )):
-            unpack(subdir, destination_eggdir)
-        if os.path.exists(dist_data):
-            os.rmdir(dist_data)
+        self.cmd_opts.add_option(
+            "--no-verify",
+            dest="no_verify",
+            action="store_true",
+            default=False,
+            help="Don't verify if built wheel is valid.",
+        )
 
-    @staticmethod
-    def _fix_namespace_packages(egg_info, destination_eggdir):
-        namespace_packages = os.path.join(
-            egg_info, 'namespace_packages.txt')
-        if os.path.exists(namespace_packages):
-            with open(namespace_packages) as fp:
-                namespace_packages = fp.read().split()
-            for mod in namespace_packages:
-                mod_dir = os.path.join(destination_eggdir, *mod.split('.'))
-                mod_init = os.path.join(mod_dir, '__init__.py')
-                if not os.path.exists(mod_dir):
-                    os.mkdir(mod_dir)
-                if not os.path.exists(mod_init):
-                    with open(mod_init, 'w') as fp:
-                        fp.write(NAMESPACE_PACKAGE_INIT)
+        self.cmd_opts.add_option(cmdoptions.config_settings())
+
+        self.cmd_opts.add_option(
+            "--pre",
+            action="store_true",
+            default=False,
+            help=(
+                "Include pre-release and development versions. By default, "
+                "pip only finds stable versions."
+            ),
+        )
+
+        self.cmd_opts.add_option(cmdoptions.require_hashes())
+
+        index_opts = cmdoptions.make_option_group(
+            cmdoptions.index_group,
+            self.parser,
+        )
+
+        self.parser.insert_option_group(0, index_opts)
+        self.parser.insert_option_group(0, self.cmd_opts)
+
+    @with_cleanup
+    def run(self, options: Values, args: list[str]) -> int:
+        cmdoptions.check_build_constraints(options)
+
+        session = self.get_default_session(options)
+
+        finder = self._build_package_finder(options, session)
+
+        options.wheel_dir = normalize_path(options.wheel_dir)
+        ensure_dir(options.wheel_dir)
+
+        build_tracker = self.enter_context(get_build_tracker())
+
+        directory = TempDirectory(
+            delete=not options.no_clean,
+            kind="wheel",
+            globally_managed=True,
+        )
+
+        reqs = self.get_requirements(args, options, finder, session)
+
+        wheel_cache = WheelCache(options.cache_dir)
+
+        preparer = self.make_requirement_preparer(
+            temp_build_dir=directory,
+            options=options,
+            build_tracker=build_tracker,
+            session=session,
+            finder=finder,
+            download_dir=options.wheel_dir,
+            use_user_site=False,
+            verbosity=self.verbosity,
+        )
+
+        resolver = self.make_resolver(
+            preparer=preparer,
+            finder=finder,
+            options=options,
+            wheel_cache=wheel_cache,
+            ignore_requires_python=options.ignore_requires_python,
+        )
+
+        self.trace_basic_info(finder)
+
+        requirement_set = resolver.resolve(reqs, check_supported_wheels=True)
+
+        preparer.prepare_linked_requirements_more(requirement_set.requirements.values())
+
+        reqs_to_build: list[InstallRequirement] = []
+        for req in requirement_set.requirements.values():
+            if req.is_wheel:
+                preparer.save_linked_requirement(req)
+            else:
+                reqs_to_build.append(req)
+
+        # build wheels
+        build_successes, build_failures = build(
+            reqs_to_build,
+            wheel_cache=wheel_cache,
+            verify=(not options.no_verify),
+        )
+        for req in build_successes:
+            assert req.link and req.link.is_wheel
+            assert req.local_file_path
+            # copy from cache to target directory
+            try:
+                shutil.copy(req.local_file_path, options.wheel_dir)
+            except OSError as e:
+                logger.warning(
+                    "Building wheel for %s failed: %s",
+                    req.name,
+                    e,
+                )
+                build_failures.append(req)
+        if len(build_failures) != 0:
+            raise CommandError("Failed to build one or more wheels")
+
+        return SUCCESS

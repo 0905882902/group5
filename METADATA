@@ -1,27 +1,28 @@
 Metadata-Version: 2.1
-Name: scipy
-Version: 1.13.1
-Summary: Fundamental algorithms for scientific computing in Python
-Home-page: https://scipy.org/
-Maintainer-Email: SciPy Developers <scipy-dev@python.org>
-License: Copyright (c) 2001-2002 Enthought, Inc. 2003-2024, SciPy Developers.
+Name: numpy
+Version: 2.0.2
+Summary: Fundamental package for array computing in Python
+Home-page: https://numpy.org
+Author: Travis E. Oliphant et al.
+Maintainer-Email: NumPy Developers <numpy-discussion@python.org>
+License: Copyright (c) 2005-2024, NumPy Developers.
         All rights reserved.
         
         Redistribution and use in source and binary forms, with or without
-        modification, are permitted provided that the following conditions
-        are met:
+        modification, are permitted provided that the following conditions are
+        met:
         
-        1. Redistributions of source code must retain the above copyright
-           notice, this list of conditions and the following disclaimer.
+            * Redistributions of source code must retain the above copyright
+               notice, this list of conditions and the following disclaimer.
         
-        2. Redistributions in binary form must reproduce the above
-           copyright notice, this list of conditions and the following
-           disclaimer in the documentation and/or other materials provided
-           with the distribution.
+            * Redistributions in binary form must reproduce the above
+               copyright notice, this list of conditions and the following
+               disclaimer in the documentation and/or other materials provided
+               with the distribution.
         
-        3. Neither the name of the copyright holder nor the names of its
-           contributors may be used to endorse or promote products derived
-           from this software without specific prior written permission.
+            * Neither the name of the NumPy Developers nor the names of any
+               contributors may be used to endorse or promote products derived
+               from this software without specific prior written permission.
         
         THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
         "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
@@ -37,14 +38,47 @@ License: Copyright (c) 2001-2002 Enthought, Inc. 2003-2024, SciPy Developers.
         
         ----
         
-        This binary distribution of SciPy also bundles the following software:
+        The NumPy repository and source distributions bundle several libraries that are
+        compatibly licensed.  We list these here.
         
+        Name: lapack-lite
+        Files: numpy/linalg/lapack_lite/*
+        License: BSD-3-Clause
+          For details, see numpy/linalg/lapack_lite/LICENSE.txt
+        
+        Name: dragon4
+        Files: numpy/_core/src/multiarray/dragon4.c
+        License: MIT
+          For license text, see numpy/_core/src/multiarray/dragon4.c
+        
+        Name: libdivide
+        Files: numpy/_core/include/numpy/libdivide/*
+        License: Zlib
+          For license text, see numpy/_core/include/numpy/libdivide/LICENSE.txt
+        
+        
+        Note that the following files are vendored in the repository and sdist but not
+        installed in built numpy packages:
+        
+        Name: Meson
+        Files: vendored-meson/meson/*
+        License: Apache 2.0
+          For license text, see vendored-meson/meson/COPYING
+        
+        Name: spin
+        Files: .spin/cmds.py
+        License: BSD-3
+          For license text, see .spin/LICENSE
+        
+        ----
+        
+        This binary distribution of NumPy also bundles the following software:
         
         Name: OpenBLAS
-        Files: scipy/.dylibs/libopenblas*.so
+        Files: numpy/.dylibs/libscipy_openblas*.so
         Description: bundled as a dynamically linked library
         Availability: https://github.com/OpenMathLib/OpenBLAS/
-        License: BSD-3-Clause-Attribution
+        License: BSD-3-Clause
           Copyright (c) 2011-2014, The OpenBLAS Project
           All rights reserved.
         
@@ -77,7 +111,7 @@ License: Copyright (c) 2001-2002 Enthought, Inc. 2003-2024, SciPy Developers.
         
         
         Name: LAPACK
-        Files: scipy/.dylibs/libopenblas*.so
+        Files: numpy/.dylibs/libscipy_openblas*.so
         Description: bundled in OpenBLAS
         Availability: https://github.com/OpenMathLib/OpenBLAS/
         License: BSD-3-Clause-Attribution
@@ -132,26 +166,26 @@ License: Copyright (c) 2001-2002 Enthought, Inc. 2003-2024, SciPy Developers.
         
         
         Name: GCC runtime library
-        Files: scipy/.dylibs/libgfortran*, scipy/.dylibs/libgcc*
+        Files: numpy/.dylibs/libgfortran*, numpy/.dylibs/libgcc*
         Description: dynamically linked to files compiled with gcc
         Availability: https://gcc.gnu.org/git/?p=gcc.git;a=tree;f=libgfortran
         License: GPL-3.0-with-GCC-exception
           Copyright (C) 2002-2017 Free Software Foundation, Inc.
-          
+        
           Libgfortran is free software; you can redistribute it and/or modify
           it under the terms of the GNU General Public License as published by
           the Free Software Foundation; either version 3, or (at your option)
           any later version.
-          
+        
           Libgfortran is distributed in the hope that it will be useful,
           but WITHOUT ANY WARRANTY; without even the implied warranty of
           MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
           GNU General Public License for more details.
-          
+        
           Under Section 7 of GPL version 3, you are granted additional
           permissions described in the GCC Runtime Library Exception, version
           3.1, as published by the Free Software Foundation.
-          
+        
           You should have received a copy of the GNU General Public License and
           a copy of the GCC Runtime Library Exception along with this program;
           see the files COPYING3 and COPYING.RUNTIME respectively.  If not, see
@@ -915,9 +949,8 @@ License: Copyright (c) 2001-2002 Enthought, Inc. 2003-2024, SciPy Developers.
         Public License instead of this License.  But first, please read
         <http://www.gnu.org/philosophy/why-not-lgpl.html>.
         
-        
         Name: libquadmath
-        Files: scipy/.dylibs/libquadmath*.so
+        Files: numpy/.dylibs/libquadmath*.so
         Description: dynamically linked to files compiled with gcc
         Availability: https://gcc.gnu.org/git/?p=gcc.git;a=tree;f=libquadmath
         License: LGPL-2.1-or-later
@@ -948,127 +981,106 @@ Classifier: Programming Language :: Python :: 3.9
 Classifier: Programming Language :: Python :: 3.10
 Classifier: Programming Language :: Python :: 3.11
 Classifier: Programming Language :: Python :: 3.12
-Classifier: Topic :: Software Development :: Libraries
+Classifier: Programming Language :: Python :: 3 :: Only
+Classifier: Programming Language :: Python :: Implementation :: CPython
+Classifier: Topic :: Software Development
 Classifier: Topic :: Scientific/Engineering
+Classifier: Typing :: Typed
 Classifier: Operating System :: Microsoft :: Windows
-Classifier: Operating System :: POSIX :: Linux
 Classifier: Operating System :: POSIX
 Classifier: Operating System :: Unix
 Classifier: Operating System :: MacOS
-Project-URL: Homepage, https://scipy.org/
-Project-URL: Documentation, https://docs.scipy.org/doc/scipy/
-Project-URL: Source, https://github.com/scipy/scipy
-Project-URL: Download, https://github.com/scipy/scipy/releases
-Project-URL: Tracker, https://github.com/scipy/scipy/issues
+Project-URL: Homepage, https://numpy.org
+Project-URL: Documentation, https://numpy.org/doc/
+Project-URL: Source, https://github.com/numpy/numpy
+Project-URL: Download, https://pypi.org/project/numpy/#files
+Project-URL: Tracker, https://github.com/numpy/numpy/issues
+Project-URL: Release notes, https://numpy.org/doc/stable/release
 Requires-Python: >=3.9
-Requires-Dist: numpy<2.3,>=1.22.4
-Requires-Dist: pytest; extra == "test"
-Requires-Dist: pytest-cov; extra == "test"
-Requires-Dist: pytest-timeout; extra == "test"
-Requires-Dist: pytest-xdist; extra == "test"
-Requires-Dist: asv; extra == "test"
-Requires-Dist: mpmath; extra == "test"
-Requires-Dist: gmpy2; extra == "test"
-Requires-Dist: threadpoolctl; extra == "test"
-Requires-Dist: scikit-umfpack; extra == "test"
-Requires-Dist: pooch; extra == "test"
-Requires-Dist: hypothesis>=6.30; extra == "test"
-Requires-Dist: array-api-strict; extra == "test"
-Requires-Dist: sphinx>=5.0.0; extra == "doc"
-Requires-Dist: pydata-sphinx-theme>=0.15.2; extra == "doc"
-Requires-Dist: sphinx-design>=0.4.0; extra == "doc"
-Requires-Dist: matplotlib>=3.5; extra == "doc"
-Requires-Dist: numpydoc; extra == "doc"
-Requires-Dist: jupytext; extra == "doc"
-Requires-Dist: myst-nb; extra == "doc"
-Requires-Dist: pooch; extra == "doc"
-Requires-Dist: jupyterlite-sphinx>=0.12.0; extra == "doc"
-Requires-Dist: jupyterlite-pyodide-kernel; extra == "doc"
-Requires-Dist: mypy; extra == "dev"
-Requires-Dist: typing_extensions; extra == "dev"
-Requires-Dist: types-psutil; extra == "dev"
-Requires-Dist: pycodestyle; extra == "dev"
-Requires-Dist: ruff; extra == "dev"
-Requires-Dist: cython-lint>=0.12.2; extra == "dev"
-Requires-Dist: rich-click; extra == "dev"
-Requires-Dist: doit>=0.36.0; extra == "dev"
-Requires-Dist: pydevtool; extra == "dev"
-Provides-Extra: test
-Provides-Extra: doc
-Provides-Extra: dev
-Description-Content-Type: text/x-rst
+Description-Content-Type: text/markdown
 
-.. image:: https://raw.githubusercontent.com/scipy/scipy/main/doc/source/_static/logo.svg
-  :target: https://scipy.org
-  :width: 110
-  :height: 110
-  :align: left 
+<h1 align="center">
+<img src="https://raw.githubusercontent.com/numpy/numpy/main/branding/logo/primary/numpylogo.svg" width="300">
+</h1><br>
 
-.. image:: https://img.shields.io/badge/powered%20by-NumFOCUS-orange.svg?style=flat&colorA=E1523D&colorB=007D8A
-  :target: https://numfocus.org
 
-.. image:: https://img.shields.io/pypi/dm/scipy.svg?label=Pypi%20downloads
-  :target: https://pypi.org/project/scipy/
+[![Powered by NumFOCUS](https://img.shields.io/badge/powered%20by-NumFOCUS-orange.svg?style=flat&colorA=E1523D&colorB=007D8A)](
+https://numfocus.org)
+[![PyPI Downloads](https://img.shields.io/pypi/dm/numpy.svg?label=PyPI%20downloads)](
+https://pypi.org/project/numpy/)
+[![Conda Downloads](https://img.shields.io/conda/dn/conda-forge/numpy.svg?label=Conda%20downloads)](
+https://anaconda.org/conda-forge/numpy)
+[![Stack Overflow](https://img.shields.io/badge/stackoverflow-Ask%20questions-blue.svg)](
+https://stackoverflow.com/questions/tagged/numpy)
+[![Nature Paper](https://img.shields.io/badge/DOI-10.1038%2Fs41586--020--2649--2-blue)](
+https://doi.org/10.1038/s41586-020-2649-2)
+[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/numpy/numpy/badge)](https://securityscorecards.dev/viewer/?uri=github.com/numpy/numpy)
 
-.. image:: https://img.shields.io/conda/dn/conda-forge/scipy.svg?label=Conda%20downloads
-  :target: https://anaconda.org/conda-forge/scipy
 
-.. image:: https://img.shields.io/badge/stackoverflow-Ask%20questions-blue.svg
-  :target: https://stackoverflow.com/questions/tagged/scipy
+NumPy is the fundamental package for scientific computing with Python.
 
-.. image:: https://img.shields.io/badge/DOI-10.1038%2Fs41592--019--0686--2-blue
-  :target: https://www.nature.com/articles/s41592-019-0686-2
-
-SciPy (pronounced "Sigh Pie") is an open-source software for mathematics,
-science, and engineering. It includes modules for statistics, optimization,
-integration, linear algebra, Fourier transforms, signal and image processing,
-ODE solvers, and more.
-
-- **Website:** https://scipy.org
-- **Documentation:** https://docs.scipy.org/doc/scipy/
-- **Development version of the documentation:** https://scipy.github.io/devdocs
-- **Mailing list:** https://mail.python.org/mailman3/lists/scipy-dev.python.org/
-- **Source code:** https://github.com/scipy/scipy
-- **Contributing:** https://scipy.github.io/devdocs/dev/index.html
-- **Bug reports:** https://github.com/scipy/scipy/issues
-- **Code of Conduct:** https://docs.scipy.org/doc/scipy/dev/conduct/code_of_conduct.html
+- **Website:** https://www.numpy.org
+- **Documentation:** https://numpy.org/doc
+- **Mailing list:** https://mail.python.org/mailman/listinfo/numpy-discussion
+- **Source code:** https://github.com/numpy/numpy
+- **Contributing:** https://www.numpy.org/devdocs/dev/index.html
+- **Bug reports:** https://github.com/numpy/numpy/issues
 - **Report a security vulnerability:** https://tidelift.com/docs/security
-- **Citing in your work:** https://www.scipy.org/citing-scipy/
 
-SciPy is built to work with
-NumPy arrays, and provides many user-friendly and efficient numerical routines,
-such as routines for numerical integration and optimization. Together, they
-run on all popular operating systems, are quick to install, and are free of
-charge. NumPy and SciPy are easy to use, but powerful enough to be depended
-upon by some of the world's leading scientists and engineers. If you need to
-manipulate numbers on a computer and display or publish the results, give
-SciPy a try!
+It provides:
 
-For the installation instructions, see `our install
-guide <https://scipy.org/install/>`__.
+- a powerful N-dimensional array object
+- sophisticated (broadcasting) functions
+- tools for integrating C/C++ and Fortran code
+- useful linear algebra, Fourier transform, and random number capabilities
 
+Testing:
+
+NumPy requires `pytest` and `hypothesis`.  Tests can then be run after installation with:
+
+    python -c "import numpy, sys; sys.exit(numpy.test() is False)"
+
+Code of Conduct
+----------------------
+
+NumPy is a community-driven open source project developed by a diverse group of
+[contributors](https://numpy.org/teams/). The NumPy leadership has made a strong
+commitment to creating an open, inclusive, and positive community. Please read the
+[NumPy Code of Conduct](https://numpy.org/code-of-conduct/) for guidance on how to interact
+with others in a way that makes our community thrive.
 
 Call for Contributions
 ----------------------
 
-We appreciate and welcome contributions. Small improvements or fixes are always appreciated; issues labeled as "good
-first issue" may be a good starting point. Have a look at `our contributing
-guide <https://scipy.github.io/devdocs/dev/index.html>`__.
+The NumPy project welcomes your expertise and enthusiasm!
 
-Writing code isn’t the only way to contribute to SciPy. You can also:
+Small improvements or fixes are always appreciated. If you are considering larger contributions
+to the source code, please contact us through the [mailing
+list](https://mail.python.org/mailman/listinfo/numpy-discussion) first.
 
+Writing code isn’t the only way to contribute to NumPy. You can also:
 - review pull requests
-- triage issues
+- help us stay on top of new and old issues
 - develop tutorials, presentations, and other educational materials
-- maintain and improve `our website <https://github.com/scipy/scipy.org>`__
+- maintain and improve [our website](https://github.com/numpy/numpy.org)
 - develop graphic design for our brand assets and promotional materials
+- translate website content
 - help with outreach and onboard new contributors
 - write grant proposals and help with other fundraising efforts
 
+For more information about the ways you can contribute to NumPy, visit [our website](https://numpy.org/contribute/). 
 If you’re unsure where to start or how your skills fit in, reach out! You can
-ask on the mailing list or here, on GitHub, by leaving a
+ask on the mailing list or here, on GitHub, by opening a new issue or leaving a
 comment on a relevant issue that is already open.
 
-If you are new to contributing to open source, `this
-guide <https://opensource.guide/how-to-contribute/>`__ helps explain why, what,
-and how to get involved.
+Our preferred channels of communication are all public, but if you’d like to
+speak to us in private first, contact our community coordinators at
+numpy-team@googlegroups.com or on Slack (write numpy-team@googlegroups.com for
+an invitation).
+
+We also have a biweekly community call, details of which are announced on the
+mailing list. You are very welcome to join.
+
+If you are new to contributing to open source, [this
+guide](https://opensource.guide/how-to-contribute/) helps explain why, what,
+and how to successfully get involved.
