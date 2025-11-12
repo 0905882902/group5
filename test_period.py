@@ -1,119 +1,184 @@
-"""
-This file contains a minimal set of tests for compliance with the extension
-array interface test suite, and should contain no other tests.
-The test suite for the full functionality of the array is located in
-`pandas/tests/arrays/`.
-
-The tests in this file are inherited from the BaseExtensionTests, and only
-minimal tweaks should be applied to get the tests passing (by overwriting a
-parent method).
-
-Additional tests should either be added to one of the BaseExtensionTests
-classes (if they are relevant for the extension interface for all dtypes), or
-be added to the array-specific tests in `pandas/tests/arrays/`.
-
-"""
-from __future__ import annotations
-
-from typing import TYPE_CHECKING
-
 import numpy as np
 import pytest
 
-from pandas._libs import (
-    Period,
-    iNaT,
-)
-from pandas.compat import is_platform_windows
-from pandas.compat.numpy import np_version_gte1p24
+from pandas._libs.tslibs import iNaT
+from pandas._libs.tslibs.period import IncompatibleFrequency
 
+from pandas.core.dtypes.base import _registry as registry
 from pandas.core.dtypes.dtypes import PeriodDtype
 
+import pandas as pd
 import pandas._testing as tm
 from pandas.core.arrays import PeriodArray
-from pandas.tests.extension import base
 
-if TYPE_CHECKING:
-    import pandas as pd
-
-
-@pytest.fixture(params=["D", "2D"])
-def dtype(request):
-    return PeriodDtype(freq=request.param)
+# ----------------------------------------------------------------------------
+# Dtype
 
 
-@pytest.fixture
-def data(dtype):
-    return PeriodArray(np.arange(1970, 2070), dtype=dtype)
+def test_registered():
+    assert PeriodDtype in registry.dtypes
+    result = registry.find("Period[D]")
+    expected = PeriodDtype("D")
+    assert result == expected
 
 
-@pytest.fixture
-def data_for_sorting(dtype):
-    return PeriodArray([2018, 2019, 2017], dtype=dtype)
+# ----------------------------------------------------------------------------
+# period_array
 
 
-@pytest.fixture
-def data_missing(dtype):
-    return PeriodArray([iNaT, 2017], dtype=dtype)
+def test_asi8():
+    result = PeriodArray._from_sequence(["2000", "2001", None], dtype="period[D]").asi8
+    expected = np.array([10957, 11323, iNaT])
+    tm.assert_numpy_array_equal(result, expected)
 
 
-@pytest.fixture
-def data_missing_for_sorting(dtype):
-    return PeriodArray([2018, iNaT, 2017], dtype=dtype)
+def test_take_raises():
+    arr = PeriodArray._from_sequence(["2000", "2001"], dtype="period[D]")
+    with pytest.raises(IncompatibleFrequency, match="freq"):
+        arr.take([0, -1], allow_fill=True, fill_value=pd.Period("2000", freq="W"))
+
+    msg = "value should be a 'Period' or 'NaT'. Got 'str' instead"
+    with pytest.raises(TypeError, match=msg):
+        arr.take([0, -1], allow_fill=True, fill_value="foo")
 
 
-@pytest.fixture
-def data_for_grouping(dtype):
-    B = 2018
-    NA = iNaT
-    A = 2017
-    C = 2019
-    return PeriodArray([B, B, NA, NA, A, A, B, C], dtype=dtype)
+def test_fillna_raises():
+    arr = PeriodArray._from_sequence(["2000", "2001", "2002"], dtype="period[D]")
+    with pytest.raises(ValueError, match="Length"):
+        arr.fillna(arr[:2])
 
 
-class TestPeriodArray(base.ExtensionTests):
-    def _get_expected_exception(self, op_name, obj, other):
-        if op_name in ("__sub__", "__rsub__"):
-            return None
-        return super()._get_expected_exception(op_name, obj, other)
-
-    def _supports_accumulation(self, ser, op_name: str) -> bool:
-        return op_name in ["cummin", "cummax"]
-
-    def _supports_reduction(self, obj, op_name: str) -> bool:
-        return op_name in ["min", "max", "median"]
-
-    def check_reduce(self, ser: pd.Series, op_name: str, skipna: bool):
-        if op_name == "median":
-            res_op = getattr(ser, op_name)
-
-            alt = ser.astype("int64")
-
-            exp_op = getattr(alt, op_name)
-            result = res_op(skipna=skipna)
-            expected = exp_op(skipna=skipna)
-            # error: Item "dtype[Any]" of "dtype[Any] | ExtensionDtype" has no
-            # attribute "freq"
-            freq = ser.dtype.freq  # type: ignore[union-attr]
-            expected = Period._from_ordinal(int(expected), freq=freq)
-            tm.assert_almost_equal(result, expected)
-
-        else:
-            return super().check_reduce(ser, op_name, skipna)
-
-    @pytest.mark.parametrize("periods", [1, -2])
-    def test_diff(self, data, periods):
-        if is_platform_windows() and np_version_gte1p24:
-            with tm.assert_produces_warning(RuntimeWarning, check_stacklevel=False):
-                super().test_diff(data, periods)
-        else:
-            super().test_diff(data, periods)
-
-    @pytest.mark.parametrize("na_action", [None, "ignore"])
-    def test_map(self, data, na_action):
-        result = data.map(lambda x: x, na_action=na_action)
-        tm.assert_extension_array_equal(result, data)
+def test_fillna_copies():
+    arr = PeriodArray._from_sequence(["2000", "2001", "2002"], dtype="period[D]")
+    result = arr.fillna(pd.Period("2000", "D"))
+    assert result is not arr
 
 
-class Test2DCompat(base.NDArrayBacked2DTests):
-    pass
+# ----------------------------------------------------------------------------
+# setitem
+
+
+@pytest.mark.parametrize(
+    "key, value, expected",
+    [
+        ([0], pd.Period("2000", "D"), [10957, 1, 2]),
+        ([0], None, [iNaT, 1, 2]),
+        ([0], np.nan, [iNaT, 1, 2]),
+        ([0, 1, 2], pd.Period("2000", "D"), [10957] * 3),
+        (
+            [0, 1, 2],
+            [pd.Period("2000", "D"), pd.Period("2001", "D"), pd.Period("2002", "D")],
+            [10957, 11323, 11688],
+        ),
+    ],
+)
+def test_setitem(key, value, expected):
+    arr = PeriodArray(np.arange(3), dtype="period[D]")
+    expected = PeriodArray(expected, dtype="period[D]")
+    arr[key] = value
+    tm.assert_period_array_equal(arr, expected)
+
+
+def test_setitem_raises_incompatible_freq():
+    arr = PeriodArray(np.arange(3), dtype="period[D]")
+    with pytest.raises(IncompatibleFrequency, match="freq"):
+        arr[0] = pd.Period("2000", freq="Y")
+
+    other = PeriodArray._from_sequence(["2000", "2001"], dtype="period[Y]")
+    with pytest.raises(IncompatibleFrequency, match="freq"):
+        arr[[0, 1]] = other
+
+
+def test_setitem_raises_length():
+    arr = PeriodArray(np.arange(3), dtype="period[D]")
+    with pytest.raises(ValueError, match="length"):
+        arr[[0, 1]] = [pd.Period("2000", freq="D")]
+
+
+def test_setitem_raises_type():
+    arr = PeriodArray(np.arange(3), dtype="period[D]")
+    with pytest.raises(TypeError, match="int"):
+        arr[0] = 1
+
+
+# ----------------------------------------------------------------------------
+# Ops
+
+
+def test_sub_period():
+    arr = PeriodArray._from_sequence(["2000", "2001"], dtype="period[D]")
+    other = pd.Period("2000", freq="M")
+    with pytest.raises(IncompatibleFrequency, match="freq"):
+        arr - other
+
+
+def test_sub_period_overflow():
+    # GH#47538
+    dti = pd.date_range("1677-09-22", periods=2, freq="D")
+    pi = dti.to_period("ns")
+
+    per = pd.Period._from_ordinal(10**14, pi.freq)
+
+    with pytest.raises(OverflowError, match="Overflow in int64 addition"):
+        pi - per
+
+    with pytest.raises(OverflowError, match="Overflow in int64 addition"):
+        per - pi
+
+
+# ----------------------------------------------------------------------------
+# Methods
+
+
+@pytest.mark.parametrize(
+    "other",
+    [
+        pd.Period("2000", freq="h"),
+        PeriodArray._from_sequence(["2000", "2001", "2000"], dtype="period[h]"),
+    ],
+)
+def test_where_different_freq_raises(other):
+    # GH#45768 The PeriodArray method raises, the Series method coerces
+    ser = pd.Series(
+        PeriodArray._from_sequence(["2000", "2001", "2002"], dtype="period[D]")
+    )
+    cond = np.array([True, False, True])
+
+    with pytest.raises(IncompatibleFrequency, match="freq"):
+        ser.array._where(cond, other)
+
+    res = ser.where(cond, other)
+    expected = ser.astype(object).where(cond, other)
+    tm.assert_series_equal(res, expected)
+
+
+# ----------------------------------------------------------------------------
+# Printing
+
+
+def test_repr_small():
+    arr = PeriodArray._from_sequence(["2000", "2001"], dtype="period[D]")
+    result = str(arr)
+    expected = (
+        "<PeriodArray>\n['2000-01-01', '2001-01-01']\nLength: 2, dtype: period[D]"
+    )
+    assert result == expected
+
+
+def test_repr_large():
+    arr = PeriodArray._from_sequence(["2000", "2001"] * 500, dtype="period[D]")
+    result = str(arr)
+    expected = (
+        "<PeriodArray>\n"
+        "['2000-01-01', '2001-01-01', '2000-01-01', '2001-01-01', "
+        "'2000-01-01',\n"
+        " '2001-01-01', '2000-01-01', '2001-01-01', '2000-01-01', "
+        "'2001-01-01',\n"
+        " ...\n"
+        " '2000-01-01', '2001-01-01', '2000-01-01', '2001-01-01', "
+        "'2000-01-01',\n"
+        " '2001-01-01', '2000-01-01', '2001-01-01', '2000-01-01', "
+        "'2001-01-01']\n"
+        "Length: 1000, dtype: period[D]"
+    )
+    assert result == expected

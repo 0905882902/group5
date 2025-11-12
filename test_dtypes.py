@@ -1,173 +1,139 @@
 import numpy as np
 import pytest
 
-from pandas.errors import DataError
-
-from pandas.core.dtypes.common import pandas_dtype
+from pandas.core.dtypes.dtypes import CategoricalDtype
 
 from pandas import (
-    NA,
-    DataFrame,
+    Categorical,
+    CategoricalIndex,
+    Index,
+    IntervalIndex,
     Series,
+    Timestamp,
 )
 import pandas._testing as tm
 
-# gh-12373 : rolling functions error on float32 data
-# make sure rolling functions works for different dtypes
-#
-# further note that we are only checking rolling for fully dtype
-# compliance (though both expanding and ewm inherit)
 
+class TestCategoricalDtypes:
+    def test_categories_match_up_to_permutation(self):
+        # test dtype comparisons between cats
 
-def get_dtype(dtype, coerce_int=None):
-    if coerce_int is False and "int" in dtype:
-        return None
-    return pandas_dtype(dtype)
+        c1 = Categorical(list("aabca"), categories=list("abc"), ordered=False)
+        c2 = Categorical(list("aabca"), categories=list("cab"), ordered=False)
+        c3 = Categorical(list("aabca"), categories=list("cab"), ordered=True)
+        assert c1._categories_match_up_to_permutation(c1)
+        assert c2._categories_match_up_to_permutation(c2)
+        assert c3._categories_match_up_to_permutation(c3)
+        assert c1._categories_match_up_to_permutation(c2)
+        assert not c1._categories_match_up_to_permutation(c3)
+        assert not c1._categories_match_up_to_permutation(Index(list("aabca")))
+        assert not c1._categories_match_up_to_permutation(c1.astype(object))
+        assert c1._categories_match_up_to_permutation(CategoricalIndex(c1))
+        assert c1._categories_match_up_to_permutation(
+            CategoricalIndex(c1, categories=list("cab"))
+        )
+        assert not c1._categories_match_up_to_permutation(
+            CategoricalIndex(c1, ordered=True)
+        )
 
+        # GH 16659
+        s1 = Series(c1)
+        s2 = Series(c2)
+        s3 = Series(c3)
+        assert c1._categories_match_up_to_permutation(s1)
+        assert c2._categories_match_up_to_permutation(s2)
+        assert c3._categories_match_up_to_permutation(s3)
+        assert c1._categories_match_up_to_permutation(s2)
+        assert not c1._categories_match_up_to_permutation(s3)
+        assert not c1._categories_match_up_to_permutation(s1.astype(object))
 
-@pytest.fixture(
-    params=[
-        "object",
-        "category",
-        "int8",
-        "int16",
-        "int32",
-        "int64",
-        "uint8",
-        "uint16",
-        "uint32",
-        "uint64",
-        "float16",
-        "float32",
-        "float64",
-        "m8[ns]",
-        "M8[ns]",
-        "datetime64[ns, UTC]",
-    ]
-)
-def dtypes(request):
-    """Dtypes for window tests"""
-    return request.param
+    def test_set_dtype_same(self):
+        c = Categorical(["a", "b", "c"])
+        result = c._set_dtype(CategoricalDtype(["a", "b", "c"]))
+        tm.assert_categorical_equal(result, c)
 
+    def test_set_dtype_new_categories(self):
+        c = Categorical(["a", "b", "c"])
+        result = c._set_dtype(CategoricalDtype(list("abcd")))
+        tm.assert_numpy_array_equal(result.codes, c.codes)
+        tm.assert_index_equal(result.dtype.categories, Index(list("abcd")))
 
-@pytest.mark.parametrize(
-    "method, data, expected_data, coerce_int, min_periods",
-    [
-        ("count", np.arange(5), [1, 2, 2, 2, 2], True, 0),
-        ("count", np.arange(10, 0, -2), [1, 2, 2, 2, 2], True, 0),
-        ("count", [0, 1, 2, np.nan, 4], [1, 2, 2, 1, 1], False, 0),
-        ("max", np.arange(5), [np.nan, 1, 2, 3, 4], True, None),
-        ("max", np.arange(10, 0, -2), [np.nan, 10, 8, 6, 4], True, None),
-        ("max", [0, 1, 2, np.nan, 4], [np.nan, 1, 2, np.nan, np.nan], False, None),
-        ("min", np.arange(5), [np.nan, 0, 1, 2, 3], True, None),
-        ("min", np.arange(10, 0, -2), [np.nan, 8, 6, 4, 2], True, None),
-        ("min", [0, 1, 2, np.nan, 4], [np.nan, 0, 1, np.nan, np.nan], False, None),
-        ("sum", np.arange(5), [np.nan, 1, 3, 5, 7], True, None),
-        ("sum", np.arange(10, 0, -2), [np.nan, 18, 14, 10, 6], True, None),
-        ("sum", [0, 1, 2, np.nan, 4], [np.nan, 1, 3, np.nan, np.nan], False, None),
-        ("mean", np.arange(5), [np.nan, 0.5, 1.5, 2.5, 3.5], True, None),
-        ("mean", np.arange(10, 0, -2), [np.nan, 9, 7, 5, 3], True, None),
-        ("mean", [0, 1, 2, np.nan, 4], [np.nan, 0.5, 1.5, np.nan, np.nan], False, None),
-        ("std", np.arange(5), [np.nan] + [np.sqrt(0.5)] * 4, True, None),
-        ("std", np.arange(10, 0, -2), [np.nan] + [np.sqrt(2)] * 4, True, None),
-        (
-            "std",
-            [0, 1, 2, np.nan, 4],
-            [np.nan] + [np.sqrt(0.5)] * 2 + [np.nan] * 2,
-            False,
-            None,
-        ),
-        ("var", np.arange(5), [np.nan, 0.5, 0.5, 0.5, 0.5], True, None),
-        ("var", np.arange(10, 0, -2), [np.nan, 2, 2, 2, 2], True, None),
-        ("var", [0, 1, 2, np.nan, 4], [np.nan, 0.5, 0.5, np.nan, np.nan], False, None),
-        ("median", np.arange(5), [np.nan, 0.5, 1.5, 2.5, 3.5], True, None),
-        ("median", np.arange(10, 0, -2), [np.nan, 9, 7, 5, 3], True, None),
-        (
-            "median",
-            [0, 1, 2, np.nan, 4],
-            [np.nan, 0.5, 1.5, np.nan, np.nan],
-            False,
-            None,
-        ),
-    ],
-)
-def test_series_dtypes(
-    method, data, expected_data, coerce_int, dtypes, min_periods, step
-):
-    ser = Series(data, dtype=get_dtype(dtypes, coerce_int=coerce_int))
-    rolled = ser.rolling(2, min_periods=min_periods, step=step)
+    @pytest.mark.parametrize(
+        "values, categories, new_categories",
+        [
+            # No NaNs, same cats, same order
+            (["a", "b", "a"], ["a", "b"], ["a", "b"]),
+            # No NaNs, same cats, different order
+            (["a", "b", "a"], ["a", "b"], ["b", "a"]),
+            # Same, unsorted
+            (["b", "a", "a"], ["a", "b"], ["a", "b"]),
+            # No NaNs, same cats, different order
+            (["b", "a", "a"], ["a", "b"], ["b", "a"]),
+            # NaNs
+            (["a", "b", "c"], ["a", "b"], ["a", "b"]),
+            (["a", "b", "c"], ["a", "b"], ["b", "a"]),
+            (["b", "a", "c"], ["a", "b"], ["a", "b"]),
+            (["b", "a", "c"], ["a", "b"], ["a", "b"]),
+            # Introduce NaNs
+            (["a", "b", "c"], ["a", "b"], ["a"]),
+            (["a", "b", "c"], ["a", "b"], ["b"]),
+            (["b", "a", "c"], ["a", "b"], ["a"]),
+            (["b", "a", "c"], ["a", "b"], ["a"]),
+            # No overlap
+            (["a", "b", "c"], ["a", "b"], ["d", "e"]),
+        ],
+    )
+    @pytest.mark.parametrize("ordered", [True, False])
+    def test_set_dtype_many(self, values, categories, new_categories, ordered):
+        c = Categorical(values, categories)
+        expected = Categorical(values, new_categories, ordered)
+        result = c._set_dtype(expected.dtype)
+        tm.assert_categorical_equal(result, expected)
 
-    if dtypes in ("m8[ns]", "M8[ns]", "datetime64[ns, UTC]") and method != "count":
-        msg = "No numeric types to aggregate"
-        with pytest.raises(DataError, match=msg):
-            getattr(rolled, method)()
-    else:
-        result = getattr(rolled, method)()
-        expected = Series(expected_data, dtype="float64")[::step]
-        tm.assert_almost_equal(result, expected)
+    def test_set_dtype_no_overlap(self):
+        c = Categorical(["a", "b", "c"], ["d", "e"])
+        result = c._set_dtype(CategoricalDtype(["a", "b"]))
+        expected = Categorical([None, None, None], categories=["a", "b"])
+        tm.assert_categorical_equal(result, expected)
 
+    def test_codes_dtypes(self):
+        # GH 8453
+        result = Categorical(["foo", "bar", "baz"])
+        assert result.codes.dtype == "int8"
 
-def test_series_nullable_int(any_signed_int_ea_dtype, step):
-    # GH 43016
-    ser = Series([0, 1, NA], dtype=any_signed_int_ea_dtype)
-    result = ser.rolling(2, step=step).mean()
-    expected = Series([np.nan, 0.5, np.nan])[::step]
-    tm.assert_series_equal(result, expected)
+        result = Categorical([f"foo{i:05d}" for i in range(400)])
+        assert result.codes.dtype == "int16"
 
+        result = Categorical([f"foo{i:05d}" for i in range(40000)])
+        assert result.codes.dtype == "int32"
 
-@pytest.mark.parametrize(
-    "method, expected_data, min_periods",
-    [
-        ("count", {0: Series([1, 2, 2, 2, 2]), 1: Series([1, 2, 2, 2, 2])}, 0),
-        (
-            "max",
-            {0: Series([np.nan, 2, 4, 6, 8]), 1: Series([np.nan, 3, 5, 7, 9])},
-            None,
-        ),
-        (
-            "min",
-            {0: Series([np.nan, 0, 2, 4, 6]), 1: Series([np.nan, 1, 3, 5, 7])},
-            None,
-        ),
-        (
-            "sum",
-            {0: Series([np.nan, 2, 6, 10, 14]), 1: Series([np.nan, 4, 8, 12, 16])},
-            None,
-        ),
-        (
-            "mean",
-            {0: Series([np.nan, 1, 3, 5, 7]), 1: Series([np.nan, 2, 4, 6, 8])},
-            None,
-        ),
-        (
-            "std",
-            {
-                0: Series([np.nan] + [np.sqrt(2)] * 4),
-                1: Series([np.nan] + [np.sqrt(2)] * 4),
-            },
-            None,
-        ),
-        (
-            "var",
-            {0: Series([np.nan, 2, 2, 2, 2]), 1: Series([np.nan, 2, 2, 2, 2])},
-            None,
-        ),
-        (
-            "median",
-            {0: Series([np.nan, 1, 3, 5, 7]), 1: Series([np.nan, 2, 4, 6, 8])},
-            None,
-        ),
-    ],
-)
-def test_dataframe_dtypes(method, expected_data, dtypes, min_periods, step):
-    df = DataFrame(np.arange(10).reshape((5, 2)), dtype=get_dtype(dtypes))
-    rolled = df.rolling(2, min_periods=min_periods, step=step)
+        # adding cats
+        result = Categorical(["foo", "bar", "baz"])
+        assert result.codes.dtype == "int8"
+        result = result.add_categories([f"foo{i:05d}" for i in range(400)])
+        assert result.codes.dtype == "int16"
 
-    if dtypes in ("m8[ns]", "M8[ns]", "datetime64[ns, UTC]") and method != "count":
-        msg = "Cannot aggregate non-numeric type"
-        with pytest.raises(DataError, match=msg):
-            getattr(rolled, method)()
-    else:
-        result = getattr(rolled, method)()
-        expected = DataFrame(expected_data, dtype="float64")[::step]
-        tm.assert_frame_equal(result, expected)
+        # removing cats
+        result = result.remove_categories([f"foo{i:05d}" for i in range(300)])
+        assert result.codes.dtype == "int8"
+
+    def test_iter_python_types(self):
+        # GH-19909
+        cat = Categorical([1, 2])
+        assert isinstance(next(iter(cat)), int)
+        assert isinstance(cat.tolist()[0], int)
+
+    def test_iter_python_types_datetime(self):
+        cat = Categorical([Timestamp("2017-01-01"), Timestamp("2017-01-02")])
+        assert isinstance(next(iter(cat)), Timestamp)
+        assert isinstance(cat.tolist()[0], Timestamp)
+
+    def test_interval_index_category(self):
+        # GH 38316
+        index = IntervalIndex.from_breaks(np.arange(3, dtype="uint64"))
+
+        result = CategoricalIndex(index).dtype.categories
+        expected = IntervalIndex.from_arrays(
+            [0, 1], [1, 2], dtype="interval[uint64, right]"
+        )
+        tm.assert_index_equal(result, expected)

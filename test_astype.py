@@ -1,287 +1,155 @@
-import pickle
-
 import numpy as np
 import pytest
 
-from pandas.compat import HAS_PYARROW
-from pandas.compat.pyarrow import pa_version_under12p0
-import pandas.util._test_decorators as td
-
-import pandas as pd
 from pandas import (
-    DataFrame,
-    Series,
+    Categorical,
+    CategoricalDtype,
+    CategoricalIndex,
+    DatetimeIndex,
+    Interval,
+    NaT,
+    Period,
     Timestamp,
-    date_range,
+    array,
+    to_datetime,
 )
 import pandas._testing as tm
-from pandas.tests.copy_view.util import get_array
 
 
-def test_astype_single_dtype(using_copy_on_write):
-    df = DataFrame({"a": [1, 2, 3], "b": [4, 5, 6], "c": 1.5})
-    df_orig = df.copy()
-    df2 = df.astype("float64")
+class TestAstype:
+    @pytest.mark.parametrize("cls", [Categorical, CategoricalIndex])
+    @pytest.mark.parametrize("values", [[1, np.nan], [Timestamp("2000"), NaT]])
+    def test_astype_nan_to_int(self, cls, values):
+        # GH#28406
+        obj = cls(values)
 
-    if using_copy_on_write:
-        assert np.shares_memory(get_array(df2, "c"), get_array(df, "c"))
-        assert not np.shares_memory(get_array(df2, "a"), get_array(df, "a"))
-    else:
-        assert not np.shares_memory(get_array(df2, "c"), get_array(df, "c"))
-        assert not np.shares_memory(get_array(df2, "a"), get_array(df, "a"))
+        msg = "Cannot (cast|convert)"
+        with pytest.raises((ValueError, TypeError), match=msg):
+            obj.astype(int)
 
-    # mutating df2 triggers a copy-on-write for that column/block
-    df2.iloc[0, 2] = 5.5
-    if using_copy_on_write:
-        assert not np.shares_memory(get_array(df2, "c"), get_array(df, "c"))
-    tm.assert_frame_equal(df, df_orig)
-
-    # mutating parent also doesn't update result
-    df2 = df.astype("float64")
-    df.iloc[0, 2] = 5.5
-    tm.assert_frame_equal(df2, df_orig.astype("float64"))
-
-
-@pytest.mark.parametrize("dtype", ["int64", "Int64"])
-@pytest.mark.parametrize("new_dtype", ["int64", "Int64", "int64[pyarrow]"])
-def test_astype_avoids_copy(using_copy_on_write, dtype, new_dtype):
-    if new_dtype == "int64[pyarrow]":
-        pytest.importorskip("pyarrow")
-    df = DataFrame({"a": [1, 2, 3]}, dtype=dtype)
-    df_orig = df.copy()
-    df2 = df.astype(new_dtype)
-
-    if using_copy_on_write:
-        assert np.shares_memory(get_array(df2, "a"), get_array(df, "a"))
-    else:
-        assert not np.shares_memory(get_array(df2, "a"), get_array(df, "a"))
-
-    # mutating df2 triggers a copy-on-write for that column/block
-    df2.iloc[0, 0] = 10
-    if using_copy_on_write:
-        assert not np.shares_memory(get_array(df2, "a"), get_array(df, "a"))
-    tm.assert_frame_equal(df, df_orig)
-
-    # mutating parent also doesn't update result
-    df2 = df.astype(new_dtype)
-    df.iloc[0, 0] = 100
-    tm.assert_frame_equal(df2, df_orig.astype(new_dtype))
-
-
-@pytest.mark.parametrize("dtype", ["float64", "int32", "Int32", "int32[pyarrow]"])
-def test_astype_different_target_dtype(using_copy_on_write, dtype):
-    if dtype == "int32[pyarrow]":
-        pytest.importorskip("pyarrow")
-    df = DataFrame({"a": [1, 2, 3]})
-    df_orig = df.copy()
-    df2 = df.astype(dtype)
-
-    assert not np.shares_memory(get_array(df2, "a"), get_array(df, "a"))
-    if using_copy_on_write:
-        assert df2._mgr._has_no_reference(0)
-
-    df2.iloc[0, 0] = 5
-    tm.assert_frame_equal(df, df_orig)
-
-    # mutating parent also doesn't update result
-    df2 = df.astype(dtype)
-    df.iloc[0, 0] = 100
-    tm.assert_frame_equal(df2, df_orig.astype(dtype))
-
-
-@td.skip_array_manager_invalid_test
-def test_astype_numpy_to_ea():
-    ser = Series([1, 2, 3])
-    with pd.option_context("mode.copy_on_write", True):
-        result = ser.astype("Int64")
-    assert np.shares_memory(get_array(ser), get_array(result))
-
-
-@pytest.mark.parametrize(
-    "dtype, new_dtype", [("object", "string"), ("string", "object")]
-)
-def test_astype_string_and_object(using_copy_on_write, dtype, new_dtype):
-    df = DataFrame({"a": ["a", "b", "c"]}, dtype=dtype)
-    df_orig = df.copy()
-    df2 = df.astype(new_dtype)
-
-    if using_copy_on_write:
-        assert np.shares_memory(get_array(df2, "a"), get_array(df, "a"))
-    else:
-        assert not np.shares_memory(get_array(df2, "a"), get_array(df, "a"))
-
-    df2.iloc[0, 0] = "x"
-    tm.assert_frame_equal(df, df_orig)
-
-
-@pytest.mark.parametrize(
-    "dtype, new_dtype", [("object", "string"), ("string", "object")]
-)
-def test_astype_string_and_object_update_original(
-    using_copy_on_write, dtype, new_dtype
-):
-    df = DataFrame({"a": ["a", "b", "c"]}, dtype=dtype)
-    df2 = df.astype(new_dtype)
-    df_orig = df2.copy()
-
-    if using_copy_on_write:
-        assert np.shares_memory(get_array(df2, "a"), get_array(df, "a"))
-    else:
-        assert not np.shares_memory(get_array(df2, "a"), get_array(df, "a"))
-
-    df.iloc[0, 0] = "x"
-    tm.assert_frame_equal(df2, df_orig)
-
-
-def test_astype_str_copy_on_pickle_roundrip():
-    # TODO(infer_string) this test can be removed after 3.0 (once str is the default)
-    # https://github.com/pandas-dev/pandas/issues/54654
-    # ensure_string_array may alter array inplace
-    base = Series(np.array([(1, 2), None, 1], dtype="object"))
-    base_copy = pickle.loads(pickle.dumps(base))
-    base_copy.astype(str)
-    tm.assert_series_equal(base, base_copy)
-
-
-def test_astype_string_copy_on_pickle_roundrip(any_string_dtype):
-    # https://github.com/pandas-dev/pandas/issues/54654
-    # ensure_string_array may alter array inplace
-    base = Series(np.array([(1, 2), None, 1], dtype="object"))
-    base_copy = pickle.loads(pickle.dumps(base))
-    base_copy.astype(any_string_dtype)
-    tm.assert_series_equal(base, base_copy)
-
-
-def test_astype_string_read_only_on_pickle_roundrip(any_string_dtype):
-    # https://github.com/pandas-dev/pandas/issues/54654
-    # ensure_string_array may alter read-only array inplace
-    base = Series(np.array([(1, 2), None, 1], dtype="object"))
-    base_copy = pickle.loads(pickle.dumps(base))
-    base_copy._values.flags.writeable = False
-    base_copy.astype(any_string_dtype)
-    tm.assert_series_equal(base, base_copy)
-
-
-def test_astype_dict_dtypes(using_copy_on_write):
-    df = DataFrame(
-        {"a": [1, 2, 3], "b": [4, 5, 6], "c": Series([1.5, 1.5, 1.5], dtype="float64")}
+    @pytest.mark.parametrize(
+        "expected",
+        [
+            array(["2019", "2020"], dtype="datetime64[ns, UTC]"),
+            array([0, 0], dtype="timedelta64[ns]"),
+            array([Period("2019"), Period("2020")], dtype="period[Y-DEC]"),
+            array([Interval(0, 1), Interval(1, 2)], dtype="interval"),
+            array([1, np.nan], dtype="Int64"),
+        ],
     )
-    df_orig = df.copy()
-    df2 = df.astype({"a": "float64", "c": "float64"})
+    def test_astype_category_to_extension_dtype(self, expected):
+        # GH#28668
+        result = expected.astype("category").astype(expected.dtype)
 
-    if using_copy_on_write:
-        assert np.shares_memory(get_array(df2, "c"), get_array(df, "c"))
-        assert np.shares_memory(get_array(df2, "b"), get_array(df, "b"))
-        assert not np.shares_memory(get_array(df2, "a"), get_array(df, "a"))
-    else:
-        assert not np.shares_memory(get_array(df2, "c"), get_array(df, "c"))
-        assert not np.shares_memory(get_array(df2, "b"), get_array(df, "b"))
-        assert not np.shares_memory(get_array(df2, "a"), get_array(df, "a"))
+        tm.assert_extension_array_equal(result, expected)
 
-    # mutating df2 triggers a copy-on-write for that column/block
-    df2.iloc[0, 2] = 5.5
-    if using_copy_on_write:
-        assert not np.shares_memory(get_array(df2, "c"), get_array(df, "c"))
-
-    df2.iloc[0, 1] = 10
-    if using_copy_on_write:
-        assert not np.shares_memory(get_array(df2, "b"), get_array(df, "b"))
-    tm.assert_frame_equal(df, df_orig)
-
-
-def test_astype_different_datetime_resos(using_copy_on_write):
-    df = DataFrame({"a": date_range("2019-12-31", periods=2, freq="D")})
-    result = df.astype("datetime64[ms]")
-
-    assert not np.shares_memory(get_array(df, "a"), get_array(result, "a"))
-    if using_copy_on_write:
-        assert result._mgr._has_no_reference(0)
-
-
-def test_astype_different_timezones(using_copy_on_write):
-    df = DataFrame(
-        {"a": date_range("2019-12-31", periods=5, freq="D", tz="US/Pacific")}
+    @pytest.mark.parametrize(
+        "dtype, expected",
+        [
+            (
+                "datetime64[ns]",
+                np.array(["2015-01-01T00:00:00.000000000"], dtype="datetime64[ns]"),
+            ),
+            (
+                "datetime64[ns, MET]",
+                DatetimeIndex([Timestamp("2015-01-01 00:00:00+0100", tz="MET")]).array,
+            ),
+        ],
     )
-    result = df.astype("datetime64[ns, Europe/Berlin]")
-    if using_copy_on_write:
-        assert not result._mgr._has_no_reference(0)
-        assert np.shares_memory(get_array(df, "a"), get_array(result, "a"))
+    def test_astype_to_datetime64(self, dtype, expected):
+        # GH#28448
+        result = Categorical(["2015-01-01"]).astype(dtype)
+        assert result == expected
 
+    def test_astype_str_int_categories_to_nullable_int(self):
+        # GH#39616
+        dtype = CategoricalDtype([str(i) for i in range(5)])
+        codes = np.random.default_rng(2).integers(5, size=20)
+        arr = Categorical.from_codes(codes, dtype=dtype)
 
-def test_astype_different_timezones_different_reso(using_copy_on_write):
-    df = DataFrame(
-        {"a": date_range("2019-12-31", periods=5, freq="D", tz="US/Pacific")}
-    )
-    result = df.astype("datetime64[ms, Europe/Berlin]")
-    if using_copy_on_write:
-        assert result._mgr._has_no_reference(0)
-        assert not np.shares_memory(get_array(df, "a"), get_array(result, "a"))
+        res = arr.astype("Int64")
+        expected = array(codes, dtype="Int64")
+        tm.assert_extension_array_equal(res, expected)
 
+    def test_astype_str_int_categories_to_nullable_float(self):
+        # GH#39616
+        dtype = CategoricalDtype([str(i / 2) for i in range(5)])
+        codes = np.random.default_rng(2).integers(5, size=20)
+        arr = Categorical.from_codes(codes, dtype=dtype)
 
-def test_astype_arrow_timestamp(using_copy_on_write):
-    pytest.importorskip("pyarrow")
-    df = DataFrame(
-        {
-            "a": [
-                Timestamp("2020-01-01 01:01:01.000001"),
-                Timestamp("2020-01-01 01:01:01.000001"),
-            ]
-        },
-        dtype="M8[ns]",
-    )
-    result = df.astype("timestamp[ns][pyarrow]")
-    if using_copy_on_write:
-        assert not result._mgr._has_no_reference(0)
-        if pa_version_under12p0:
-            assert not np.shares_memory(
-                get_array(df, "a"), get_array(result, "a")._pa_array
-            )
-        else:
-            assert np.shares_memory(
-                get_array(df, "a"), get_array(result, "a")._pa_array
-            )
+        res = arr.astype("Float64")
+        expected = array(codes, dtype="Float64") / 2
+        tm.assert_extension_array_equal(res, expected)
 
+    @pytest.mark.parametrize("ordered", [True, False])
+    def test_astype(self, ordered):
+        # string
+        cat = Categorical(list("abbaaccc"), ordered=ordered)
+        result = cat.astype(object)
+        expected = np.array(cat)
+        tm.assert_numpy_array_equal(result, expected)
 
-def test_convert_dtypes_infer_objects(using_copy_on_write):
-    ser = Series(["a", "b", "c"])
-    ser_orig = ser.copy()
-    result = ser.convert_dtypes(
-        convert_integer=False,
-        convert_boolean=False,
-        convert_floating=False,
-        convert_string=False,
-    )
+        msg = r"Cannot cast object|str dtype to float64"
+        with pytest.raises(ValueError, match=msg):
+            cat.astype(float)
 
-    if using_copy_on_write:
-        assert tm.shares_memory(get_array(ser), get_array(result))
-    else:
-        assert not np.shares_memory(get_array(ser), get_array(result))
+        # numeric
+        cat = Categorical([0, 1, 2, 2, 1, 0, 1, 0, 2], ordered=ordered)
+        result = cat.astype(object)
+        expected = np.array(cat, dtype=object)
+        tm.assert_numpy_array_equal(result, expected)
 
-    result.iloc[0] = "x"
-    tm.assert_series_equal(ser, ser_orig)
+        result = cat.astype(int)
+        expected = np.array(cat, dtype="int")
+        tm.assert_numpy_array_equal(result, expected)
 
+        result = cat.astype(float)
+        expected = np.array(cat, dtype=float)
+        tm.assert_numpy_array_equal(result, expected)
 
-def test_convert_dtypes(using_copy_on_write, using_infer_string):
-    df = DataFrame({"a": ["a", "b"], "b": [1, 2], "c": [1.5, 2.5], "d": [True, False]})
-    df_orig = df.copy()
-    df2 = df.convert_dtypes()
+    @pytest.mark.parametrize("dtype_ordered", [True, False])
+    @pytest.mark.parametrize("cat_ordered", [True, False])
+    def test_astype_category(self, dtype_ordered, cat_ordered):
+        # GH#10696/GH#18593
+        data = list("abcaacbab")
+        cat = Categorical(data, categories=list("bac"), ordered=cat_ordered)
 
-    if using_copy_on_write:
-        if using_infer_string and HAS_PYARROW:
-            # TODO the default nullable string dtype still uses python storage
-            # this should be changed to pyarrow if installed
-            assert not tm.shares_memory(get_array(df2, "a"), get_array(df, "a"))
-        else:
-            assert tm.shares_memory(get_array(df2, "a"), get_array(df, "a"))
-        assert tm.shares_memory(get_array(df2, "d"), get_array(df, "d"))
-        assert tm.shares_memory(get_array(df2, "b"), get_array(df, "b"))
-        assert tm.shares_memory(get_array(df2, "c"), get_array(df, "c"))
-    else:
-        assert not np.shares_memory(get_array(df2, "a"), get_array(df, "a"))
-        assert not np.shares_memory(get_array(df2, "b"), get_array(df, "b"))
-        assert not np.shares_memory(get_array(df2, "c"), get_array(df, "c"))
-        assert not np.shares_memory(get_array(df2, "d"), get_array(df, "d"))
+        # standard categories
+        dtype = CategoricalDtype(ordered=dtype_ordered)
+        result = cat.astype(dtype)
+        expected = Categorical(data, categories=cat.categories, ordered=dtype_ordered)
+        tm.assert_categorical_equal(result, expected)
 
-    df2.iloc[0, 0] = "x"
-    df2.iloc[0, 1] = 10
-    tm.assert_frame_equal(df, df_orig)
+        # non-standard categories
+        dtype = CategoricalDtype(list("adc"), dtype_ordered)
+        result = cat.astype(dtype)
+        expected = Categorical(data, dtype=dtype)
+        tm.assert_categorical_equal(result, expected)
+
+        if dtype_ordered is False:
+            # dtype='category' can't specify ordered, so only test once
+            result = cat.astype("category")
+            expected = cat
+            tm.assert_categorical_equal(result, expected)
+
+    def test_astype_object_datetime_categories(self):
+        # GH#40754
+        cat = Categorical(to_datetime(["2021-03-27", NaT]))
+        result = cat.astype(object)
+        expected = np.array([Timestamp("2021-03-27 00:00:00"), NaT], dtype="object")
+        tm.assert_numpy_array_equal(result, expected)
+
+    def test_astype_object_timestamp_categories(self):
+        # GH#18024
+        cat = Categorical([Timestamp("2014-01-01")])
+        result = cat.astype(object)
+        expected = np.array([Timestamp("2014-01-01 00:00:00")], dtype="object")
+        tm.assert_numpy_array_equal(result, expected)
+
+    def test_astype_category_readonly_mask_values(self):
+        # GH#53658
+        arr = array([0, 1, 2], dtype="Int64")
+        arr._mask.flags["WRITEABLE"] = False
+        result = arr.astype("category")
+        expected = array([0, 1, 2], dtype="Int64").astype("category")
+        tm.assert_extension_array_equal(result, expected)

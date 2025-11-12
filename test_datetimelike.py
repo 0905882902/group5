@@ -1,1760 +1,1360 @@
-""" Test cases for time series specific (freq conversion, etc) """
-from datetime import (
-    date,
-    datetime,
-    time,
-    timedelta,
-)
-import pickle
+from __future__ import annotations
+
+import re
+import warnings
 
 import numpy as np
 import pytest
 
-from pandas._libs.tslibs import (
-    BaseOffset,
-    to_offset,
+from pandas._libs import (
+    NaT,
+    OutOfBoundsDatetime,
+    Timestamp,
 )
 from pandas._libs.tslibs.dtypes import freq_to_period_freqstr
+from pandas.compat.numpy import np_version_gt2
 
+import pandas as pd
 from pandas import (
-    DataFrame,
-    Index,
-    NaT,
-    Series,
-    concat,
-    isna,
-    to_datetime,
-)
-import pandas._testing as tm
-from pandas.core.indexes.datetimes import (
     DatetimeIndex,
-    bdate_range,
-    date_range,
-)
-from pandas.core.indexes.period import (
     Period,
     PeriodIndex,
-    period_range,
+    TimedeltaIndex,
 )
-from pandas.core.indexes.timedeltas import timedelta_range
-from pandas.tests.plotting.common import _check_ticks_props
+import pandas._testing as tm
+from pandas.core.arrays import (
+    DatetimeArray,
+    NumpyExtensionArray,
+    PeriodArray,
+    TimedeltaArray,
+)
 
-from pandas.tseries.offsets import WeekOfMonth
 
-mpl = pytest.importorskip("matplotlib")
+# TODO: more freq variants
+@pytest.fixture(params=["D", "B", "W", "ME", "QE", "YE"])
+def freqstr(request):
+    """Fixture returning parametrized frequency in string format."""
+    return request.param
 
 
-class TestTSPlot:
-    @pytest.mark.filterwarnings("ignore::UserWarning")
-    def test_ts_plot_with_tz(self, tz_aware_fixture):
-        # GH2877, GH17173, GH31205, GH31580
-        tz = tz_aware_fixture
-        index = date_range("1/1/2011", periods=2, freq="h", tz=tz)
-        ts = Series([188.5, 328.25], index=index)
-        _check_plot_works(ts.plot)
-        ax = ts.plot()
-        xdata = next(iter(ax.get_lines())).get_xdata()
-        # Check first and last points' labels are correct
-        assert (xdata[0].hour, xdata[0].minute) == (0, 0)
-        assert (xdata[-1].hour, xdata[-1].minute) == (1, 0)
+@pytest.fixture
+def period_index(freqstr):
+    """
+    A fixture to provide PeriodIndex objects with different frequencies.
 
-    def test_fontsize_set_correctly(self):
-        # For issue #8765
-        df = DataFrame(
-            np.random.default_rng(2).standard_normal((10, 9)), index=range(10)
+    Most PeriodArray behavior is already tested in PeriodIndex tests,
+    so here we just test that the PeriodArray behavior matches
+    the PeriodIndex behavior.
+    """
+    # TODO: non-monotone indexes; NaTs, different start dates
+    with warnings.catch_warnings():
+        # suppress deprecation of Period[B]
+        warnings.filterwarnings(
+            "ignore", message="Period with BDay freq", category=FutureWarning
         )
-        _, ax = mpl.pyplot.subplots()
-        df.plot(fontsize=2, ax=ax)
-        for label in ax.get_xticklabels() + ax.get_yticklabels():
-            assert label.get_fontsize() == 2
+        freqstr = freq_to_period_freqstr(1, freqstr)
+        pi = pd.period_range(start=Timestamp("2000-01-01"), periods=100, freq=freqstr)
+    return pi
 
-    def test_frame_inferred(self):
-        # inferred freq
-        idx = date_range("1/1/1987", freq="MS", periods=100)
-        idx = DatetimeIndex(idx.values, freq=None)
 
-        df = DataFrame(
-            np.random.default_rng(2).standard_normal((len(idx), 3)), index=idx
-        )
-        _check_plot_works(df.plot)
+@pytest.fixture
+def datetime_index(freqstr):
+    """
+    A fixture to provide DatetimeIndex objects with different frequencies.
 
-        # axes freq
-        idx = idx[0:40].union(idx[45:99])
-        df2 = DataFrame(
-            np.random.default_rng(2).standard_normal((len(idx), 3)), index=idx
-        )
-        _check_plot_works(df2.plot)
+    Most DatetimeArray behavior is already tested in DatetimeIndex tests,
+    so here we just test that the DatetimeArray behavior matches
+    the DatetimeIndex behavior.
+    """
+    # TODO: non-monotone indexes; NaTs, different start dates, timezones
+    dti = pd.date_range(start=Timestamp("2000-01-01"), periods=100, freq=freqstr)
+    return dti
 
-    def test_frame_inferred_n_gt_1(self):
-        # N > 1
-        idx = date_range("2008-1-1 00:15:00", freq="15min", periods=10)
-        idx = DatetimeIndex(idx.values, freq=None)
-        df = DataFrame(
-            np.random.default_rng(2).standard_normal((len(idx), 3)), index=idx
-        )
-        _check_plot_works(df.plot)
 
-    def test_is_error_nozeroindex(self):
-        # GH11858
-        i = np.array([1, 2, 3])
-        a = DataFrame(i, index=i)
-        _check_plot_works(a.plot, xerr=a)
-        _check_plot_works(a.plot, yerr=a)
+@pytest.fixture
+def timedelta_index():
+    """
+    A fixture to provide TimedeltaIndex objects with different frequencies.
+     Most TimedeltaArray behavior is already tested in TimedeltaIndex tests,
+    so here we just test that the TimedeltaArray behavior matches
+    the TimedeltaIndex behavior.
+    """
+    # TODO: flesh this out
+    return TimedeltaIndex(["1 Day", "3 Hours", "NaT"])
 
-    def test_nonnumeric_exclude(self):
-        idx = date_range("1/1/1987", freq="YE", periods=3)
-        df = DataFrame({"A": ["x", "y", "z"], "B": [1, 2, 3]}, idx)
 
-        fig, ax = mpl.pyplot.subplots()
-        df.plot(ax=ax)  # it works
-        assert len(ax.get_lines()) == 1  # B was plotted
-        mpl.pyplot.close(fig)
+class SharedTests:
+    index_cls: type[DatetimeIndex | PeriodIndex | TimedeltaIndex]
 
-    def test_nonnumeric_exclude_error(self):
-        idx = date_range("1/1/1987", freq="YE", periods=3)
-        df = DataFrame({"A": ["x", "y", "z"], "B": [1, 2, 3]}, idx)
-        msg = "no numeric data to plot"
+    @pytest.fixture
+    def arr1d(self):
+        """Fixture returning DatetimeArray with daily frequency."""
+        data = np.arange(10, dtype="i8") * 24 * 3600 * 10**9
+        if self.array_cls is PeriodArray:
+            arr = self.array_cls(data, freq="D")
+        else:
+            arr = self.index_cls(data, freq="D")._data
+        return arr
+
+    def test_compare_len1_raises(self, arr1d):
+        # make sure we raise when comparing with different lengths, specific
+        #  to the case where one has length-1, which numpy would broadcast
+        arr = arr1d
+        idx = self.index_cls(arr)
+
+        with pytest.raises(ValueError, match="Lengths must match"):
+            arr == arr[:1]
+
+        # test the index classes while we're at it, GH#23078
+        with pytest.raises(ValueError, match="Lengths must match"):
+            idx <= idx[[0]]
+
+    @pytest.mark.parametrize(
+        "result",
+        [
+            pd.date_range("2020", periods=3),
+            pd.date_range("2020", periods=3, tz="UTC"),
+            pd.timedelta_range("0 days", periods=3),
+            pd.period_range("2020Q1", periods=3, freq="Q"),
+        ],
+    )
+    def test_compare_with_Categorical(self, result):
+        expected = pd.Categorical(result)
+        assert all(result == expected)
+        assert not any(result != expected)
+
+    @pytest.mark.parametrize("reverse", [True, False])
+    @pytest.mark.parametrize("as_index", [True, False])
+    def test_compare_categorical_dtype(self, arr1d, as_index, reverse, ordered):
+        other = pd.Categorical(arr1d, ordered=ordered)
+        if as_index:
+            other = pd.CategoricalIndex(other)
+
+        left, right = arr1d, other
+        if reverse:
+            left, right = right, left
+
+        ones = np.ones(arr1d.shape, dtype=bool)
+        zeros = ~ones
+
+        result = left == right
+        tm.assert_numpy_array_equal(result, ones)
+
+        result = left != right
+        tm.assert_numpy_array_equal(result, zeros)
+
+        if not reverse and not as_index:
+            # Otherwise Categorical raises TypeError bc it is not ordered
+            # TODO: we should probably get the same behavior regardless?
+            result = left < right
+            tm.assert_numpy_array_equal(result, zeros)
+
+            result = left <= right
+            tm.assert_numpy_array_equal(result, ones)
+
+            result = left > right
+            tm.assert_numpy_array_equal(result, zeros)
+
+            result = left >= right
+            tm.assert_numpy_array_equal(result, ones)
+
+    def test_take(self):
+        data = np.arange(100, dtype="i8") * 24 * 3600 * 10**9
+        np.random.default_rng(2).shuffle(data)
+
+        if self.array_cls is PeriodArray:
+            arr = PeriodArray(data, dtype="period[D]")
+        else:
+            arr = self.index_cls(data)._data
+        idx = self.index_cls._simple_new(arr)
+
+        takers = [1, 4, 94]
+        result = arr.take(takers)
+        expected = idx.take(takers)
+
+        tm.assert_index_equal(self.index_cls(result), expected)
+
+        takers = np.array([1, 4, 94])
+        result = arr.take(takers)
+        expected = idx.take(takers)
+
+        tm.assert_index_equal(self.index_cls(result), expected)
+
+    @pytest.mark.parametrize("fill_value", [2, 2.0, Timestamp(2021, 1, 1, 12).time])
+    def test_take_fill_raises(self, fill_value, arr1d):
+        msg = f"value should be a '{arr1d._scalar_type.__name__}' or 'NaT'. Got"
         with pytest.raises(TypeError, match=msg):
-            df["A"].plot()
+            arr1d.take([0, 1], allow_fill=True, fill_value=fill_value)
 
-    @pytest.mark.parametrize("freq", ["s", "min", "h", "D", "W", "M", "Q", "Y"])
-    def test_tsplot_period(self, freq):
-        idx = period_range("12/31/1999", freq=freq, periods=100)
-        ser = Series(np.random.default_rng(2).standard_normal(len(idx)), idx)
-        _, ax = mpl.pyplot.subplots()
-        _check_plot_works(ser.plot, ax=ax)
+    def test_take_fill(self, arr1d):
+        arr = arr1d
 
-    @pytest.mark.parametrize(
-        "freq", ["s", "min", "h", "D", "W", "ME", "QE-DEC", "YE", "1B30Min"]
-    )
-    def test_tsplot_datetime(self, freq):
-        idx = date_range("12/31/1999", freq=freq, periods=100)
-        ser = Series(np.random.default_rng(2).standard_normal(len(idx)), idx)
-        _, ax = mpl.pyplot.subplots()
-        _check_plot_works(ser.plot, ax=ax)
+        result = arr.take([-1, 1], allow_fill=True, fill_value=None)
+        assert result[0] is NaT
 
-    def test_tsplot(self):
-        ts = Series(
-            np.arange(10, dtype=np.float64), index=date_range("2020-01-01", periods=10)
-        )
-        _, ax = mpl.pyplot.subplots()
-        ts.plot(style="k", ax=ax)
-        color = (0.0, 0.0, 0.0, 1)
-        assert color == ax.get_lines()[0].get_color()
+        result = arr.take([-1, 1], allow_fill=True, fill_value=np.nan)
+        assert result[0] is NaT
 
-    def test_both_style_and_color(self):
-        ts = Series(
-            np.arange(10, dtype=np.float64), index=date_range("2020-01-01", periods=10)
-        )
-        msg = (
-            "Cannot pass 'style' string with a color symbol and 'color' "
-            "keyword argument. Please use one or the other or pass 'style' "
-            "without a color symbol"
-        )
-        with pytest.raises(ValueError, match=msg):
-            ts.plot(style="b-", color="#000099")
-
-        s = ts.reset_index(drop=True)
-        with pytest.raises(ValueError, match=msg):
-            s.plot(style="b-", color="#000099")
-
-    @pytest.mark.parametrize("freq", ["ms", "us"])
-    def test_high_freq(self, freq):
-        _, ax = mpl.pyplot.subplots()
-        rng = date_range("1/1/2012", periods=100, freq=freq)
-        ser = Series(np.random.default_rng(2).standard_normal(len(rng)), rng)
-        _check_plot_works(ser.plot, ax=ax)
-
-    def test_get_datevalue(self):
-        from pandas.plotting._matplotlib.converter import get_datevalue
-
-        assert get_datevalue(None, "D") is None
-        assert get_datevalue(1987, "Y") == 1987
-        assert get_datevalue(Period(1987, "Y"), "M") == Period("1987-12", "M").ordinal
-        assert get_datevalue("1/1/1987", "D") == Period("1987-1-1", "D").ordinal
-
-    def test_ts_plot_format_coord(self):
-        def check_format_of_first_point(ax, expected_string):
-            first_line = ax.get_lines()[0]
-            first_x = first_line.get_xdata()[0].ordinal
-            first_y = first_line.get_ydata()[0]
-            assert expected_string == ax.format_coord(first_x, first_y)
-
-        annual = Series(1, index=date_range("2014-01-01", periods=3, freq="YE-DEC"))
-        _, ax = mpl.pyplot.subplots()
-        annual.plot(ax=ax)
-        check_format_of_first_point(ax, "t = 2014  y = 1.000000")
-
-        # note this is added to the annual plot already in existence, and
-        # changes its freq field
-        daily = Series(1, index=date_range("2014-01-01", periods=3, freq="D"))
-        daily.plot(ax=ax)
-        check_format_of_first_point(ax, "t = 2014-01-01  y = 1.000000")
-
-    @pytest.mark.parametrize("freq", ["s", "min", "h", "D", "W", "M", "Q", "Y"])
-    def test_line_plot_period_series(self, freq):
-        idx = period_range("12/31/1999", freq=freq, periods=100)
-        ser = Series(np.random.default_rng(2).standard_normal(len(idx)), idx)
-        _check_plot_works(ser.plot, ser.index.freq)
-
-    @pytest.mark.parametrize(
-        "frqncy", ["1s", "3s", "5min", "7h", "4D", "8W", "11M", "3Y"]
-    )
-    def test_line_plot_period_mlt_series(self, frqncy):
-        # test period index line plot for series with multiples (`mlt`) of the
-        # frequency (`frqncy`) rule code. tests resolution of issue #14763
-        idx = period_range("12/31/1999", freq=frqncy, periods=100)
-        s = Series(np.random.default_rng(2).standard_normal(len(idx)), idx)
-        _check_plot_works(s.plot, s.index.freq.rule_code)
-
-    @pytest.mark.parametrize(
-        "freq", ["s", "min", "h", "D", "W", "ME", "QE-DEC", "YE", "1B30Min"]
-    )
-    def test_line_plot_datetime_series(self, freq):
-        idx = date_range("12/31/1999", freq=freq, periods=100)
-        ser = Series(np.random.default_rng(2).standard_normal(len(idx)), idx)
-        _check_plot_works(ser.plot, ser.index.freq.rule_code)
-
-    @pytest.mark.parametrize("freq", ["s", "min", "h", "D", "W", "ME", "QE", "YE"])
-    def test_line_plot_period_frame(self, freq):
-        idx = date_range("12/31/1999", freq=freq, periods=100)
-        df = DataFrame(
-            np.random.default_rng(2).standard_normal((len(idx), 3)),
-            index=idx,
-            columns=["A", "B", "C"],
-        )
-        _check_plot_works(df.plot, df.index.freq)
-
-    @pytest.mark.parametrize(
-        "frqncy", ["1s", "3s", "5min", "7h", "4D", "8W", "11M", "3Y"]
-    )
-    def test_line_plot_period_mlt_frame(self, frqncy):
-        # test period index line plot for DataFrames with multiples (`mlt`)
-        # of the frequency (`frqncy`) rule code. tests resolution of issue
-        # #14763
-        idx = period_range("12/31/1999", freq=frqncy, periods=100)
-        df = DataFrame(
-            np.random.default_rng(2).standard_normal((len(idx), 3)),
-            index=idx,
-            columns=["A", "B", "C"],
-        )
-        freq = freq_to_period_freqstr(1, df.index.freq.rule_code)
-        freq = df.index.asfreq(freq).freq
-        _check_plot_works(df.plot, freq)
-
-    @pytest.mark.filterwarnings(r"ignore:PeriodDtype\[B\] is deprecated:FutureWarning")
-    @pytest.mark.parametrize(
-        "freq", ["s", "min", "h", "D", "W", "ME", "QE-DEC", "YE", "1B30Min"]
-    )
-    def test_line_plot_datetime_frame(self, freq):
-        idx = date_range("12/31/1999", freq=freq, periods=100)
-        df = DataFrame(
-            np.random.default_rng(2).standard_normal((len(idx), 3)),
-            index=idx,
-            columns=["A", "B", "C"],
-        )
-        freq = freq_to_period_freqstr(1, df.index.freq.rule_code)
-        freq = df.index.to_period(freq).freq
-        _check_plot_works(df.plot, freq)
-
-    @pytest.mark.parametrize(
-        "freq", ["s", "min", "h", "D", "W", "ME", "QE-DEC", "YE", "1B30Min"]
-    )
-    def test_line_plot_inferred_freq(self, freq):
-        idx = date_range("12/31/1999", freq=freq, periods=100)
-        ser = Series(np.random.default_rng(2).standard_normal(len(idx)), idx)
-        ser = Series(ser.values, Index(np.asarray(ser.index)))
-        _check_plot_works(ser.plot, ser.index.inferred_freq)
-
-        ser = ser.iloc[[0, 3, 5, 6]]
-        _check_plot_works(ser.plot)
-
-    def test_fake_inferred_business(self):
-        _, ax = mpl.pyplot.subplots()
-        rng = date_range("2001-1-1", "2001-1-10")
-        ts = Series(range(len(rng)), index=rng)
-        ts = concat([ts[:3], ts[5:]])
-        ts.plot(ax=ax)
-        assert not hasattr(ax, "freq")
-
-    def test_plot_offset_freq(self):
-        ser = Series(
-            np.arange(10, dtype=np.float64), index=date_range("2020-01-01", periods=10)
-        )
-        _check_plot_works(ser.plot)
-
-    def test_plot_offset_freq_business(self):
-        dr = date_range("2023-01-01", freq="BQS", periods=10)
-        ser = Series(np.random.default_rng(2).standard_normal(len(dr)), index=dr)
-        _check_plot_works(ser.plot)
-
-    def test_plot_multiple_inferred_freq(self):
-        dr = Index([datetime(2000, 1, 1), datetime(2000, 1, 6), datetime(2000, 1, 11)])
-        ser = Series(np.random.default_rng(2).standard_normal(len(dr)), index=dr)
-        _check_plot_works(ser.plot)
-
-    @pytest.mark.xfail(reason="Api changed in 3.6.0")
-    def test_uhf(self):
-        import pandas.plotting._matplotlib.converter as conv
-
-        idx = date_range("2012-6-22 21:59:51.960928", freq="ms", periods=500)
-        df = DataFrame(
-            np.random.default_rng(2).standard_normal((len(idx), 2)), index=idx
-        )
-
-        _, ax = mpl.pyplot.subplots()
-        df.plot(ax=ax)
-        axis = ax.get_xaxis()
-
-        tlocs = axis.get_ticklocs()
-        tlabels = axis.get_ticklabels()
-        for loc, label in zip(tlocs, tlabels):
-            xp = conv._from_ordinal(loc).strftime("%H:%M:%S.%f")
-            rs = str(label.get_text())
-            if len(rs):
-                assert xp == rs
-
-    def test_irreg_hf(self):
-        idx = date_range("2012-6-22 21:59:51", freq="s", periods=10)
-        df = DataFrame(
-            np.random.default_rng(2).standard_normal((len(idx), 2)), index=idx
-        )
-
-        irreg = df.iloc[[0, 1, 3, 4]]
-        _, ax = mpl.pyplot.subplots()
-        irreg.plot(ax=ax)
-        diffs = Series(ax.get_lines()[0].get_xydata()[:, 0]).diff()
-
-        sec = 1.0 / 24 / 60 / 60
-        assert (np.fabs(diffs[1:] - [sec, sec * 2, sec]) < 1e-8).all()
-
-    def test_irreg_hf_object(self):
-        idx = date_range("2012-6-22 21:59:51", freq="s", periods=10)
-        df2 = DataFrame(
-            np.random.default_rng(2).standard_normal((len(idx), 2)), index=idx
-        )
-        _, ax = mpl.pyplot.subplots()
-        df2.index = df2.index.astype(object)
-        df2.plot(ax=ax)
-        diffs = Series(ax.get_lines()[0].get_xydata()[:, 0]).diff()
-        sec = 1.0 / 24 / 60 / 60
-        assert (np.fabs(diffs[1:] - sec) < 1e-8).all()
-
-    def test_irregular_datetime64_repr_bug(self):
-        ser = Series(
-            np.arange(10, dtype=np.float64), index=date_range("2020-01-01", periods=10)
-        )
-        ser = ser.iloc[[0, 1, 2, 7]]
-
-        _, ax = mpl.pyplot.subplots()
-
-        ret = ser.plot(ax=ax)
-        assert ret is not None
-
-        for rs, xp in zip(ax.get_lines()[0].get_xdata(), ser.index):
-            assert rs == xp
-
-    def test_business_freq(self):
-        bts = Series(range(5), period_range("2020-01-01", periods=5))
-        msg = r"PeriodDtype\[B\] is deprecated"
-        dt = bts.index[0].to_timestamp()
-        with tm.assert_produces_warning(FutureWarning, match=msg):
-            bts.index = period_range(start=dt, periods=len(bts), freq="B")
-        _, ax = mpl.pyplot.subplots()
-        bts.plot(ax=ax)
-        assert ax.get_lines()[0].get_xydata()[0, 0] == bts.index[0].ordinal
-        idx = ax.get_lines()[0].get_xdata()
-        with tm.assert_produces_warning(FutureWarning, match=msg):
-            assert PeriodIndex(data=idx).freqstr == "B"
-
-    def test_business_freq_convert(self):
-        bts = Series(
-            np.arange(300, dtype=np.float64),
-            index=date_range("2020-01-01", periods=300, freq="B"),
-        ).asfreq("BME")
-        ts = bts.to_period("M")
-        _, ax = mpl.pyplot.subplots()
-        bts.plot(ax=ax)
-        assert ax.get_lines()[0].get_xydata()[0, 0] == ts.index[0].ordinal
-        idx = ax.get_lines()[0].get_xdata()
-        assert PeriodIndex(data=idx).freqstr == "M"
-
-    def test_freq_with_no_period_alias(self):
-        # GH34487
-        freq = WeekOfMonth()
-        bts = Series(
-            np.arange(10, dtype=np.float64), index=date_range("2020-01-01", periods=10)
-        ).asfreq(freq)
-        _, ax = mpl.pyplot.subplots()
-        bts.plot(ax=ax)
-
-        idx = ax.get_lines()[0].get_xdata()
-        msg = "freq not specified and cannot be inferred"
-        with pytest.raises(ValueError, match=msg):
-            PeriodIndex(data=idx)
-
-    def test_nonzero_base(self):
-        # GH2571
-        idx = date_range("2012-12-20", periods=24, freq="h") + timedelta(minutes=30)
-        df = DataFrame(np.arange(24), index=idx)
-        _, ax = mpl.pyplot.subplots()
-        df.plot(ax=ax)
-        rs = ax.get_lines()[0].get_xdata()
-        assert not Index(rs).is_normalized
-
-    def test_dataframe(self):
-        bts = DataFrame(
-            {
-                "a": Series(
-                    np.arange(10, dtype=np.float64),
-                    index=date_range("2020-01-01", periods=10),
-                )
-            }
-        )
-        _, ax = mpl.pyplot.subplots()
-        bts.plot(ax=ax)
-        idx = ax.get_lines()[0].get_xdata()
-        tm.assert_index_equal(bts.index.to_period(), PeriodIndex(idx))
+        result = arr.take([-1, 1], allow_fill=True, fill_value=NaT)
+        assert result[0] is NaT
 
     @pytest.mark.filterwarnings(
         "ignore:Period with BDay freq is deprecated:FutureWarning"
     )
+    def test_take_fill_str(self, arr1d):
+        # Cast str fill_value matching other fill_value-taking methods
+        result = arr1d.take([-1, 1], allow_fill=True, fill_value=str(arr1d[-1]))
+        expected = arr1d[[-1, 1]]
+        tm.assert_equal(result, expected)
+
+        msg = f"value should be a '{arr1d._scalar_type.__name__}' or 'NaT'. Got"
+        with pytest.raises(TypeError, match=msg):
+            arr1d.take([-1, 1], allow_fill=True, fill_value="foo")
+
+    def test_concat_same_type(self, arr1d):
+        arr = arr1d
+        idx = self.index_cls(arr)
+        idx = idx.insert(0, NaT)
+        arr = arr1d
+
+        result = arr._concat_same_type([arr[:-1], arr[1:], arr])
+        arr2 = arr.astype(object)
+        expected = self.index_cls(np.concatenate([arr2[:-1], arr2[1:], arr2]))
+
+        tm.assert_index_equal(self.index_cls(result), expected)
+
+    def test_unbox_scalar(self, arr1d):
+        result = arr1d._unbox_scalar(arr1d[0])
+        expected = arr1d._ndarray.dtype.type
+        assert isinstance(result, expected)
+
+        result = arr1d._unbox_scalar(NaT)
+        assert isinstance(result, expected)
+
+        msg = f"'value' should be a {self.scalar_type.__name__}."
+        with pytest.raises(ValueError, match=msg):
+            arr1d._unbox_scalar("foo")
+
+    def test_check_compatible_with(self, arr1d):
+        arr1d._check_compatible_with(arr1d[0])
+        arr1d._check_compatible_with(arr1d[:1])
+        arr1d._check_compatible_with(NaT)
+
+    def test_scalar_from_string(self, arr1d):
+        result = arr1d._scalar_from_string(str(arr1d[0]))
+        assert result == arr1d[0]
+
+    def test_reduce_invalid(self, arr1d):
+        msg = "does not support reduction 'not a method'"
+        with pytest.raises(TypeError, match=msg):
+            arr1d._reduce("not a method")
+
+    @pytest.mark.parametrize("method", ["pad", "backfill"])
+    def test_fillna_method_doesnt_change_orig(self, method):
+        data = np.arange(10, dtype="i8") * 24 * 3600 * 10**9
+        if self.array_cls is PeriodArray:
+            arr = self.array_cls(data, dtype="period[D]")
+        else:
+            arr = self.array_cls._from_sequence(data)
+        arr[4] = NaT
+
+        fill_value = arr[3] if method == "pad" else arr[5]
+
+        result = arr._pad_or_backfill(method=method)
+        assert result[4] == fill_value
+
+        # check that the original was not changed
+        assert arr[4] is NaT
+
+    def test_searchsorted(self):
+        data = np.arange(10, dtype="i8") * 24 * 3600 * 10**9
+        if self.array_cls is PeriodArray:
+            arr = self.array_cls(data, dtype="period[D]")
+        else:
+            arr = self.array_cls._from_sequence(data)
+
+        # scalar
+        result = arr.searchsorted(arr[1])
+        assert result == 1
+
+        result = arr.searchsorted(arr[2], side="right")
+        assert result == 3
+
+        # own-type
+        result = arr.searchsorted(arr[1:3])
+        expected = np.array([1, 2], dtype=np.intp)
+        tm.assert_numpy_array_equal(result, expected)
+
+        result = arr.searchsorted(arr[1:3], side="right")
+        expected = np.array([2, 3], dtype=np.intp)
+        tm.assert_numpy_array_equal(result, expected)
+
+        # GH#29884 match numpy convention on whether NaT goes
+        #  at the end or the beginning
+        result = arr.searchsorted(NaT)
+        assert result == 10
+
+    @pytest.mark.parametrize("box", [None, "index", "series"])
+    def test_searchsorted_castable_strings(self, arr1d, box, string_storage):
+        arr = arr1d
+        if box is None:
+            pass
+        elif box == "index":
+            # Test the equivalent Index.searchsorted method while we're here
+            arr = self.index_cls(arr)
+        else:
+            # Test the equivalent Series.searchsorted method while we're here
+            arr = pd.Series(arr)
+
+        # scalar
+        result = arr.searchsorted(str(arr[1]))
+        assert result == 1
+
+        result = arr.searchsorted(str(arr[2]), side="right")
+        assert result == 3
+
+        result = arr.searchsorted([str(x) for x in arr[1:3]])
+        expected = np.array([1, 2], dtype=np.intp)
+        tm.assert_numpy_array_equal(result, expected)
+
+        with pytest.raises(
+            TypeError,
+            match=re.escape(
+                f"value should be a '{arr1d._scalar_type.__name__}', 'NaT', "
+                "or array of those. Got 'str' instead."
+            ),
+        ):
+            arr.searchsorted("foo")
+
+        with pd.option_context("string_storage", string_storage):
+            with pytest.raises(
+                TypeError,
+                match=re.escape(
+                    f"value should be a '{arr1d._scalar_type.__name__}', 'NaT', "
+                    "or array of those. Got string array instead."
+                ),
+            ):
+                arr.searchsorted([str(arr[1]), "baz"])
+
+    def test_getitem_near_implementation_bounds(self):
+        # We only check tz-naive for DTA bc the bounds are slightly different
+        #  for other tzs
+        i8vals = np.asarray([NaT._value + n for n in range(1, 5)], dtype="i8")
+        if self.array_cls is PeriodArray:
+            arr = self.array_cls(i8vals, dtype="period[ns]")
+        else:
+            arr = self.index_cls(i8vals, freq="ns")._data
+        arr[0]  # should not raise OutOfBoundsDatetime
+
+        index = pd.Index(arr)
+        index[0]  # should not raise OutOfBoundsDatetime
+
+        ser = pd.Series(arr)
+        ser[0]  # should not raise OutOfBoundsDatetime
+
+    def test_getitem_2d(self, arr1d):
+        # 2d slicing on a 1D array
+        expected = type(arr1d)._simple_new(
+            arr1d._ndarray[:, np.newaxis], dtype=arr1d.dtype
+        )
+        result = arr1d[:, np.newaxis]
+        tm.assert_equal(result, expected)
+
+        # Lookup on a 2D array
+        arr2d = expected
+        expected = type(arr2d)._simple_new(arr2d._ndarray[:3, 0], dtype=arr2d.dtype)
+        result = arr2d[:3, 0]
+        tm.assert_equal(result, expected)
+
+        # Scalar lookup
+        result = arr2d[-1, 0]
+        expected = arr1d[-1]
+        assert result == expected
+
+    def test_iter_2d(self, arr1d):
+        data2d = arr1d._ndarray[:3, np.newaxis]
+        arr2d = type(arr1d)._simple_new(data2d, dtype=arr1d.dtype)
+        result = list(arr2d)
+        assert len(result) == 3
+        for x in result:
+            assert isinstance(x, type(arr1d))
+            assert x.ndim == 1
+            assert x.dtype == arr1d.dtype
+
+    def test_repr_2d(self, arr1d):
+        data2d = arr1d._ndarray[:3, np.newaxis]
+        arr2d = type(arr1d)._simple_new(data2d, dtype=arr1d.dtype)
+
+        result = repr(arr2d)
+
+        if isinstance(arr2d, TimedeltaArray):
+            expected = (
+                f"<{type(arr2d).__name__}>\n"
+                "[\n"
+                f"['{arr1d[0]._repr_base()}'],\n"
+                f"['{arr1d[1]._repr_base()}'],\n"
+                f"['{arr1d[2]._repr_base()}']\n"
+                "]\n"
+                f"Shape: (3, 1), dtype: {arr1d.dtype}"
+            )
+        else:
+            expected = (
+                f"<{type(arr2d).__name__}>\n"
+                "[\n"
+                f"['{arr1d[0]}'],\n"
+                f"['{arr1d[1]}'],\n"
+                f"['{arr1d[2]}']\n"
+                "]\n"
+                f"Shape: (3, 1), dtype: {arr1d.dtype}"
+            )
+
+        assert result == expected
+
+    def test_setitem(self):
+        data = np.arange(10, dtype="i8") * 24 * 3600 * 10**9
+        if self.array_cls is PeriodArray:
+            arr = self.array_cls(data, dtype="period[D]")
+        else:
+            arr = self.index_cls(data, freq="D")._data
+
+        arr[0] = arr[1]
+        expected = np.arange(10, dtype="i8") * 24 * 3600 * 10**9
+        expected[0] = expected[1]
+
+        tm.assert_numpy_array_equal(arr.asi8, expected)
+
+        arr[:2] = arr[-2:]
+        expected[:2] = expected[-2:]
+        tm.assert_numpy_array_equal(arr.asi8, expected)
+
     @pytest.mark.parametrize(
-        "obj",
+        "box",
         [
-            Series(
-                np.arange(10, dtype=np.float64),
-                index=date_range("2020-01-01", periods=10),
-            ),
-            DataFrame(
-                {
-                    "a": Series(
-                        np.arange(10, dtype=np.float64),
-                        index=date_range("2020-01-01", periods=10),
-                    ),
-                    "b": Series(
-                        np.arange(10, dtype=np.float64),
-                        index=date_range("2020-01-01", periods=10),
-                    )
-                    + 1,
-                }
-            ),
+            pd.Index,
+            pd.Series,
+            np.array,
+            list,
+            NumpyExtensionArray,
         ],
     )
-    def test_axis_limits(self, obj):
-        _, ax = mpl.pyplot.subplots()
-        obj.plot(ax=ax)
-        xlim = ax.get_xlim()
-        ax.set_xlim(xlim[0] - 5, xlim[1] + 10)
-        result = ax.get_xlim()
-        assert result[0] == xlim[0] - 5
-        assert result[1] == xlim[1] + 10
-
-        # string
-        expected = (Period("1/1/2000", ax.freq), Period("4/1/2000", ax.freq))
-        ax.set_xlim("1/1/2000", "4/1/2000")
-        result = ax.get_xlim()
-        assert int(result[0]) == expected[0].ordinal
-        assert int(result[1]) == expected[1].ordinal
-
-        # datetime
-        expected = (Period("1/1/2000", ax.freq), Period("4/1/2000", ax.freq))
-        ax.set_xlim(datetime(2000, 1, 1), datetime(2000, 4, 1))
-        result = ax.get_xlim()
-        assert int(result[0]) == expected[0].ordinal
-        assert int(result[1]) == expected[1].ordinal
-        fig = ax.get_figure()
-        mpl.pyplot.close(fig)
-
-    def test_get_finder(self):
-        import pandas.plotting._matplotlib.converter as conv
-
-        assert conv.get_finder(to_offset("B")) == conv._daily_finder
-        assert conv.get_finder(to_offset("D")) == conv._daily_finder
-        assert conv.get_finder(to_offset("ME")) == conv._monthly_finder
-        assert conv.get_finder(to_offset("QE")) == conv._quarterly_finder
-        assert conv.get_finder(to_offset("YE")) == conv._annual_finder
-        assert conv.get_finder(to_offset("W")) == conv._daily_finder
-
-    def test_finder_daily(self):
-        day_lst = [10, 40, 252, 400, 950, 2750, 10000]
-
-        msg = "Period with BDay freq is deprecated"
-        with tm.assert_produces_warning(FutureWarning, match=msg):
-            xpl1 = xpl2 = [Period("1999-1-1", freq="B").ordinal] * len(day_lst)
-        rs1 = []
-        rs2 = []
-        for n in day_lst:
-            rng = bdate_range("1999-1-1", periods=n)
-            ser = Series(np.random.default_rng(2).standard_normal(len(rng)), rng)
-            _, ax = mpl.pyplot.subplots()
-            ser.plot(ax=ax)
-            xaxis = ax.get_xaxis()
-            rs1.append(xaxis.get_majorticklocs()[0])
-
-            vmin, vmax = ax.get_xlim()
-            ax.set_xlim(vmin + 0.9, vmax)
-            rs2.append(xaxis.get_majorticklocs()[0])
-            mpl.pyplot.close(ax.get_figure())
-
-        assert rs1 == xpl1
-        assert rs2 == xpl2
-
-    def test_finder_quarterly(self):
-        yrs = [3.5, 11]
-
-        xpl1 = xpl2 = [Period("1988Q1").ordinal] * len(yrs)
-        rs1 = []
-        rs2 = []
-        for n in yrs:
-            rng = period_range("1987Q2", periods=int(n * 4), freq="Q")
-            ser = Series(np.random.default_rng(2).standard_normal(len(rng)), rng)
-            _, ax = mpl.pyplot.subplots()
-            ser.plot(ax=ax)
-            xaxis = ax.get_xaxis()
-            rs1.append(xaxis.get_majorticklocs()[0])
-
-            (vmin, vmax) = ax.get_xlim()
-            ax.set_xlim(vmin + 0.9, vmax)
-            rs2.append(xaxis.get_majorticklocs()[0])
-            mpl.pyplot.close(ax.get_figure())
-
-        assert rs1 == xpl1
-        assert rs2 == xpl2
-
-    def test_finder_monthly(self):
-        yrs = [1.15, 2.5, 4, 11]
-
-        xpl1 = xpl2 = [Period("Jan 1988").ordinal] * len(yrs)
-        rs1 = []
-        rs2 = []
-        for n in yrs:
-            rng = period_range("1987Q2", periods=int(n * 12), freq="M")
-            ser = Series(np.random.default_rng(2).standard_normal(len(rng)), rng)
-            _, ax = mpl.pyplot.subplots()
-            ser.plot(ax=ax)
-            xaxis = ax.get_xaxis()
-            rs1.append(xaxis.get_majorticklocs()[0])
-
-            vmin, vmax = ax.get_xlim()
-            ax.set_xlim(vmin + 0.9, vmax)
-            rs2.append(xaxis.get_majorticklocs()[0])
-            mpl.pyplot.close(ax.get_figure())
-
-        assert rs1 == xpl1
-        assert rs2 == xpl2
-
-    def test_finder_monthly_long(self):
-        rng = period_range("1988Q1", periods=24 * 12, freq="M")
-        ser = Series(np.random.default_rng(2).standard_normal(len(rng)), rng)
-        _, ax = mpl.pyplot.subplots()
-        ser.plot(ax=ax)
-        xaxis = ax.get_xaxis()
-        rs = xaxis.get_majorticklocs()[0]
-        xp = Period("1989Q1", "M").ordinal
-        assert rs == xp
-
-    def test_finder_annual(self):
-        xp = [1987, 1988, 1990, 1990, 1995, 2020, 2070, 2170]
-        xp = [Period(x, freq="Y").ordinal for x in xp]
-        rs = []
-        for nyears in [5, 10, 19, 49, 99, 199, 599, 1001]:
-            rng = period_range("1987", periods=nyears, freq="Y")
-            ser = Series(np.random.default_rng(2).standard_normal(len(rng)), rng)
-            _, ax = mpl.pyplot.subplots()
-            ser.plot(ax=ax)
-            xaxis = ax.get_xaxis()
-            rs.append(xaxis.get_majorticklocs()[0])
-            mpl.pyplot.close(ax.get_figure())
-
-        assert rs == xp
-
-    @pytest.mark.slow
-    def test_finder_minutely(self):
-        nminutes = 50 * 24 * 60
-        rng = date_range("1/1/1999", freq="Min", periods=nminutes)
-        ser = Series(np.random.default_rng(2).standard_normal(len(rng)), rng)
-        _, ax = mpl.pyplot.subplots()
-        ser.plot(ax=ax)
-        xaxis = ax.get_xaxis()
-        rs = xaxis.get_majorticklocs()[0]
-        xp = Period("1/1/1999", freq="Min").ordinal
-
-        assert rs == xp
-
-    def test_finder_hourly(self):
-        nhours = 23
-        rng = date_range("1/1/1999", freq="h", periods=nhours)
-        ser = Series(np.random.default_rng(2).standard_normal(len(rng)), rng)
-        _, ax = mpl.pyplot.subplots()
-        ser.plot(ax=ax)
-        xaxis = ax.get_xaxis()
-        rs = xaxis.get_majorticklocs()[0]
-        xp = Period("1/1/1999", freq="h").ordinal
-
-        assert rs == xp
-
-    def test_gaps(self):
-        ts = Series(
-            np.arange(30, dtype=np.float64), index=date_range("2020-01-01", periods=30)
-        )
-        ts.iloc[5:25] = np.nan
-        _, ax = mpl.pyplot.subplots()
-        ts.plot(ax=ax)
-        lines = ax.get_lines()
-        assert len(lines) == 1
-        line = lines[0]
-        data = line.get_xydata()
-
-        data = np.ma.MaskedArray(data, mask=isna(data), fill_value=np.nan)
-
-        assert isinstance(data, np.ma.core.MaskedArray)
-        mask = data.mask
-        assert mask[5:25, 1].all()
-        mpl.pyplot.close(ax.get_figure())
-
-    def test_gaps_irregular(self):
-        # irregular
-        ts = Series(
-            np.arange(30, dtype=np.float64), index=date_range("2020-01-01", periods=30)
-        )
-        ts = ts.iloc[[0, 1, 2, 5, 7, 9, 12, 15, 20]]
-        ts.iloc[2:5] = np.nan
-        _, ax = mpl.pyplot.subplots()
-        ax = ts.plot(ax=ax)
-        lines = ax.get_lines()
-        assert len(lines) == 1
-        line = lines[0]
-        data = line.get_xydata()
-
-        data = np.ma.MaskedArray(data, mask=isna(data), fill_value=np.nan)
-
-        assert isinstance(data, np.ma.core.MaskedArray)
-        mask = data.mask
-        assert mask[2:5, 1].all()
-        mpl.pyplot.close(ax.get_figure())
-
-    def test_gaps_non_ts(self):
-        # non-ts
-        idx = [0, 1, 2, 5, 7, 9, 12, 15, 20]
-        ser = Series(np.random.default_rng(2).standard_normal(len(idx)), idx)
-        ser.iloc[2:5] = np.nan
-        _, ax = mpl.pyplot.subplots()
-        ser.plot(ax=ax)
-        lines = ax.get_lines()
-        assert len(lines) == 1
-        line = lines[0]
-        data = line.get_xydata()
-        data = np.ma.MaskedArray(data, mask=isna(data), fill_value=np.nan)
-
-        assert isinstance(data, np.ma.core.MaskedArray)
-        mask = data.mask
-        assert mask[2:5, 1].all()
-
-    def test_gap_upsample(self):
-        low = Series(
-            np.arange(30, dtype=np.float64), index=date_range("2020-01-01", periods=30)
-        )
-        low.iloc[5:25] = np.nan
-        _, ax = mpl.pyplot.subplots()
-        low.plot(ax=ax)
-
-        idxh = date_range(low.index[0], low.index[-1], freq="12h")
-        s = Series(np.random.default_rng(2).standard_normal(len(idxh)), idxh)
-        s.plot(secondary_y=True)
-        lines = ax.get_lines()
-        assert len(lines) == 1
-        assert len(ax.right_ax.get_lines()) == 1
-
-        line = lines[0]
-        data = line.get_xydata()
-        data = np.ma.MaskedArray(data, mask=isna(data), fill_value=np.nan)
-
-        assert isinstance(data, np.ma.core.MaskedArray)
-        mask = data.mask
-        assert mask[5:25, 1].all()
-
-    def test_secondary_y(self):
-        ser = Series(np.random.default_rng(2).standard_normal(10))
-        fig, _ = mpl.pyplot.subplots()
-        ax = ser.plot(secondary_y=True)
-        assert hasattr(ax, "left_ax")
-        assert not hasattr(ax, "right_ax")
-        axes = fig.get_axes()
-        line = ax.get_lines()[0]
-        xp = Series(line.get_ydata(), line.get_xdata())
-        tm.assert_series_equal(ser, xp)
-        assert ax.get_yaxis().get_ticks_position() == "right"
-        assert not axes[0].get_yaxis().get_visible()
-        mpl.pyplot.close(fig)
-
-    def test_secondary_y_yaxis(self):
-        Series(np.random.default_rng(2).standard_normal(10))
-        ser2 = Series(np.random.default_rng(2).standard_normal(10))
-        _, ax2 = mpl.pyplot.subplots()
-        ser2.plot(ax=ax2)
-        assert ax2.get_yaxis().get_ticks_position() == "left"
-        mpl.pyplot.close(ax2.get_figure())
-
-    def test_secondary_both(self):
-        ser = Series(np.random.default_rng(2).standard_normal(10))
-        ser2 = Series(np.random.default_rng(2).standard_normal(10))
-        ax = ser2.plot()
-        ax2 = ser.plot(secondary_y=True)
-        assert ax.get_yaxis().get_visible()
-        assert not hasattr(ax, "left_ax")
-        assert hasattr(ax, "right_ax")
-        assert hasattr(ax2, "left_ax")
-        assert not hasattr(ax2, "right_ax")
-
-    def test_secondary_y_ts(self):
-        idx = date_range("1/1/2000", periods=10)
-        ser = Series(np.random.default_rng(2).standard_normal(10), idx)
-        fig, _ = mpl.pyplot.subplots()
-        ax = ser.plot(secondary_y=True)
-        assert hasattr(ax, "left_ax")
-        assert not hasattr(ax, "right_ax")
-        axes = fig.get_axes()
-        line = ax.get_lines()[0]
-        xp = Series(line.get_ydata(), line.get_xdata()).to_timestamp()
-        tm.assert_series_equal(ser, xp)
-        assert ax.get_yaxis().get_ticks_position() == "right"
-        assert not axes[0].get_yaxis().get_visible()
-        mpl.pyplot.close(fig)
-
-    def test_secondary_y_ts_yaxis(self):
-        idx = date_range("1/1/2000", periods=10)
-        ser2 = Series(np.random.default_rng(2).standard_normal(10), idx)
-        _, ax2 = mpl.pyplot.subplots()
-        ser2.plot(ax=ax2)
-        assert ax2.get_yaxis().get_ticks_position() == "left"
-        mpl.pyplot.close(ax2.get_figure())
-
-    def test_secondary_y_ts_visible(self):
-        idx = date_range("1/1/2000", periods=10)
-        ser2 = Series(np.random.default_rng(2).standard_normal(10), idx)
-        ax = ser2.plot()
-        assert ax.get_yaxis().get_visible()
-
-    def test_secondary_kde(self):
-        pytest.importorskip("scipy")
-        ser = Series(np.random.default_rng(2).standard_normal(10))
-        fig, ax = mpl.pyplot.subplots()
-        ax = ser.plot(secondary_y=True, kind="density", ax=ax)
-        assert hasattr(ax, "left_ax")
-        assert not hasattr(ax, "right_ax")
-        axes = fig.get_axes()
-        assert axes[1].get_yaxis().get_ticks_position() == "right"
-
-    def test_secondary_bar(self):
-        ser = Series(np.random.default_rng(2).standard_normal(10))
-        fig, ax = mpl.pyplot.subplots()
-        ser.plot(secondary_y=True, kind="bar", ax=ax)
-        axes = fig.get_axes()
-        assert axes[1].get_yaxis().get_ticks_position() == "right"
-
-    def test_secondary_frame(self):
-        df = DataFrame(
-            np.random.default_rng(2).standard_normal((5, 3)), columns=["a", "b", "c"]
-        )
-        axes = df.plot(secondary_y=["a", "c"], subplots=True)
-        assert axes[0].get_yaxis().get_ticks_position() == "right"
-        assert axes[1].get_yaxis().get_ticks_position() == "left"
-        assert axes[2].get_yaxis().get_ticks_position() == "right"
-
-    def test_secondary_bar_frame(self):
-        df = DataFrame(
-            np.random.default_rng(2).standard_normal((5, 3)), columns=["a", "b", "c"]
-        )
-        axes = df.plot(kind="bar", secondary_y=["a", "c"], subplots=True)
-        assert axes[0].get_yaxis().get_ticks_position() == "right"
-        assert axes[1].get_yaxis().get_ticks_position() == "left"
-        assert axes[2].get_yaxis().get_ticks_position() == "right"
-
-    def test_mixed_freq_regular_first(self):
-        # TODO
-        s1 = Series(
-            np.arange(20, dtype=np.float64),
-            index=date_range("2020-01-01", periods=20, freq="B"),
-        )
-        s2 = s1.iloc[[0, 5, 10, 11, 12, 13, 14, 15]]
-
-        # it works!
-        _, ax = mpl.pyplot.subplots()
-        s1.plot(ax=ax)
-
-        ax2 = s2.plot(style="g", ax=ax)
-        lines = ax2.get_lines()
-        msg = r"PeriodDtype\[B\] is deprecated"
-        with tm.assert_produces_warning(FutureWarning, match=msg):
-            idx1 = PeriodIndex(lines[0].get_xdata())
-            idx2 = PeriodIndex(lines[1].get_xdata())
-
-            tm.assert_index_equal(idx1, s1.index.to_period("B"))
-            tm.assert_index_equal(idx2, s2.index.to_period("B"))
-
-            left, right = ax2.get_xlim()
-            pidx = s1.index.to_period()
-        assert left <= pidx[0].ordinal
-        assert right >= pidx[-1].ordinal
-
-    def test_mixed_freq_irregular_first(self):
-        s1 = Series(
-            np.arange(20, dtype=np.float64), index=date_range("2020-01-01", periods=20)
-        )
-        s2 = s1.iloc[[0, 5, 10, 11, 12, 13, 14, 15]]
-        _, ax = mpl.pyplot.subplots()
-        s2.plot(style="g", ax=ax)
-        s1.plot(ax=ax)
-        assert not hasattr(ax, "freq")
-        lines = ax.get_lines()
-        x1 = lines[0].get_xdata()
-        tm.assert_numpy_array_equal(x1, s2.index.astype(object).values)
-        x2 = lines[1].get_xdata()
-        tm.assert_numpy_array_equal(x2, s1.index.astype(object).values)
-
-    def test_mixed_freq_regular_first_df(self):
-        # GH 9852
-        s1 = Series(
-            np.arange(20, dtype=np.float64),
-            index=date_range("2020-01-01", periods=20, freq="B"),
-        ).to_frame()
-        s2 = s1.iloc[[0, 5, 10, 11, 12, 13, 14, 15], :]
-        _, ax = mpl.pyplot.subplots()
-        s1.plot(ax=ax)
-        ax2 = s2.plot(style="g", ax=ax)
-        lines = ax2.get_lines()
-        msg = r"PeriodDtype\[B\] is deprecated"
-        with tm.assert_produces_warning(FutureWarning, match=msg):
-            idx1 = PeriodIndex(lines[0].get_xdata())
-            idx2 = PeriodIndex(lines[1].get_xdata())
-            assert idx1.equals(s1.index.to_period("B"))
-            assert idx2.equals(s2.index.to_period("B"))
-            left, right = ax2.get_xlim()
-            pidx = s1.index.to_period()
-        assert left <= pidx[0].ordinal
-        assert right >= pidx[-1].ordinal
-
-    def test_mixed_freq_irregular_first_df(self):
-        # GH 9852
-        s1 = Series(
-            np.arange(20, dtype=np.float64), index=date_range("2020-01-01", periods=20)
-        ).to_frame()
-        s2 = s1.iloc[[0, 5, 10, 11, 12, 13, 14, 15], :]
-        _, ax = mpl.pyplot.subplots()
-        s2.plot(style="g", ax=ax)
-        s1.plot(ax=ax)
-        assert not hasattr(ax, "freq")
-        lines = ax.get_lines()
-        x1 = lines[0].get_xdata()
-        tm.assert_numpy_array_equal(x1, s2.index.astype(object).values)
-        x2 = lines[1].get_xdata()
-        tm.assert_numpy_array_equal(x2, s1.index.astype(object).values)
-
-    def test_mixed_freq_hf_first(self):
-        idxh = date_range("1/1/1999", periods=365, freq="D")
-        idxl = date_range("1/1/1999", periods=12, freq="ME")
-        high = Series(np.random.default_rng(2).standard_normal(len(idxh)), idxh)
-        low = Series(np.random.default_rng(2).standard_normal(len(idxl)), idxl)
-        _, ax = mpl.pyplot.subplots()
-        high.plot(ax=ax)
-        low.plot(ax=ax)
-        for line in ax.get_lines():
-            assert PeriodIndex(data=line.get_xdata()).freq == "D"
-
-    def test_mixed_freq_alignment(self):
-        ts_ind = date_range("2012-01-01 13:00", "2012-01-02", freq="h")
-        ts_data = np.random.default_rng(2).standard_normal(12)
-
-        ts = Series(ts_data, index=ts_ind)
-        ts2 = ts.asfreq("min").interpolate()
-
-        _, ax = mpl.pyplot.subplots()
-        ax = ts.plot(ax=ax)
-        ts2.plot(style="r", ax=ax)
-
-        assert ax.lines[0].get_xdata()[0] == ax.lines[1].get_xdata()[0]
-
-    def test_mixed_freq_lf_first(self):
-        idxh = date_range("1/1/1999", periods=365, freq="D")
-        idxl = date_range("1/1/1999", periods=12, freq="ME")
-        high = Series(np.random.default_rng(2).standard_normal(len(idxh)), idxh)
-        low = Series(np.random.default_rng(2).standard_normal(len(idxl)), idxl)
-        _, ax = mpl.pyplot.subplots()
-        low.plot(legend=True, ax=ax)
-        high.plot(legend=True, ax=ax)
-        for line in ax.get_lines():
-            assert PeriodIndex(data=line.get_xdata()).freq == "D"
-        leg = ax.get_legend()
-        assert len(leg.texts) == 2
-        mpl.pyplot.close(ax.get_figure())
-
-    def test_mixed_freq_lf_first_hourly(self):
-        idxh = date_range("1/1/1999", periods=240, freq="min")
-        idxl = date_range("1/1/1999", periods=4, freq="h")
-        high = Series(np.random.default_rng(2).standard_normal(len(idxh)), idxh)
-        low = Series(np.random.default_rng(2).standard_normal(len(idxl)), idxl)
-        _, ax = mpl.pyplot.subplots()
-        low.plot(ax=ax)
-        high.plot(ax=ax)
-        for line in ax.get_lines():
-            assert PeriodIndex(data=line.get_xdata()).freq == "min"
-
-    @pytest.mark.filterwarnings(r"ignore:PeriodDtype\[B\] is deprecated:FutureWarning")
-    def test_mixed_freq_irreg_period(self):
-        ts = Series(
-            np.arange(30, dtype=np.float64), index=date_range("2020-01-01", periods=30)
-        )
-        irreg = ts.iloc[[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 16, 17, 18, 29]]
-        msg = r"PeriodDtype\[B\] is deprecated"
-        with tm.assert_produces_warning(FutureWarning, match=msg):
-            rng = period_range("1/3/2000", periods=30, freq="B")
-        ps = Series(np.random.default_rng(2).standard_normal(len(rng)), rng)
-        _, ax = mpl.pyplot.subplots()
-        irreg.plot(ax=ax)
-        ps.plot(ax=ax)
-
-    def test_mixed_freq_shared_ax(self):
-        # GH13341, using sharex=True
-        idx1 = date_range("2015-01-01", periods=3, freq="ME")
-        idx2 = idx1[:1].union(idx1[2:])
-        s1 = Series(range(len(idx1)), idx1)
-        s2 = Series(range(len(idx2)), idx2)
-
-        _, (ax1, ax2) = mpl.pyplot.subplots(nrows=2, sharex=True)
-        s1.plot(ax=ax1)
-        s2.plot(ax=ax2)
-
-        assert ax1.freq == "M"
-        assert ax2.freq == "M"
-        assert ax1.lines[0].get_xydata()[0, 0] == ax2.lines[0].get_xydata()[0, 0]
-
-    def test_mixed_freq_shared_ax_twin_x(self):
-        # GH13341, using sharex=True
-        idx1 = date_range("2015-01-01", periods=3, freq="ME")
-        idx2 = idx1[:1].union(idx1[2:])
-        s1 = Series(range(len(idx1)), idx1)
-        s2 = Series(range(len(idx2)), idx2)
-        # using twinx
-        _, ax1 = mpl.pyplot.subplots()
-        ax2 = ax1.twinx()
-        s1.plot(ax=ax1)
-        s2.plot(ax=ax2)
-
-        assert ax1.lines[0].get_xydata()[0, 0] == ax2.lines[0].get_xydata()[0, 0]
-
-    @pytest.mark.xfail(reason="TODO (GH14330, GH14322)")
-    def test_mixed_freq_shared_ax_twin_x_irregular_first(self):
-        # GH13341, using sharex=True
-        idx1 = date_range("2015-01-01", periods=3, freq="M")
-        idx2 = idx1[:1].union(idx1[2:])
-        s1 = Series(range(len(idx1)), idx1)
-        s2 = Series(range(len(idx2)), idx2)
-        _, ax1 = mpl.pyplot.subplots()
-        ax2 = ax1.twinx()
-        s2.plot(ax=ax1)
-        s1.plot(ax=ax2)
-        assert ax1.lines[0].get_xydata()[0, 0] == ax2.lines[0].get_xydata()[0, 0]
-
-    def test_nat_handling(self):
-        _, ax = mpl.pyplot.subplots()
-
-        dti = DatetimeIndex(["2015-01-01", NaT, "2015-01-03"])
-        s = Series(range(len(dti)), dti)
-        s.plot(ax=ax)
-        xdata = ax.get_lines()[0].get_xdata()
-        # plot x data is bounded by index values
-        assert s.index.min() <= Series(xdata).min()
-        assert Series(xdata).max() <= s.index.max()
-
-    def test_to_weekly_resampling_disallow_how_kwd(self):
-        idxh = date_range("1/1/1999", periods=52, freq="W")
-        idxl = date_range("1/1/1999", periods=12, freq="ME")
-        high = Series(np.random.default_rng(2).standard_normal(len(idxh)), idxh)
-        low = Series(np.random.default_rng(2).standard_normal(len(idxl)), idxl)
-        _, ax = mpl.pyplot.subplots()
-        high.plot(ax=ax)
+    def test_setitem_object_dtype(self, box, arr1d):
+        expected = arr1d.copy()[::-1]
+        if expected.dtype.kind in ["m", "M"]:
+            expected = expected._with_freq(None)
+
+        vals = expected
+        if box is list:
+            vals = list(vals)
+        elif box is np.array:
+            # if we do np.array(x).astype(object) then dt64 and td64 cast to ints
+            vals = np.array(vals.astype(object))
+        elif box is NumpyExtensionArray:
+            vals = box(np.asarray(vals, dtype=object))
+        else:
+            vals = box(vals).astype(object)
+
+        arr1d[:] = vals
+
+        tm.assert_equal(arr1d, expected)
+
+    def test_setitem_strs(self, arr1d):
+        # Check that we parse strs in both scalar and listlike
+
+        # Setting list-like of strs
+        expected = arr1d.copy()
+        expected[[0, 1]] = arr1d[-2:]
+
+        result = arr1d.copy()
+        result[:2] = [str(x) for x in arr1d[-2:]]
+        tm.assert_equal(result, expected)
+
+        # Same thing but now for just a scalar str
+        expected = arr1d.copy()
+        expected[0] = arr1d[-1]
+
+        result = arr1d.copy()
+        result[0] = str(arr1d[-1])
+        tm.assert_equal(result, expected)
+
+    @pytest.mark.parametrize("as_index", [True, False])
+    def test_setitem_categorical(self, arr1d, as_index):
+        expected = arr1d.copy()[::-1]
+        if not isinstance(expected, PeriodArray):
+            expected = expected._with_freq(None)
+
+        cat = pd.Categorical(arr1d)
+        if as_index:
+            cat = pd.CategoricalIndex(cat)
+
+        arr1d[:] = cat[::-1]
+
+        tm.assert_equal(arr1d, expected)
+
+    def test_setitem_raises(self, arr1d):
+        arr = arr1d[:10]
+        val = arr[0]
+
+        with pytest.raises(IndexError, match="index 12 is out of bounds"):
+            arr[12] = val
+
+        with pytest.raises(TypeError, match="value should be a.* 'object'"):
+            arr[0] = object()
+
+        msg = "cannot set using a list-like indexer with a different length"
+        with pytest.raises(ValueError, match=msg):
+            # GH#36339
+            arr[[]] = [arr[1]]
+
+        msg = "cannot set using a slice indexer with a different length than"
+        with pytest.raises(ValueError, match=msg):
+            # GH#36339
+            arr[1:1] = arr[:3]
+
+    @pytest.mark.parametrize("box", [list, np.array, pd.Index, pd.Series])
+    def test_setitem_numeric_raises(self, arr1d, box):
+        # We dont case e.g. int64 to our own dtype for setitem
 
         msg = (
-            "'how' is not a valid keyword for plotting functions. If plotting "
-            "multiple objects on shared axes, resample manually first."
+            f"value should be a '{arr1d._scalar_type.__name__}', "
+            "'NaT', or array of those. Got"
         )
-        with pytest.raises(ValueError, match=msg):
-            low.plot(ax=ax, how="foo")
+        with pytest.raises(TypeError, match=msg):
+            arr1d[:2] = box([0, 1])
 
-    def test_to_weekly_resampling(self):
-        idxh = date_range("1/1/1999", periods=52, freq="W")
-        idxl = date_range("1/1/1999", periods=12, freq="ME")
-        high = Series(np.random.default_rng(2).standard_normal(len(idxh)), idxh)
-        low = Series(np.random.default_rng(2).standard_normal(len(idxl)), idxl)
-        _, ax = mpl.pyplot.subplots()
-        high.plot(ax=ax)
-        low.plot(ax=ax)
-        for line in ax.get_lines():
-            assert PeriodIndex(data=line.get_xdata()).freq == idxh.freq
+        with pytest.raises(TypeError, match=msg):
+            arr1d[:2] = box([0.0, 1.0])
 
-    def test_from_weekly_resampling(self):
-        idxh = date_range("1/1/1999", periods=52, freq="W")
-        idxl = date_range("1/1/1999", periods=12, freq="ME")
-        high = Series(np.random.default_rng(2).standard_normal(len(idxh)), idxh)
-        low = Series(np.random.default_rng(2).standard_normal(len(idxl)), idxl)
-        _, ax = mpl.pyplot.subplots()
-        low.plot(ax=ax)
-        high.plot(ax=ax)
+    def test_inplace_arithmetic(self):
+        # GH#24115 check that iadd and isub are actually in-place
+        data = np.arange(10, dtype="i8") * 24 * 3600 * 10**9
+        if self.array_cls is PeriodArray:
+            arr = self.array_cls(data, dtype="period[D]")
+        else:
+            arr = self.index_cls(data, freq="D")._data
 
-        expected_h = idxh.to_period().asi8.astype(np.float64)
-        expected_l = np.array(
-            [1514, 1519, 1523, 1527, 1531, 1536, 1540, 1544, 1549, 1553, 1558, 1562],
-            dtype=np.float64,
+        expected = arr + pd.Timedelta(days=1)
+        arr += pd.Timedelta(days=1)
+        tm.assert_equal(arr, expected)
+
+        expected = arr - pd.Timedelta(days=1)
+        arr -= pd.Timedelta(days=1)
+        tm.assert_equal(arr, expected)
+
+    def test_shift_fill_int_deprecated(self, arr1d):
+        # GH#31971, enforced in 2.0
+        with pytest.raises(TypeError, match="value should be a"):
+            arr1d.shift(1, fill_value=1)
+
+    def test_median(self, arr1d):
+        arr = arr1d
+        if len(arr) % 2 == 0:
+            # make it easier to define `expected`
+            arr = arr[:-1]
+
+        expected = arr[len(arr) // 2]
+
+        result = arr.median()
+        assert type(result) is type(expected)
+        assert result == expected
+
+        arr[len(arr) // 2] = NaT
+        if not isinstance(expected, Period):
+            expected = arr[len(arr) // 2 - 1 : len(arr) // 2 + 2].mean()
+
+        assert arr.median(skipna=False) is NaT
+
+        result = arr.median()
+        assert type(result) is type(expected)
+        assert result == expected
+
+        assert arr[:0].median() is NaT
+        assert arr[:0].median(skipna=False) is NaT
+
+        # 2d Case
+        arr2 = arr.reshape(-1, 1)
+
+        result = arr2.median(axis=None)
+        assert type(result) is type(expected)
+        assert result == expected
+
+        assert arr2.median(axis=None, skipna=False) is NaT
+
+        result = arr2.median(axis=0)
+        expected2 = type(arr)._from_sequence([expected], dtype=arr.dtype)
+        tm.assert_equal(result, expected2)
+
+        result = arr2.median(axis=0, skipna=False)
+        expected2 = type(arr)._from_sequence([NaT], dtype=arr.dtype)
+        tm.assert_equal(result, expected2)
+
+        result = arr2.median(axis=1)
+        tm.assert_equal(result, arr)
+
+        result = arr2.median(axis=1, skipna=False)
+        tm.assert_equal(result, arr)
+
+    def test_from_integer_array(self):
+        arr = np.array([1, 2, 3], dtype=np.int64)
+        data = pd.array(arr, dtype="Int64")
+        if self.array_cls is PeriodArray:
+            expected = self.array_cls(arr, dtype=self.example_dtype)
+            result = self.array_cls(data, dtype=self.example_dtype)
+        else:
+            expected = self.array_cls._from_sequence(arr, dtype=self.example_dtype)
+            result = self.array_cls._from_sequence(data, dtype=self.example_dtype)
+
+        tm.assert_extension_array_equal(result, expected)
+
+
+class TestDatetimeArray(SharedTests):
+    index_cls = DatetimeIndex
+    array_cls = DatetimeArray
+    scalar_type = Timestamp
+    example_dtype = "M8[ns]"
+
+    @pytest.fixture
+    def arr1d(self, tz_naive_fixture, freqstr):
+        """
+        Fixture returning DatetimeArray with parametrized frequency and
+        timezones
+        """
+        tz = tz_naive_fixture
+        dti = pd.date_range("2016-01-01 01:01:00", periods=5, freq=freqstr, tz=tz)
+        dta = dti._data
+        return dta
+
+    def test_round(self, arr1d):
+        # GH#24064
+        dti = self.index_cls(arr1d)
+
+        result = dti.round(freq="2min")
+        expected = dti - pd.Timedelta(minutes=1)
+        expected = expected._with_freq(None)
+        tm.assert_index_equal(result, expected)
+
+        dta = dti._data
+        result = dta.round(freq="2min")
+        expected = expected._data._with_freq(None)
+        tm.assert_datetime_array_equal(result, expected)
+
+    def test_array_interface(self, datetime_index):
+        arr = datetime_index._data
+        copy_false = None if np_version_gt2 else False
+
+        # default asarray gives the same underlying data (for tz naive)
+        result = np.asarray(arr)
+        expected = arr._ndarray
+        assert result is expected
+        tm.assert_numpy_array_equal(result, expected)
+        result = np.array(arr, copy=copy_false)
+        assert result is expected
+        tm.assert_numpy_array_equal(result, expected)
+
+        # specifying M8[ns] gives the same result as default
+        result = np.asarray(arr, dtype="datetime64[ns]")
+        expected = arr._ndarray
+        assert result is expected
+        tm.assert_numpy_array_equal(result, expected)
+        result = np.array(arr, dtype="datetime64[ns]", copy=copy_false)
+        assert result is expected
+        tm.assert_numpy_array_equal(result, expected)
+        result = np.array(arr, dtype="datetime64[ns]")
+        if not np_version_gt2:
+            # TODO: GH 57739
+            assert result is not expected
+        tm.assert_numpy_array_equal(result, expected)
+
+        # to object dtype
+        result = np.asarray(arr, dtype=object)
+        expected = np.array(list(arr), dtype=object)
+        tm.assert_numpy_array_equal(result, expected)
+
+        # to other dtype always copies
+        result = np.asarray(arr, dtype="int64")
+        assert result is not arr.asi8
+        assert not np.may_share_memory(arr, result)
+        expected = arr.asi8.copy()
+        tm.assert_numpy_array_equal(result, expected)
+
+        # other dtypes handled by numpy
+        for dtype in ["float64", str]:
+            result = np.asarray(arr, dtype=dtype)
+            expected = np.asarray(arr).astype(dtype)
+            tm.assert_numpy_array_equal(result, expected)
+
+    def test_array_object_dtype(self, arr1d):
+        # GH#23524
+        arr = arr1d
+        dti = self.index_cls(arr1d)
+
+        expected = np.array(list(dti))
+
+        result = np.array(arr, dtype=object)
+        tm.assert_numpy_array_equal(result, expected)
+
+        # also test the DatetimeIndex method while we're at it
+        result = np.array(dti, dtype=object)
+        tm.assert_numpy_array_equal(result, expected)
+
+    def test_array_tz(self, arr1d):
+        # GH#23524
+        arr = arr1d
+        dti = self.index_cls(arr1d)
+        copy_false = None if np_version_gt2 else False
+
+        expected = dti.asi8.view("M8[ns]")
+        result = np.array(arr, dtype="M8[ns]")
+        tm.assert_numpy_array_equal(result, expected)
+
+        result = np.array(arr, dtype="datetime64[ns]")
+        tm.assert_numpy_array_equal(result, expected)
+
+        # check that we are not making copies when setting copy=copy_false
+        result = np.array(arr, dtype="M8[ns]", copy=copy_false)
+        assert result.base is expected.base
+        assert result.base is not None
+        result = np.array(arr, dtype="datetime64[ns]", copy=copy_false)
+        assert result.base is expected.base
+        assert result.base is not None
+
+    def test_array_i8_dtype(self, arr1d):
+        arr = arr1d
+        dti = self.index_cls(arr1d)
+        copy_false = None if np_version_gt2 else False
+
+        expected = dti.asi8
+        result = np.array(arr, dtype="i8")
+        tm.assert_numpy_array_equal(result, expected)
+
+        result = np.array(arr, dtype=np.int64)
+        tm.assert_numpy_array_equal(result, expected)
+
+        # check that we are still making copies when setting copy=copy_false
+        result = np.array(arr, dtype="i8", copy=copy_false)
+        assert result.base is not expected.base
+        assert result.base is None
+
+    def test_from_array_keeps_base(self):
+        # Ensure that DatetimeArray._ndarray.base isn't lost.
+        arr = np.array(["2000-01-01", "2000-01-02"], dtype="M8[ns]")
+        dta = DatetimeArray._from_sequence(arr)
+
+        assert dta._ndarray is arr
+        dta = DatetimeArray._from_sequence(arr[:0])
+        assert dta._ndarray.base is arr
+
+    def test_from_dti(self, arr1d):
+        arr = arr1d
+        dti = self.index_cls(arr1d)
+        assert list(dti) == list(arr)
+
+        # Check that Index.__new__ knows what to do with DatetimeArray
+        dti2 = pd.Index(arr)
+        assert isinstance(dti2, DatetimeIndex)
+        assert list(dti2) == list(arr)
+
+    def test_astype_object(self, arr1d):
+        arr = arr1d
+        dti = self.index_cls(arr1d)
+
+        asobj = arr.astype("O")
+        assert isinstance(asobj, np.ndarray)
+        assert asobj.dtype == "O"
+        assert list(asobj) == list(dti)
+
+    @pytest.mark.filterwarnings(r"ignore:PeriodDtype\[B\] is deprecated:FutureWarning")
+    def test_to_period(self, datetime_index, freqstr):
+        dti = datetime_index
+        arr = dti._data
+
+        freqstr = freq_to_period_freqstr(1, freqstr)
+        expected = dti.to_period(freq=freqstr)
+        result = arr.to_period(freq=freqstr)
+        assert isinstance(result, PeriodArray)
+
+        tm.assert_equal(result, expected._data)
+
+    def test_to_period_2d(self, arr1d):
+        arr2d = arr1d.reshape(1, -1)
+
+        warn = None if arr1d.tz is None else UserWarning
+        with tm.assert_produces_warning(warn):
+            result = arr2d.to_period("D")
+            expected = arr1d.to_period("D").reshape(1, -1)
+        tm.assert_period_array_equal(result, expected)
+
+    @pytest.mark.parametrize("propname", DatetimeArray._bool_ops)
+    def test_bool_properties(self, arr1d, propname):
+        # in this case _bool_ops is just `is_leap_year`
+        dti = self.index_cls(arr1d)
+        arr = arr1d
+        assert dti.freq == arr.freq
+
+        result = getattr(arr, propname)
+        expected = np.array(getattr(dti, propname), dtype=result.dtype)
+
+        tm.assert_numpy_array_equal(result, expected)
+
+    @pytest.mark.parametrize("propname", DatetimeArray._field_ops)
+    def test_int_properties(self, arr1d, propname):
+        dti = self.index_cls(arr1d)
+        arr = arr1d
+
+        result = getattr(arr, propname)
+        expected = np.array(getattr(dti, propname), dtype=result.dtype)
+
+        tm.assert_numpy_array_equal(result, expected)
+
+    def test_take_fill_valid(self, arr1d, fixed_now_ts):
+        arr = arr1d
+        dti = self.index_cls(arr1d)
+
+        now = fixed_now_ts.tz_localize(dti.tz)
+        result = arr.take([-1, 1], allow_fill=True, fill_value=now)
+        assert result[0] == now
+
+        msg = f"value should be a '{arr1d._scalar_type.__name__}' or 'NaT'. Got"
+        with pytest.raises(TypeError, match=msg):
+            # fill_value Timedelta invalid
+            arr.take([-1, 1], allow_fill=True, fill_value=now - now)
+
+        with pytest.raises(TypeError, match=msg):
+            # fill_value Period invalid
+            arr.take([-1, 1], allow_fill=True, fill_value=Period("2014Q1"))
+
+        tz = None if dti.tz is not None else "US/Eastern"
+        now = fixed_now_ts.tz_localize(tz)
+        msg = "Cannot compare tz-naive and tz-aware datetime-like objects"
+        with pytest.raises(TypeError, match=msg):
+            # Timestamp with mismatched tz-awareness
+            arr.take([-1, 1], allow_fill=True, fill_value=now)
+
+        value = NaT._value
+        msg = f"value should be a '{arr1d._scalar_type.__name__}' or 'NaT'. Got"
+        with pytest.raises(TypeError, match=msg):
+            # require NaT, not iNaT, as it could be confused with an integer
+            arr.take([-1, 1], allow_fill=True, fill_value=value)
+
+        value = np.timedelta64("NaT", "ns")
+        with pytest.raises(TypeError, match=msg):
+            # require appropriate-dtype if we have a NA value
+            arr.take([-1, 1], allow_fill=True, fill_value=value)
+
+        if arr.tz is not None:
+            # GH#37356
+            # Assuming here that arr1d fixture does not include Australia/Melbourne
+            value = fixed_now_ts.tz_localize("Australia/Melbourne")
+            result = arr.take([-1, 1], allow_fill=True, fill_value=value)
+
+            expected = arr.take(
+                [-1, 1],
+                allow_fill=True,
+                fill_value=value.tz_convert(arr.dtype.tz),
+            )
+            tm.assert_equal(result, expected)
+
+    def test_concat_same_type_invalid(self, arr1d):
+        # different timezones
+        arr = arr1d
+
+        if arr.tz is None:
+            other = arr.tz_localize("UTC")
+        else:
+            other = arr.tz_localize(None)
+
+        with pytest.raises(ValueError, match="to_concat must have the same"):
+            arr._concat_same_type([arr, other])
+
+    def test_concat_same_type_different_freq(self, unit):
+        # we *can* concatenate DTI with different freqs.
+        a = pd.date_range("2000", periods=2, freq="D", tz="US/Central", unit=unit)._data
+        b = pd.date_range("2000", periods=2, freq="h", tz="US/Central", unit=unit)._data
+        result = DatetimeArray._concat_same_type([a, b])
+        expected = (
+            pd.to_datetime(
+                [
+                    "2000-01-01 00:00:00",
+                    "2000-01-02 00:00:00",
+                    "2000-01-01 00:00:00",
+                    "2000-01-01 01:00:00",
+                ]
+            )
+            .tz_localize("US/Central")
+            .as_unit(unit)
+            ._data
         )
-        for line in ax.get_lines():
-            assert PeriodIndex(data=line.get_xdata()).freq == idxh.freq
-            xdata = line.get_xdata(orig=False)
-            if len(xdata) == 12:  # idxl lines
-                tm.assert_numpy_array_equal(xdata, expected_l)
-            else:
-                tm.assert_numpy_array_equal(xdata, expected_h)
 
-    @pytest.mark.parametrize("kind1, kind2", [("line", "area"), ("area", "line")])
-    def test_from_resampling_area_line_mixed(self, kind1, kind2):
-        idxh = date_range("1/1/1999", periods=52, freq="W")
-        idxl = date_range("1/1/1999", periods=12, freq="ME")
-        high = DataFrame(
-            np.random.default_rng(2).random((len(idxh), 3)),
-            index=idxh,
-            columns=[0, 1, 2],
-        )
-        low = DataFrame(
-            np.random.default_rng(2).random((len(idxl), 3)),
-            index=idxl,
-            columns=[0, 1, 2],
-        )
+        tm.assert_datetime_array_equal(result, expected)
 
-        _, ax = mpl.pyplot.subplots()
-        low.plot(kind=kind1, stacked=True, ax=ax)
-        high.plot(kind=kind2, stacked=True, ax=ax)
+    def test_strftime(self, arr1d, using_infer_string):
+        arr = arr1d
 
-        # check low dataframe result
-        expected_x = np.array(
-            [
-                1514,
-                1519,
-                1523,
-                1527,
-                1531,
-                1536,
-                1540,
-                1544,
-                1549,
-                1553,
-                1558,
-                1562,
-            ],
-            dtype=np.float64,
-        )
-        expected_y = np.zeros(len(expected_x), dtype=np.float64)
-        for i in range(3):
-            line = ax.lines[i]
-            assert PeriodIndex(line.get_xdata()).freq == idxh.freq
-            tm.assert_numpy_array_equal(line.get_xdata(orig=False), expected_x)
-            # check stacked values are correct
-            expected_y += low[i].values
-            tm.assert_numpy_array_equal(line.get_ydata(orig=False), expected_y)
+        result = arr.strftime("%Y %b")
+        expected = np.array([ts.strftime("%Y %b") for ts in arr], dtype=object)
+        if using_infer_string:
+            expected = pd.array(expected, dtype=pd.StringDtype(na_value=np.nan))
+        tm.assert_equal(result, expected)
 
-        # check high dataframe result
-        expected_x = idxh.to_period().asi8.astype(np.float64)
-        expected_y = np.zeros(len(expected_x), dtype=np.float64)
-        for i in range(3):
-            line = ax.lines[3 + i]
-            assert PeriodIndex(data=line.get_xdata()).freq == idxh.freq
-            tm.assert_numpy_array_equal(line.get_xdata(orig=False), expected_x)
-            expected_y += high[i].values
-            tm.assert_numpy_array_equal(line.get_ydata(orig=False), expected_y)
+    def test_strftime_nat(self, using_infer_string):
+        # GH 29578
+        arr = DatetimeIndex(["2019-01-01", NaT])._data
 
-    @pytest.mark.parametrize("kind1, kind2", [("line", "area"), ("area", "line")])
-    def test_from_resampling_area_line_mixed_high_to_low(self, kind1, kind2):
-        idxh = date_range("1/1/1999", periods=52, freq="W")
-        idxl = date_range("1/1/1999", periods=12, freq="ME")
-        high = DataFrame(
-            np.random.default_rng(2).random((len(idxh), 3)),
-            index=idxh,
-            columns=[0, 1, 2],
-        )
-        low = DataFrame(
-            np.random.default_rng(2).random((len(idxl), 3)),
-            index=idxl,
-            columns=[0, 1, 2],
-        )
-        _, ax = mpl.pyplot.subplots()
-        high.plot(kind=kind1, stacked=True, ax=ax)
-        low.plot(kind=kind2, stacked=True, ax=ax)
+        result = arr.strftime("%Y-%m-%d")
+        expected = np.array(["2019-01-01", np.nan], dtype=object)
+        if using_infer_string:
+            expected = pd.array(expected, dtype=pd.StringDtype(na_value=np.nan))
+        tm.assert_equal(result, expected)
 
-        # check high dataframe result
-        expected_x = idxh.to_period().asi8.astype(np.float64)
-        expected_y = np.zeros(len(expected_x), dtype=np.float64)
-        for i in range(3):
-            line = ax.lines[i]
-            assert PeriodIndex(data=line.get_xdata()).freq == idxh.freq
-            tm.assert_numpy_array_equal(line.get_xdata(orig=False), expected_x)
-            expected_y += high[i].values
-            tm.assert_numpy_array_equal(line.get_ydata(orig=False), expected_y)
 
-        # check low dataframe result
-        expected_x = np.array(
-            [
-                1514,
-                1519,
-                1523,
-                1527,
-                1531,
-                1536,
-                1540,
-                1544,
-                1549,
-                1553,
-                1558,
-                1562,
-            ],
-            dtype=np.float64,
-        )
-        expected_y = np.zeros(len(expected_x), dtype=np.float64)
-        for i in range(3):
-            lines = ax.lines[3 + i]
-            assert PeriodIndex(data=lines.get_xdata()).freq == idxh.freq
-            tm.assert_numpy_array_equal(lines.get_xdata(orig=False), expected_x)
-            expected_y += low[i].values
-            tm.assert_numpy_array_equal(lines.get_ydata(orig=False), expected_y)
+class TestTimedeltaArray(SharedTests):
+    index_cls = TimedeltaIndex
+    array_cls = TimedeltaArray
+    scalar_type = pd.Timedelta
+    example_dtype = "m8[ns]"
 
-    def test_mixed_freq_second_millisecond(self):
-        # GH 7772, GH 7760
-        idxh = date_range("2014-07-01 09:00", freq="s", periods=50)
-        idxl = date_range("2014-07-01 09:00", freq="100ms", periods=500)
-        high = Series(np.random.default_rng(2).standard_normal(len(idxh)), idxh)
-        low = Series(np.random.default_rng(2).standard_normal(len(idxl)), idxl)
-        # high to low
-        _, ax = mpl.pyplot.subplots()
-        high.plot(ax=ax)
-        low.plot(ax=ax)
-        assert len(ax.get_lines()) == 2
-        for line in ax.get_lines():
-            assert PeriodIndex(data=line.get_xdata()).freq == "ms"
+    def test_from_tdi(self):
+        tdi = TimedeltaIndex(["1 Day", "3 Hours"])
+        arr = tdi._data
+        assert list(arr) == list(tdi)
 
-    def test_mixed_freq_second_millisecond_low_to_high(self):
-        # GH 7772, GH 7760
-        idxh = date_range("2014-07-01 09:00", freq="s", periods=50)
-        idxl = date_range("2014-07-01 09:00", freq="100ms", periods=500)
-        high = Series(np.random.default_rng(2).standard_normal(len(idxh)), idxh)
-        low = Series(np.random.default_rng(2).standard_normal(len(idxl)), idxl)
-        # low to high
-        _, ax = mpl.pyplot.subplots()
-        low.plot(ax=ax)
-        high.plot(ax=ax)
-        assert len(ax.get_lines()) == 2
-        for line in ax.get_lines():
-            assert PeriodIndex(data=line.get_xdata()).freq == "ms"
+        # Check that Index.__new__ knows what to do with TimedeltaArray
+        tdi2 = pd.Index(arr)
+        assert isinstance(tdi2, TimedeltaIndex)
+        assert list(tdi2) == list(arr)
 
-    def test_irreg_dtypes(self):
-        # date
-        idx = [date(2000, 1, 1), date(2000, 1, 5), date(2000, 1, 20)]
-        df = DataFrame(
-            np.random.default_rng(2).standard_normal((len(idx), 3)),
-            Index(idx, dtype=object),
-        )
-        _check_plot_works(df.plot)
+    def test_astype_object(self):
+        tdi = TimedeltaIndex(["1 Day", "3 Hours"])
+        arr = tdi._data
+        asobj = arr.astype("O")
+        assert isinstance(asobj, np.ndarray)
+        assert asobj.dtype == "O"
+        assert list(asobj) == list(tdi)
 
-    def test_irreg_dtypes_dt64(self):
-        # np.datetime64
-        idx = date_range("1/1/2000", periods=10)
-        idx = idx[[0, 2, 5, 9]].astype(object)
-        df = DataFrame(np.random.default_rng(2).standard_normal((len(idx), 3)), idx)
-        _, ax = mpl.pyplot.subplots()
-        _check_plot_works(df.plot, ax=ax)
+    def test_to_pytimedelta(self, timedelta_index):
+        tdi = timedelta_index
+        arr = tdi._data
 
-    def test_time(self):
-        t = datetime(1, 1, 1, 3, 30, 0)
-        deltas = np.random.default_rng(2).integers(1, 20, 3).cumsum()
-        ts = np.array([(t + timedelta(minutes=int(x))).time() for x in deltas])
-        df = DataFrame(
-            {
-                "a": np.random.default_rng(2).standard_normal(len(ts)),
-                "b": np.random.default_rng(2).standard_normal(len(ts)),
-            },
-            index=ts,
-        )
-        _, ax = mpl.pyplot.subplots()
-        df.plot(ax=ax)
+        expected = tdi.to_pytimedelta()
+        result = arr.to_pytimedelta()
 
-        # verify tick labels
-        ticks = ax.get_xticks()
-        labels = ax.get_xticklabels()
-        for _tick, _label in zip(ticks, labels):
-            m, s = divmod(int(_tick), 60)
-            h, m = divmod(m, 60)
-            rs = _label.get_text()
-            if len(rs) > 0:
-                if s != 0:
-                    xp = time(h, m, s).strftime("%H:%M:%S")
-                else:
-                    xp = time(h, m, s).strftime("%H:%M")
-                assert xp == rs
+        tm.assert_numpy_array_equal(result, expected)
 
-    def test_time_change_xlim(self):
-        t = datetime(1, 1, 1, 3, 30, 0)
-        deltas = np.random.default_rng(2).integers(1, 20, 3).cumsum()
-        ts = np.array([(t + timedelta(minutes=int(x))).time() for x in deltas])
-        df = DataFrame(
-            {
-                "a": np.random.default_rng(2).standard_normal(len(ts)),
-                "b": np.random.default_rng(2).standard_normal(len(ts)),
-            },
-            index=ts,
-        )
-        _, ax = mpl.pyplot.subplots()
-        df.plot(ax=ax)
+    def test_total_seconds(self, timedelta_index):
+        tdi = timedelta_index
+        arr = tdi._data
 
-        # verify tick labels
-        ticks = ax.get_xticks()
-        labels = ax.get_xticklabels()
-        for _tick, _label in zip(ticks, labels):
-            m, s = divmod(int(_tick), 60)
-            h, m = divmod(m, 60)
-            rs = _label.get_text()
-            if len(rs) > 0:
-                if s != 0:
-                    xp = time(h, m, s).strftime("%H:%M:%S")
-                else:
-                    xp = time(h, m, s).strftime("%H:%M")
-                assert xp == rs
+        expected = tdi.total_seconds()
+        result = arr.total_seconds()
 
-        # change xlim
-        ax.set_xlim("1:30", "5:00")
+        tm.assert_numpy_array_equal(result, expected.values)
 
-        # check tick labels again
-        ticks = ax.get_xticks()
-        labels = ax.get_xticklabels()
-        for _tick, _label in zip(ticks, labels):
-            m, s = divmod(int(_tick), 60)
-            h, m = divmod(m, 60)
-            rs = _label.get_text()
-            if len(rs) > 0:
-                if s != 0:
-                    xp = time(h, m, s).strftime("%H:%M:%S")
-                else:
-                    xp = time(h, m, s).strftime("%H:%M")
-                assert xp == rs
+    @pytest.mark.parametrize("propname", TimedeltaArray._field_ops)
+    def test_int_properties(self, timedelta_index, propname):
+        tdi = timedelta_index
+        arr = tdi._data
 
-    def test_time_musec(self):
-        t = datetime(1, 1, 1, 3, 30, 0)
-        deltas = np.random.default_rng(2).integers(1, 20, 3).cumsum()
-        ts = np.array([(t + timedelta(microseconds=int(x))).time() for x in deltas])
-        df = DataFrame(
-            {
-                "a": np.random.default_rng(2).standard_normal(len(ts)),
-                "b": np.random.default_rng(2).standard_normal(len(ts)),
-            },
-            index=ts,
-        )
-        _, ax = mpl.pyplot.subplots()
-        ax = df.plot(ax=ax)
+        result = getattr(arr, propname)
+        expected = np.array(getattr(tdi, propname), dtype=result.dtype)
 
-        # verify tick labels
-        ticks = ax.get_xticks()
-        labels = ax.get_xticklabels()
-        for _tick, _label in zip(ticks, labels):
-            m, s = divmod(int(_tick), 60)
+        tm.assert_numpy_array_equal(result, expected)
 
-            us = round((_tick - int(_tick)) * 1e6)
+    def test_array_interface(self, timedelta_index):
+        arr = timedelta_index._data
+        copy_false = None if np_version_gt2 else False
 
-            h, m = divmod(m, 60)
-            rs = _label.get_text()
-            if len(rs) > 0:
-                if (us % 1000) != 0:
-                    xp = time(h, m, s, us).strftime("%H:%M:%S.%f")
-                elif (us // 1000) != 0:
-                    xp = time(h, m, s, us).strftime("%H:%M:%S.%f")[:-3]
-                elif s != 0:
-                    xp = time(h, m, s, us).strftime("%H:%M:%S")
-                else:
-                    xp = time(h, m, s, us).strftime("%H:%M")
-                assert xp == rs
+        # default asarray gives the same underlying data
+        result = np.asarray(arr)
+        expected = arr._ndarray
+        assert result is expected
+        tm.assert_numpy_array_equal(result, expected)
+        result = np.array(arr, copy=copy_false)
+        assert result is expected
+        tm.assert_numpy_array_equal(result, expected)
 
-    def test_secondary_upsample(self):
-        idxh = date_range("1/1/1999", periods=365, freq="D")
-        idxl = date_range("1/1/1999", periods=12, freq="ME")
-        high = Series(np.random.default_rng(2).standard_normal(len(idxh)), idxh)
-        low = Series(np.random.default_rng(2).standard_normal(len(idxl)), idxl)
-        _, ax = mpl.pyplot.subplots()
-        low.plot(ax=ax)
-        ax = high.plot(secondary_y=True, ax=ax)
-        for line in ax.get_lines():
-            assert PeriodIndex(line.get_xdata()).freq == "D"
-        assert hasattr(ax, "left_ax")
-        assert not hasattr(ax, "right_ax")
-        for line in ax.left_ax.get_lines():
-            assert PeriodIndex(line.get_xdata()).freq == "D"
+        # specifying m8[ns] gives the same result as default
+        result = np.asarray(arr, dtype="timedelta64[ns]")
+        expected = arr._ndarray
+        assert result is expected
+        tm.assert_numpy_array_equal(result, expected)
+        result = np.array(arr, dtype="timedelta64[ns]", copy=copy_false)
+        assert result is expected
+        tm.assert_numpy_array_equal(result, expected)
+        result = np.array(arr, dtype="timedelta64[ns]")
+        if not np_version_gt2:
+            # TODO: GH 57739
+            assert result is not expected
+        tm.assert_numpy_array_equal(result, expected)
 
-    def test_secondary_legend(self):
-        fig = mpl.pyplot.figure()
-        ax = fig.add_subplot(211)
+        # to object dtype
+        result = np.asarray(arr, dtype=object)
+        expected = np.array(list(arr), dtype=object)
+        tm.assert_numpy_array_equal(result, expected)
 
-        # ts
-        df = DataFrame(
-            np.random.default_rng(2).standard_normal((10, 4)),
-            columns=Index(list("ABCD"), dtype=object),
-            index=date_range("2000-01-01", periods=10, freq="B"),
-        )
-        df.plot(secondary_y=["A", "B"], ax=ax)
-        leg = ax.get_legend()
-        assert len(leg.get_lines()) == 4
-        assert leg.get_texts()[0].get_text() == "A (right)"
-        assert leg.get_texts()[1].get_text() == "B (right)"
-        assert leg.get_texts()[2].get_text() == "C"
-        assert leg.get_texts()[3].get_text() == "D"
-        assert ax.right_ax.get_legend() is None
-        colors = set()
-        for line in leg.get_lines():
-            colors.add(line.get_color())
+        # to other dtype always copies
+        result = np.asarray(arr, dtype="int64")
+        assert result is not arr.asi8
+        assert not np.may_share_memory(arr, result)
+        expected = arr.asi8.copy()
+        tm.assert_numpy_array_equal(result, expected)
 
-        # TODO: color cycle problems
-        assert len(colors) == 4
-        mpl.pyplot.close(fig)
+        # other dtypes handled by numpy
+        for dtype in ["float64", str]:
+            result = np.asarray(arr, dtype=dtype)
+            expected = np.asarray(arr).astype(dtype)
+            tm.assert_numpy_array_equal(result, expected)
 
-    def test_secondary_legend_right(self):
-        df = DataFrame(
-            np.random.default_rng(2).standard_normal((10, 4)),
-            columns=Index(list("ABCD"), dtype=object),
-            index=date_range("2000-01-01", periods=10, freq="B"),
-        )
-        fig = mpl.pyplot.figure()
-        ax = fig.add_subplot(211)
-        df.plot(secondary_y=["A", "C"], mark_right=False, ax=ax)
-        leg = ax.get_legend()
-        assert len(leg.get_lines()) == 4
-        assert leg.get_texts()[0].get_text() == "A"
-        assert leg.get_texts()[1].get_text() == "B"
-        assert leg.get_texts()[2].get_text() == "C"
-        assert leg.get_texts()[3].get_text() == "D"
-        mpl.pyplot.close(fig)
+    def test_take_fill_valid(self, timedelta_index, fixed_now_ts):
+        tdi = timedelta_index
+        arr = tdi._data
 
-    def test_secondary_legend_bar(self):
-        df = DataFrame(
-            np.random.default_rng(2).standard_normal((10, 4)),
-            columns=Index(list("ABCD"), dtype=object),
-            index=date_range("2000-01-01", periods=10, freq="B"),
-        )
-        fig, ax = mpl.pyplot.subplots()
-        df.plot(kind="bar", secondary_y=["A"], ax=ax)
-        leg = ax.get_legend()
-        assert leg.get_texts()[0].get_text() == "A (right)"
-        assert leg.get_texts()[1].get_text() == "B"
-        mpl.pyplot.close(fig)
+        td1 = pd.Timedelta(days=1)
+        result = arr.take([-1, 1], allow_fill=True, fill_value=td1)
+        assert result[0] == td1
 
-    def test_secondary_legend_bar_right(self):
-        df = DataFrame(
-            np.random.default_rng(2).standard_normal((10, 4)),
-            columns=Index(list("ABCD"), dtype=object),
-            index=date_range("2000-01-01", periods=10, freq="B"),
-        )
-        fig, ax = mpl.pyplot.subplots()
-        df.plot(kind="bar", secondary_y=["A"], mark_right=False, ax=ax)
-        leg = ax.get_legend()
-        assert leg.get_texts()[0].get_text() == "A"
-        assert leg.get_texts()[1].get_text() == "B"
-        mpl.pyplot.close(fig)
+        value = fixed_now_ts
+        msg = f"value should be a '{arr._scalar_type.__name__}' or 'NaT'. Got"
+        with pytest.raises(TypeError, match=msg):
+            # fill_value Timestamp invalid
+            arr.take([0, 1], allow_fill=True, fill_value=value)
 
-    def test_secondary_legend_multi_col(self):
-        df = DataFrame(
-            np.random.default_rng(2).standard_normal((10, 4)),
-            columns=Index(list("ABCD"), dtype=object),
-            index=date_range("2000-01-01", periods=10, freq="B"),
-        )
-        fig = mpl.pyplot.figure()
-        ax = fig.add_subplot(211)
-        df = DataFrame(
-            np.random.default_rng(2).standard_normal((10, 4)),
-            columns=Index(list("ABCD"), dtype=object),
-            index=date_range("2000-01-01", periods=10, freq="B"),
-        )
-        ax = df.plot(secondary_y=["C", "D"], ax=ax)
-        leg = ax.get_legend()
-        assert len(leg.get_lines()) == 4
-        assert ax.right_ax.get_legend() is None
-        colors = set()
-        for line in leg.get_lines():
-            colors.add(line.get_color())
+        value = fixed_now_ts.to_period("D")
+        with pytest.raises(TypeError, match=msg):
+            # fill_value Period invalid
+            arr.take([0, 1], allow_fill=True, fill_value=value)
 
-        # TODO: color cycle problems
-        assert len(colors) == 4
-        mpl.pyplot.close(fig)
+        value = np.datetime64("NaT", "ns")
+        with pytest.raises(TypeError, match=msg):
+            # require appropriate-dtype if we have a NA value
+            arr.take([-1, 1], allow_fill=True, fill_value=value)
 
-    def test_secondary_legend_nonts(self):
-        # non-ts
-        df = DataFrame(
-            1.1 * np.arange(120).reshape((30, 4)),
-            columns=Index(list("ABCD"), dtype=object),
-            index=Index([f"i-{i}" for i in range(30)], dtype=object),
-        )
-        fig = mpl.pyplot.figure()
-        ax = fig.add_subplot(211)
-        ax = df.plot(secondary_y=["A", "B"], ax=ax)
-        leg = ax.get_legend()
-        assert len(leg.get_lines()) == 4
-        assert ax.right_ax.get_legend() is None
-        colors = set()
-        for line in leg.get_lines():
-            colors.add(line.get_color())
 
-        # TODO: color cycle problems
-        assert len(colors) == 4
-        mpl.pyplot.close()
+@pytest.mark.filterwarnings(r"ignore:Period with BDay freq is deprecated:FutureWarning")
+@pytest.mark.filterwarnings(r"ignore:PeriodDtype\[B\] is deprecated:FutureWarning")
+class TestPeriodArray(SharedTests):
+    index_cls = PeriodIndex
+    array_cls = PeriodArray
+    scalar_type = Period
+    example_dtype = PeriodIndex([], freq="W").dtype
 
-    def test_secondary_legend_nonts_multi_col(self):
-        # non-ts
-        df = DataFrame(
-            1.1 * np.arange(120).reshape((30, 4)),
-            columns=Index(list("ABCD"), dtype=object),
-            index=Index([f"i-{i}" for i in range(30)], dtype=object),
-        )
-        fig = mpl.pyplot.figure()
-        ax = fig.add_subplot(211)
-        ax = df.plot(secondary_y=["C", "D"], ax=ax)
-        leg = ax.get_legend()
-        assert len(leg.get_lines()) == 4
-        assert ax.right_ax.get_legend() is None
-        colors = set()
-        for line in leg.get_lines():
-            colors.add(line.get_color())
+    @pytest.fixture
+    def arr1d(self, period_index):
+        """
+        Fixture returning DatetimeArray from parametrized PeriodIndex objects
+        """
+        return period_index._data
 
-        # TODO: color cycle problems
-        assert len(colors) == 4
+    def test_from_pi(self, arr1d):
+        pi = self.index_cls(arr1d)
+        arr = arr1d
+        assert list(arr) == list(pi)
 
-    @pytest.mark.xfail(reason="Api changed in 3.6.0")
-    def test_format_date_axis(self):
-        rng = date_range("1/1/2012", periods=12, freq="ME")
-        df = DataFrame(np.random.default_rng(2).standard_normal((len(rng), 3)), rng)
-        _, ax = mpl.pyplot.subplots()
-        ax = df.plot(ax=ax)
-        xaxis = ax.get_xaxis()
-        for line in xaxis.get_ticklabels():
-            if len(line.get_text()) > 0:
-                assert line.get_rotation() == 30
+        # Check that Index.__new__ knows what to do with PeriodArray
+        pi2 = pd.Index(arr)
+        assert isinstance(pi2, PeriodIndex)
+        assert list(pi2) == list(arr)
 
-    def test_ax_plot(self):
-        x = date_range(start="2012-01-02", periods=10, freq="D")
-        y = list(range(len(x)))
-        _, ax = mpl.pyplot.subplots()
-        lines = ax.plot(x, y, label="Y")
-        tm.assert_index_equal(DatetimeIndex(lines[0].get_xdata()), x)
+    def test_astype_object(self, arr1d):
+        pi = self.index_cls(arr1d)
+        arr = arr1d
+        asobj = arr.astype("O")
+        assert isinstance(asobj, np.ndarray)
+        assert asobj.dtype == "O"
+        assert list(asobj) == list(pi)
 
-    def test_mpl_nopandas(self):
-        dates = [date(2008, 12, 31), date(2009, 1, 31)]
-        values1 = np.arange(10.0, 11.0, 0.5)
-        values2 = np.arange(11.0, 12.0, 0.5)
+    def test_take_fill_valid(self, arr1d):
+        arr = arr1d
 
-        _, ax = mpl.pyplot.subplots()
+        value = NaT._value
+        msg = f"value should be a '{arr1d._scalar_type.__name__}' or 'NaT'. Got"
+        with pytest.raises(TypeError, match=msg):
+            # require NaT, not iNaT, as it could be confused with an integer
+            arr.take([-1, 1], allow_fill=True, fill_value=value)
+
+        value = np.timedelta64("NaT", "ns")
+        with pytest.raises(TypeError, match=msg):
+            # require appropriate-dtype if we have a NA value
+            arr.take([-1, 1], allow_fill=True, fill_value=value)
+
+    @pytest.mark.parametrize("how", ["S", "E"])
+    def test_to_timestamp(self, how, arr1d):
+        pi = self.index_cls(arr1d)
+        arr = arr1d
+
+        expected = DatetimeIndex(pi.to_timestamp(how=how))._data
+        result = arr.to_timestamp(how=how)
+        assert isinstance(result, DatetimeArray)
+
+        tm.assert_equal(result, expected)
+
+    def test_to_timestamp_roundtrip_bday(self):
+        # Case where infer_freq inside would choose "D" instead of "B"
+        dta = pd.date_range("2021-10-18", periods=3, freq="B")._data
+        parr = dta.to_period()
+        result = parr.to_timestamp()
+        assert result.freq == "B"
+        tm.assert_extension_array_equal(result, dta)
+
+        dta2 = dta[::2]
+        parr2 = dta2.to_period()
+        result2 = parr2.to_timestamp()
+        assert result2.freq == "2B"
+        tm.assert_extension_array_equal(result2, dta2)
+
+        parr3 = dta.to_period("2B")
+        result3 = parr3.to_timestamp()
+        assert result3.freq == "B"
+        tm.assert_extension_array_equal(result3, dta)
+
+    def test_to_timestamp_out_of_bounds(self):
+        # GH#19643 previously overflowed silently
+        pi = pd.period_range("1500", freq="Y", periods=3)
+        msg = "Out of bounds nanosecond timestamp: 1500-01-01 00:00:00"
+        with pytest.raises(OutOfBoundsDatetime, match=msg):
+            pi.to_timestamp()
+
+        with pytest.raises(OutOfBoundsDatetime, match=msg):
+            pi._data.to_timestamp()
+
+    @pytest.mark.parametrize("propname", PeriodArray._bool_ops)
+    def test_bool_properties(self, arr1d, propname):
+        # in this case _bool_ops is just `is_leap_year`
+        pi = self.index_cls(arr1d)
+        arr = arr1d
+
+        result = getattr(arr, propname)
+        expected = np.array(getattr(pi, propname))
+
+        tm.assert_numpy_array_equal(result, expected)
+
+    @pytest.mark.parametrize("propname", PeriodArray._field_ops)
+    def test_int_properties(self, arr1d, propname):
+        pi = self.index_cls(arr1d)
+        arr = arr1d
+
+        result = getattr(arr, propname)
+        expected = np.array(getattr(pi, propname))
+
+        tm.assert_numpy_array_equal(result, expected)
+
+    def test_array_interface(self, arr1d):
+        arr = arr1d
+
+        # default asarray gives objects
+        result = np.asarray(arr)
+        expected = np.array(list(arr), dtype=object)
+        tm.assert_numpy_array_equal(result, expected)
+
+        # to object dtype (same as default)
+        result = np.asarray(arr, dtype=object)
+        tm.assert_numpy_array_equal(result, expected)
+
+        # to int64 gives the underlying representation
+        result = np.asarray(arr, dtype="int64")
+        tm.assert_numpy_array_equal(result, arr.asi8)
+
+        result2 = np.asarray(arr, dtype="int64")
+        assert np.may_share_memory(result, result2)
+
+        result_copy1 = np.array(arr, dtype="int64", copy=True)
+        result_copy2 = np.array(arr, dtype="int64", copy=True)
+        assert not np.may_share_memory(result_copy1, result_copy2)
+
+        # to other dtypes
+        msg = r"float\(\) argument must be a string or a( real)? number, not 'Period'"
+        with pytest.raises(TypeError, match=msg):
+            np.asarray(arr, dtype="float64")
+
+        result = np.asarray(arr, dtype="S20")
+        expected = np.asarray(arr).astype("S20")
+        tm.assert_numpy_array_equal(result, expected)
+
+    def test_strftime(self, arr1d, using_infer_string):
+        arr = arr1d
+
+        result = arr.strftime("%Y")
+        expected = np.array([per.strftime("%Y") for per in arr], dtype=object)
+        if using_infer_string:
+            expected = pd.array(expected, dtype=pd.StringDtype(na_value=np.nan))
+        tm.assert_equal(result, expected)
+
+    def test_strftime_nat(self, using_infer_string):
+        # GH 29578
+        arr = PeriodArray(PeriodIndex(["2019-01-01", NaT], dtype="period[D]"))
+
+        result = arr.strftime("%Y-%m-%d")
+        expected = np.array(["2019-01-01", np.nan], dtype=object)
+        if using_infer_string:
+            expected = pd.array(expected, dtype=pd.StringDtype(na_value=np.nan))
+        tm.assert_equal(result, expected)
+
+
+@pytest.mark.parametrize(
+    "arr,casting_nats",
+    [
         (
-            line1,
-            line2,
-        ) = ax.plot(
-            [x.toordinal() for x in dates],
-            values1,
-            "-",
-            [x.toordinal() for x in dates],
-            values2,
-            "-",
-            linewidth=4,
-        )
+            TimedeltaIndex(["1 Day", "3 Hours", "NaT"])._data,
+            (NaT, np.timedelta64("NaT", "ns")),
+        ),
+        (
+            pd.date_range("2000-01-01", periods=3, freq="D")._data,
+            (NaT, np.datetime64("NaT", "ns")),
+        ),
+        (pd.period_range("2000-01-01", periods=3, freq="D")._data, (NaT,)),
+    ],
+    ids=lambda x: type(x).__name__,
+)
+def test_casting_nat_setitem_array(arr, casting_nats):
+    expected = type(arr)._from_sequence([NaT, arr[1], arr[2]], dtype=arr.dtype)
 
-        exp = np.array([x.toordinal() for x in dates], dtype=np.float64)
-        tm.assert_numpy_array_equal(line1.get_xydata()[:, 0], exp)
-        exp = np.array([x.toordinal() for x in dates], dtype=np.float64)
-        tm.assert_numpy_array_equal(line2.get_xydata()[:, 0], exp)
-
-    def test_irregular_ts_shared_ax_xlim(self):
-        # GH 2960
-        from pandas.plotting._matplotlib.converter import DatetimeConverter
-
-        ts = Series(
-            np.arange(20, dtype=np.float64), index=date_range("2020-01-01", periods=20)
-        )
-        ts_irregular = ts.iloc[[1, 4, 5, 6, 8, 9, 10, 12, 13, 14, 15, 17, 18]]
-
-        # plot the left section of the irregular series, then the right section
-        _, ax = mpl.pyplot.subplots()
-        ts_irregular[:5].plot(ax=ax)
-        ts_irregular[5:].plot(ax=ax)
-
-        # check that axis limits are correct
-        left, right = ax.get_xlim()
-        assert left <= DatetimeConverter.convert(ts_irregular.index.min(), "", ax)
-        assert right >= DatetimeConverter.convert(ts_irregular.index.max(), "", ax)
-
-    def test_secondary_y_non_ts_xlim(self):
-        # GH 3490 - non-timeseries with secondary y
-        index_1 = [1, 2, 3, 4]
-        index_2 = [5, 6, 7, 8]
-        s1 = Series(1, index=index_1)
-        s2 = Series(2, index=index_2)
-
-        _, ax = mpl.pyplot.subplots()
-        s1.plot(ax=ax)
-        left_before, right_before = ax.get_xlim()
-        s2.plot(secondary_y=True, ax=ax)
-        left_after, right_after = ax.get_xlim()
-
-        assert left_before >= left_after
-        assert right_before < right_after
-
-    def test_secondary_y_regular_ts_xlim(self):
-        # GH 3490 - regular-timeseries with secondary y
-        index_1 = date_range(start="2000-01-01", periods=4, freq="D")
-        index_2 = date_range(start="2000-01-05", periods=4, freq="D")
-        s1 = Series(1, index=index_1)
-        s2 = Series(2, index=index_2)
-
-        _, ax = mpl.pyplot.subplots()
-        s1.plot(ax=ax)
-        left_before, right_before = ax.get_xlim()
-        s2.plot(secondary_y=True, ax=ax)
-        left_after, right_after = ax.get_xlim()
-
-        assert left_before >= left_after
-        assert right_before < right_after
-
-    def test_secondary_y_mixed_freq_ts_xlim(self):
-        # GH 3490 - mixed frequency timeseries with secondary y
-        rng = date_range("2000-01-01", periods=10000, freq="min")
-        ts = Series(1, index=rng)
-
-        _, ax = mpl.pyplot.subplots()
-        ts.plot(ax=ax)
-        left_before, right_before = ax.get_xlim()
-        ts.resample("D").mean().plot(secondary_y=True, ax=ax)
-        left_after, right_after = ax.get_xlim()
-
-        # a downsample should not have changed either limit
-        assert left_before == left_after
-        assert right_before == right_after
-
-    def test_secondary_y_irregular_ts_xlim(self):
-        # GH 3490 - irregular-timeseries with secondary y
-        from pandas.plotting._matplotlib.converter import DatetimeConverter
-
-        ts = Series(
-            np.arange(20, dtype=np.float64), index=date_range("2020-01-01", periods=20)
-        )
-        ts_irregular = ts.iloc[[1, 4, 5, 6, 8, 9, 10, 12, 13, 14, 15, 17, 18]]
-
-        _, ax = mpl.pyplot.subplots()
-        ts_irregular[:5].plot(ax=ax)
-        # plot higher-x values on secondary axis
-        ts_irregular[5:].plot(secondary_y=True, ax=ax)
-        # ensure secondary limits aren't overwritten by plot on primary
-        ts_irregular[:5].plot(ax=ax)
-
-        left, right = ax.get_xlim()
-        assert left <= DatetimeConverter.convert(ts_irregular.index.min(), "", ax)
-        assert right >= DatetimeConverter.convert(ts_irregular.index.max(), "", ax)
-
-    def test_plot_outofbounds_datetime(self):
-        # 2579 - checking this does not raise
-        values = [date(1677, 1, 1), date(1677, 1, 2)]
-        _, ax = mpl.pyplot.subplots()
-        ax.plot(values)
-
-        values = [datetime(1677, 1, 1, 12), datetime(1677, 1, 2, 12)]
-        ax.plot(values)
-
-    def test_format_timedelta_ticks_narrow(self):
-        expected_labels = [f"00:00:00.0000000{i:0>2d}" for i in np.arange(10)]
-
-        rng = timedelta_range("0", periods=10, freq="ns")
-        df = DataFrame(np.random.default_rng(2).standard_normal((len(rng), 3)), rng)
-        _, ax = mpl.pyplot.subplots()
-        df.plot(fontsize=2, ax=ax)
-        mpl.pyplot.draw()
-        labels = ax.get_xticklabels()
-
-        result_labels = [x.get_text() for x in labels]
-        assert len(result_labels) == len(expected_labels)
-        assert result_labels == expected_labels
-
-    def test_format_timedelta_ticks_wide(self):
-        expected_labels = [
-            "00:00:00",
-            "1 days 03:46:40",
-            "2 days 07:33:20",
-            "3 days 11:20:00",
-            "4 days 15:06:40",
-            "5 days 18:53:20",
-            "6 days 22:40:00",
-            "8 days 02:26:40",
-            "9 days 06:13:20",
-        ]
-
-        rng = timedelta_range("0", periods=10, freq="1 d")
-        df = DataFrame(np.random.default_rng(2).standard_normal((len(rng), 3)), rng)
-        _, ax = mpl.pyplot.subplots()
-        ax = df.plot(fontsize=2, ax=ax)
-        mpl.pyplot.draw()
-        labels = ax.get_xticklabels()
-
-        result_labels = [x.get_text() for x in labels]
-        assert len(result_labels) == len(expected_labels)
-        assert result_labels == expected_labels
-
-    def test_timedelta_plot(self):
-        # test issue #8711
-        s = Series(range(5), timedelta_range("1day", periods=5))
-        _, ax = mpl.pyplot.subplots()
-        _check_plot_works(s.plot, ax=ax)
-
-    def test_timedelta_long_period(self):
-        # test long period
-        index = timedelta_range("1 day 2 hr 30 min 10 s", periods=10, freq="1 d")
-        s = Series(np.random.default_rng(2).standard_normal(len(index)), index)
-        _, ax = mpl.pyplot.subplots()
-        _check_plot_works(s.plot, ax=ax)
-
-    def test_timedelta_short_period(self):
-        # test short period
-        index = timedelta_range("1 day 2 hr 30 min 10 s", periods=10, freq="1 ns")
-        s = Series(np.random.default_rng(2).standard_normal(len(index)), index)
-        _, ax = mpl.pyplot.subplots()
-        _check_plot_works(s.plot, ax=ax)
-
-    def test_hist(self):
-        # https://github.com/matplotlib/matplotlib/issues/8459
-        rng = date_range("1/1/2011", periods=10, freq="h")
-        x = rng
-        w1 = np.arange(0, 1, 0.1)
-        w2 = np.arange(0, 1, 0.1)[::-1]
-        _, ax = mpl.pyplot.subplots()
-        ax.hist([x, x], weights=[w1, w2])
-
-    def test_overlapping_datetime(self):
-        # GB 6608
-        s1 = Series(
-            [1, 2, 3],
-            index=[
-                datetime(1995, 12, 31),
-                datetime(2000, 12, 31),
-                datetime(2005, 12, 31),
-            ],
-        )
-        s2 = Series(
-            [1, 2, 3],
-            index=[
-                datetime(1997, 12, 31),
-                datetime(2003, 12, 31),
-                datetime(2008, 12, 31),
-            ],
-        )
-
-        # plot first series, then add the second series to those axes,
-        # then try adding the first series again
-        _, ax = mpl.pyplot.subplots()
-        s1.plot(ax=ax)
-        s2.plot(ax=ax)
-        s1.plot(ax=ax)
-
-    @pytest.mark.xfail(reason="GH9053 matplotlib does not use ax.xaxis.converter")
-    def test_add_matplotlib_datetime64(self):
-        # GH9053 - ensure that a plot with PeriodConverter still understands
-        # datetime64 data. This still fails because matplotlib overrides the
-        # ax.xaxis.converter with a DatetimeConverter
-        s = Series(
-            np.random.default_rng(2).standard_normal(10),
-            index=date_range("1970-01-02", periods=10),
-        )
-        ax = s.plot()
-        with tm.assert_produces_warning(DeprecationWarning):
-            # multi-dimensional indexing
-            ax.plot(s.index, s.values, color="g")
-        l1, l2 = ax.lines
-        tm.assert_numpy_array_equal(l1.get_xydata(), l2.get_xydata())
-
-    def test_matplotlib_scatter_datetime64(self):
-        # https://github.com/matplotlib/matplotlib/issues/11391
-        df = DataFrame(np.random.default_rng(2).random((10, 2)), columns=["x", "y"])
-        df["time"] = date_range("2018-01-01", periods=10, freq="D")
-        _, ax = mpl.pyplot.subplots()
-        ax.scatter(x="time", y="y", data=df)
-        mpl.pyplot.draw()
-        label = ax.get_xticklabels()[0]
-        expected = "2018-01-01"
-        assert label.get_text() == expected
-
-    def test_check_xticks_rot(self):
-        # https://github.com/pandas-dev/pandas/issues/29460
-        # regular time series
-        x = to_datetime(["2020-05-01", "2020-05-02", "2020-05-03"])
-        df = DataFrame({"x": x, "y": [1, 2, 3]})
-        axes = df.plot(x="x", y="y")
-        _check_ticks_props(axes, xrot=0)
-
-    def test_check_xticks_rot_irregular(self):
-        # irregular time series
-        x = to_datetime(["2020-05-01", "2020-05-02", "2020-05-04"])
-        df = DataFrame({"x": x, "y": [1, 2, 3]})
-        axes = df.plot(x="x", y="y")
-        _check_ticks_props(axes, xrot=30)
-
-    def test_check_xticks_rot_use_idx(self):
-        # irregular time series
-        x = to_datetime(["2020-05-01", "2020-05-02", "2020-05-04"])
-        df = DataFrame({"x": x, "y": [1, 2, 3]})
-        # use timeseries index or not
-        axes = df.set_index("x").plot(y="y", use_index=True)
-        _check_ticks_props(axes, xrot=30)
-        axes = df.set_index("x").plot(y="y", use_index=False)
-        _check_ticks_props(axes, xrot=0)
-
-    def test_check_xticks_rot_sharex(self):
-        # irregular time series
-        x = to_datetime(["2020-05-01", "2020-05-02", "2020-05-04"])
-        df = DataFrame({"x": x, "y": [1, 2, 3]})
-        # separate subplots
-        axes = df.plot(x="x", y="y", subplots=True, sharex=True)
-        _check_ticks_props(axes, xrot=30)
-        axes = df.plot(x="x", y="y", subplots=True, sharex=False)
-        _check_ticks_props(axes, xrot=0)
+    for nat in casting_nats:
+        arr = arr.copy()
+        arr[0] = nat
+        tm.assert_equal(arr, expected)
 
 
-def _check_plot_works(f, freq=None, series=None, *args, **kwargs):
-    import matplotlib.pyplot as plt
+@pytest.mark.parametrize(
+    "arr,non_casting_nats",
+    [
+        (
+            TimedeltaIndex(["1 Day", "3 Hours", "NaT"])._data,
+            (np.datetime64("NaT", "ns"), NaT._value),
+        ),
+        (
+            pd.date_range("2000-01-01", periods=3, freq="D")._data,
+            (np.timedelta64("NaT", "ns"), NaT._value),
+        ),
+        (
+            pd.period_range("2000-01-01", periods=3, freq="D")._data,
+            (np.datetime64("NaT", "ns"), np.timedelta64("NaT", "ns"), NaT._value),
+        ),
+    ],
+    ids=lambda x: type(x).__name__,
+)
+def test_invalid_nat_setitem_array(arr, non_casting_nats):
+    msg = (
+        "value should be a '(Timestamp|Timedelta|Period)', 'NaT', or array of those. "
+        "Got '(timedelta64|datetime64|int)' instead."
+    )
 
-    fig = plt.gcf()
+    for nat in non_casting_nats:
+        with pytest.raises(TypeError, match=msg):
+            arr[0] = nat
 
-    try:
-        plt.clf()
-        ax = fig.add_subplot(211)
-        orig_ax = kwargs.pop("ax", plt.gca())
-        orig_axfreq = getattr(orig_ax, "freq", None)
 
-        ret = f(*args, **kwargs)
-        assert ret is not None  # do something more intelligent
+@pytest.mark.parametrize(
+    "arr",
+    [
+        pd.date_range("2000", periods=4).array,
+        pd.timedelta_range("2000", periods=4).array,
+    ],
+)
+def test_to_numpy_extra(arr):
+    arr[0] = NaT
+    original = arr.copy()
 
-        ax = kwargs.pop("ax", plt.gca())
-        if series is not None:
-            dfreq = series.index.freq
-            if isinstance(dfreq, BaseOffset):
-                dfreq = dfreq.rule_code
-            if orig_axfreq is None:
-                assert ax.freq == dfreq
+    result = arr.to_numpy()
+    assert np.isnan(result[0])
 
-        if freq is not None:
-            ax_freq = to_offset(ax.freq, is_period=True)
-        if freq is not None and orig_axfreq is None:
-            assert ax_freq == freq
+    result = arr.to_numpy(dtype="int64")
+    assert result[0] == -9223372036854775808
 
-        ax = fig.add_subplot(212)
-        kwargs["ax"] = ax
-        ret = f(*args, **kwargs)
-        assert ret is not None  # TODO: do something more intelligent
+    result = arr.to_numpy(dtype="int64", na_value=0)
+    assert result[0] == 0
 
-        # GH18439, GH#24088, statsmodels#4772
-        with tm.ensure_clean(return_filelike=True) as path:
-            pickle.dump(fig, path)
-    finally:
-        plt.close(fig)
+    result = arr.to_numpy(na_value=arr[1].to_numpy())
+    assert result[0] == result[1]
+
+    result = arr.to_numpy(na_value=arr[1].to_numpy(copy=False))
+    assert result[0] == result[1]
+
+    tm.assert_equal(arr, original)
+
+
+@pytest.mark.parametrize("as_index", [True, False])
+@pytest.mark.parametrize(
+    "values",
+    [
+        pd.to_datetime(["2020-01-01", "2020-02-01"]),
+        pd.to_timedelta([1, 2], unit="D"),
+        PeriodIndex(["2020-01-01", "2020-02-01"], freq="D"),
+    ],
+)
+@pytest.mark.parametrize(
+    "klass",
+    [
+        list,
+        np.array,
+        pd.array,
+        pd.Series,
+        pd.Index,
+        pd.Categorical,
+        pd.CategoricalIndex,
+    ],
+)
+def test_searchsorted_datetimelike_with_listlike(values, klass, as_index):
+    # https://github.com/pandas-dev/pandas/issues/32762
+    if not as_index:
+        values = values._data
+
+    result = values.searchsorted(klass(values))
+    expected = np.array([0, 1], dtype=result.dtype)
+
+    tm.assert_numpy_array_equal(result, expected)
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        pd.to_datetime(["2020-01-01", "2020-02-01"]),
+        pd.to_timedelta([1, 2], unit="D"),
+        PeriodIndex(["2020-01-01", "2020-02-01"], freq="D"),
+    ],
+)
+@pytest.mark.parametrize(
+    "arg", [[1, 2], ["a", "b"], [Timestamp("2020-01-01", tz="Europe/London")] * 2]
+)
+def test_searchsorted_datetimelike_with_listlike_invalid_dtype(values, arg):
+    # https://github.com/pandas-dev/pandas/issues/32762
+    msg = "[Unexpected type|Cannot compare]"
+    with pytest.raises(TypeError, match=msg):
+        values.searchsorted(arg)
+
+
+@pytest.mark.parametrize("klass", [list, tuple, np.array, pd.Series])
+def test_period_index_construction_from_strings(klass):
+    # https://github.com/pandas-dev/pandas/issues/26109
+    strings = ["2020Q1", "2020Q2"] * 2
+    data = klass(strings)
+    result = PeriodIndex(data, freq="Q")
+    expected = PeriodIndex([Period(s) for s in strings])
+    tm.assert_index_equal(result, expected)
+
+
+@pytest.mark.parametrize("dtype", ["M8[ns]", "m8[ns]"])
+def test_from_pandas_array(dtype):
+    # GH#24615
+    data = np.array([1, 2, 3], dtype=dtype)
+    arr = NumpyExtensionArray(data)
+
+    cls = {"M8[ns]": DatetimeArray, "m8[ns]": TimedeltaArray}[dtype]
+
+    depr_msg = f"{cls.__name__}.__init__ is deprecated"
+    with tm.assert_produces_warning(FutureWarning, match=depr_msg):
+        result = cls(arr)
+        expected = cls(data)
+    tm.assert_extension_array_equal(result, expected)
+
+    result = cls._from_sequence(arr, dtype=dtype)
+    expected = cls._from_sequence(data, dtype=dtype)
+    tm.assert_extension_array_equal(result, expected)
+
+    func = {"M8[ns]": pd.to_datetime, "m8[ns]": pd.to_timedelta}[dtype]
+    result = func(arr).array
+    expected = func(data).array
+    tm.assert_equal(result, expected)
+
+    # Let's check the Indexes while we're here
+    idx_cls = {"M8[ns]": DatetimeIndex, "m8[ns]": TimedeltaIndex}[dtype]
+    result = idx_cls(arr)
+    expected = idx_cls(data)
+    tm.assert_index_equal(result, expected)
