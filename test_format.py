@@ -1,1027 +1,562 @@
-# doctest
-r''' Test the .npy file format.
-
-Set up:
-
-    >>> import sys
-    >>> from io import BytesIO
-    >>> from numpy.lib import format
-    >>>
-    >>> scalars = [
-    ...     np.uint8,
-    ...     np.int8,
-    ...     np.uint16,
-    ...     np.int16,
-    ...     np.uint32,
-    ...     np.int32,
-    ...     np.uint64,
-    ...     np.int64,
-    ...     np.float32,
-    ...     np.float64,
-    ...     np.complex64,
-    ...     np.complex128,
-    ...     object,
-    ... ]
-    >>>
-    >>> basic_arrays = []
-    >>>
-    >>> for scalar in scalars:
-    ...     for endian in '<>':
-    ...         dtype = np.dtype(scalar).newbyteorder(endian)
-    ...         basic = np.arange(15).astype(dtype)
-    ...         basic_arrays.extend([
-    ...             np.array([], dtype=dtype),
-    ...             np.array(10, dtype=dtype),
-    ...             basic,
-    ...             basic.reshape((3,5)),
-    ...             basic.reshape((3,5)).T,
-    ...             basic.reshape((3,5))[::-1,::2],
-    ...         ])
-    ...
-    >>>
-    >>> Pdescr = [
-    ...     ('x', 'i4', (2,)),
-    ...     ('y', 'f8', (2, 2)),
-    ...     ('z', 'u1')]
-    >>>
-    >>>
-    >>> PbufferT = [
-    ...     ([3,2], [[6.,4.],[6.,4.]], 8),
-    ...     ([4,3], [[7.,5.],[7.,5.]], 9),
-    ...     ]
-    >>>
-    >>>
-    >>> Ndescr = [
-    ...     ('x', 'i4', (2,)),
-    ...     ('Info', [
-    ...         ('value', 'c16'),
-    ...         ('y2', 'f8'),
-    ...         ('Info2', [
-    ...             ('name', 'S2'),
-    ...             ('value', 'c16', (2,)),
-    ...             ('y3', 'f8', (2,)),
-    ...             ('z3', 'u4', (2,))]),
-    ...         ('name', 'S2'),
-    ...         ('z2', 'b1')]),
-    ...     ('color', 'S2'),
-    ...     ('info', [
-    ...         ('Name', 'U8'),
-    ...         ('Value', 'c16')]),
-    ...     ('y', 'f8', (2, 2)),
-    ...     ('z', 'u1')]
-    >>>
-    >>>
-    >>> NbufferT = [
-    ...     ([3,2], (6j, 6., ('nn', [6j,4j], [6.,4.], [1,2]), 'NN', True), 'cc', ('NN', 6j), [[6.,4.],[6.,4.]], 8),
-    ...     ([4,3], (7j, 7., ('oo', [7j,5j], [7.,5.], [2,1]), 'OO', False), 'dd', ('OO', 7j), [[7.,5.],[7.,5.]], 9),
-    ...     ]
-    >>>
-    >>>
-    >>> record_arrays = [
-    ...     np.array(PbufferT, dtype=np.dtype(Pdescr).newbyteorder('<')),
-    ...     np.array(NbufferT, dtype=np.dtype(Ndescr).newbyteorder('<')),
-    ...     np.array(PbufferT, dtype=np.dtype(Pdescr).newbyteorder('>')),
-    ...     np.array(NbufferT, dtype=np.dtype(Ndescr).newbyteorder('>')),
-    ... ]
-
-Test the magic string writing.
-
-    >>> format.magic(1, 0)
-    '\x93NUMPY\x01\x00'
-    >>> format.magic(0, 0)
-    '\x93NUMPY\x00\x00'
-    >>> format.magic(255, 255)
-    '\x93NUMPY\xff\xff'
-    >>> format.magic(2, 5)
-    '\x93NUMPY\x02\x05'
-
-Test the magic string reading.
-
-    >>> format.read_magic(BytesIO(format.magic(1, 0)))
-    (1, 0)
-    >>> format.read_magic(BytesIO(format.magic(0, 0)))
-    (0, 0)
-    >>> format.read_magic(BytesIO(format.magic(255, 255)))
-    (255, 255)
-    >>> format.read_magic(BytesIO(format.magic(2, 5)))
-    (2, 5)
-
-Test the header writing.
-
-    >>> for arr in basic_arrays + record_arrays:
-    ...     f = BytesIO()
-    ...     format.write_array_header_1_0(f, arr)   # XXX: arr is not a dict, items gets called on it
-    ...     print(repr(f.getvalue()))
-    ...
-    "F\x00{'descr': '|u1', 'fortran_order': False, 'shape': (0,)}              \n"
-    "F\x00{'descr': '|u1', 'fortran_order': False, 'shape': ()}                \n"
-    "F\x00{'descr': '|u1', 'fortran_order': False, 'shape': (15,)}             \n"
-    "F\x00{'descr': '|u1', 'fortran_order': False, 'shape': (3, 5)}            \n"
-    "F\x00{'descr': '|u1', 'fortran_order': True, 'shape': (5, 3)}             \n"
-    "F\x00{'descr': '|u1', 'fortran_order': False, 'shape': (3, 3)}            \n"
-    "F\x00{'descr': '|u1', 'fortran_order': False, 'shape': (0,)}              \n"
-    "F\x00{'descr': '|u1', 'fortran_order': False, 'shape': ()}                \n"
-    "F\x00{'descr': '|u1', 'fortran_order': False, 'shape': (15,)}             \n"
-    "F\x00{'descr': '|u1', 'fortran_order': False, 'shape': (3, 5)}            \n"
-    "F\x00{'descr': '|u1', 'fortran_order': True, 'shape': (5, 3)}             \n"
-    "F\x00{'descr': '|u1', 'fortran_order': False, 'shape': (3, 3)}            \n"
-    "F\x00{'descr': '|i1', 'fortran_order': False, 'shape': (0,)}              \n"
-    "F\x00{'descr': '|i1', 'fortran_order': False, 'shape': ()}                \n"
-    "F\x00{'descr': '|i1', 'fortran_order': False, 'shape': (15,)}             \n"
-    "F\x00{'descr': '|i1', 'fortran_order': False, 'shape': (3, 5)}            \n"
-    "F\x00{'descr': '|i1', 'fortran_order': True, 'shape': (5, 3)}             \n"
-    "F\x00{'descr': '|i1', 'fortran_order': False, 'shape': (3, 3)}            \n"
-    "F\x00{'descr': '|i1', 'fortran_order': False, 'shape': (0,)}              \n"
-    "F\x00{'descr': '|i1', 'fortran_order': False, 'shape': ()}                \n"
-    "F\x00{'descr': '|i1', 'fortran_order': False, 'shape': (15,)}             \n"
-    "F\x00{'descr': '|i1', 'fortran_order': False, 'shape': (3, 5)}            \n"
-    "F\x00{'descr': '|i1', 'fortran_order': True, 'shape': (5, 3)}             \n"
-    "F\x00{'descr': '|i1', 'fortran_order': False, 'shape': (3, 3)}            \n"
-    "F\x00{'descr': '<u2', 'fortran_order': False, 'shape': (0,)}              \n"
-    "F\x00{'descr': '<u2', 'fortran_order': False, 'shape': ()}                \n"
-    "F\x00{'descr': '<u2', 'fortran_order': False, 'shape': (15,)}             \n"
-    "F\x00{'descr': '<u2', 'fortran_order': False, 'shape': (3, 5)}            \n"
-    "F\x00{'descr': '<u2', 'fortran_order': True, 'shape': (5, 3)}             \n"
-    "F\x00{'descr': '<u2', 'fortran_order': False, 'shape': (3, 3)}            \n"
-    "F\x00{'descr': '>u2', 'fortran_order': False, 'shape': (0,)}              \n"
-    "F\x00{'descr': '>u2', 'fortran_order': False, 'shape': ()}                \n"
-    "F\x00{'descr': '>u2', 'fortran_order': False, 'shape': (15,)}             \n"
-    "F\x00{'descr': '>u2', 'fortran_order': False, 'shape': (3, 5)}            \n"
-    "F\x00{'descr': '>u2', 'fortran_order': True, 'shape': (5, 3)}             \n"
-    "F\x00{'descr': '>u2', 'fortran_order': False, 'shape': (3, 3)}            \n"
-    "F\x00{'descr': '<i2', 'fortran_order': False, 'shape': (0,)}              \n"
-    "F\x00{'descr': '<i2', 'fortran_order': False, 'shape': ()}                \n"
-    "F\x00{'descr': '<i2', 'fortran_order': False, 'shape': (15,)}             \n"
-    "F\x00{'descr': '<i2', 'fortran_order': False, 'shape': (3, 5)}            \n"
-    "F\x00{'descr': '<i2', 'fortran_order': True, 'shape': (5, 3)}             \n"
-    "F\x00{'descr': '<i2', 'fortran_order': False, 'shape': (3, 3)}            \n"
-    "F\x00{'descr': '>i2', 'fortran_order': False, 'shape': (0,)}              \n"
-    "F\x00{'descr': '>i2', 'fortran_order': False, 'shape': ()}                \n"
-    "F\x00{'descr': '>i2', 'fortran_order': False, 'shape': (15,)}             \n"
-    "F\x00{'descr': '>i2', 'fortran_order': False, 'shape': (3, 5)}            \n"
-    "F\x00{'descr': '>i2', 'fortran_order': True, 'shape': (5, 3)}             \n"
-    "F\x00{'descr': '>i2', 'fortran_order': False, 'shape': (3, 3)}            \n"
-    "F\x00{'descr': '<u4', 'fortran_order': False, 'shape': (0,)}              \n"
-    "F\x00{'descr': '<u4', 'fortran_order': False, 'shape': ()}                \n"
-    "F\x00{'descr': '<u4', 'fortran_order': False, 'shape': (15,)}             \n"
-    "F\x00{'descr': '<u4', 'fortran_order': False, 'shape': (3, 5)}            \n"
-    "F\x00{'descr': '<u4', 'fortran_order': True, 'shape': (5, 3)}             \n"
-    "F\x00{'descr': '<u4', 'fortran_order': False, 'shape': (3, 3)}            \n"
-    "F\x00{'descr': '>u4', 'fortran_order': False, 'shape': (0,)}              \n"
-    "F\x00{'descr': '>u4', 'fortran_order': False, 'shape': ()}                \n"
-    "F\x00{'descr': '>u4', 'fortran_order': False, 'shape': (15,)}             \n"
-    "F\x00{'descr': '>u4', 'fortran_order': False, 'shape': (3, 5)}            \n"
-    "F\x00{'descr': '>u4', 'fortran_order': True, 'shape': (5, 3)}             \n"
-    "F\x00{'descr': '>u4', 'fortran_order': False, 'shape': (3, 3)}            \n"
-    "F\x00{'descr': '<i4', 'fortran_order': False, 'shape': (0,)}              \n"
-    "F\x00{'descr': '<i4', 'fortran_order': False, 'shape': ()}                \n"
-    "F\x00{'descr': '<i4', 'fortran_order': False, 'shape': (15,)}             \n"
-    "F\x00{'descr': '<i4', 'fortran_order': False, 'shape': (3, 5)}            \n"
-    "F\x00{'descr': '<i4', 'fortran_order': True, 'shape': (5, 3)}             \n"
-    "F\x00{'descr': '<i4', 'fortran_order': False, 'shape': (3, 3)}            \n"
-    "F\x00{'descr': '>i4', 'fortran_order': False, 'shape': (0,)}              \n"
-    "F\x00{'descr': '>i4', 'fortran_order': False, 'shape': ()}                \n"
-    "F\x00{'descr': '>i4', 'fortran_order': False, 'shape': (15,)}             \n"
-    "F\x00{'descr': '>i4', 'fortran_order': False, 'shape': (3, 5)}            \n"
-    "F\x00{'descr': '>i4', 'fortran_order': True, 'shape': (5, 3)}             \n"
-    "F\x00{'descr': '>i4', 'fortran_order': False, 'shape': (3, 3)}            \n"
-    "F\x00{'descr': '<u8', 'fortran_order': False, 'shape': (0,)}              \n"
-    "F\x00{'descr': '<u8', 'fortran_order': False, 'shape': ()}                \n"
-    "F\x00{'descr': '<u8', 'fortran_order': False, 'shape': (15,)}             \n"
-    "F\x00{'descr': '<u8', 'fortran_order': False, 'shape': (3, 5)}            \n"
-    "F\x00{'descr': '<u8', 'fortran_order': True, 'shape': (5, 3)}             \n"
-    "F\x00{'descr': '<u8', 'fortran_order': False, 'shape': (3, 3)}            \n"
-    "F\x00{'descr': '>u8', 'fortran_order': False, 'shape': (0,)}              \n"
-    "F\x00{'descr': '>u8', 'fortran_order': False, 'shape': ()}                \n"
-    "F\x00{'descr': '>u8', 'fortran_order': False, 'shape': (15,)}             \n"
-    "F\x00{'descr': '>u8', 'fortran_order': False, 'shape': (3, 5)}            \n"
-    "F\x00{'descr': '>u8', 'fortran_order': True, 'shape': (5, 3)}             \n"
-    "F\x00{'descr': '>u8', 'fortran_order': False, 'shape': (3, 3)}            \n"
-    "F\x00{'descr': '<i8', 'fortran_order': False, 'shape': (0,)}              \n"
-    "F\x00{'descr': '<i8', 'fortran_order': False, 'shape': ()}                \n"
-    "F\x00{'descr': '<i8', 'fortran_order': False, 'shape': (15,)}             \n"
-    "F\x00{'descr': '<i8', 'fortran_order': False, 'shape': (3, 5)}            \n"
-    "F\x00{'descr': '<i8', 'fortran_order': True, 'shape': (5, 3)}             \n"
-    "F\x00{'descr': '<i8', 'fortran_order': False, 'shape': (3, 3)}            \n"
-    "F\x00{'descr': '>i8', 'fortran_order': False, 'shape': (0,)}              \n"
-    "F\x00{'descr': '>i8', 'fortran_order': False, 'shape': ()}                \n"
-    "F\x00{'descr': '>i8', 'fortran_order': False, 'shape': (15,)}             \n"
-    "F\x00{'descr': '>i8', 'fortran_order': False, 'shape': (3, 5)}            \n"
-    "F\x00{'descr': '>i8', 'fortran_order': True, 'shape': (5, 3)}             \n"
-    "F\x00{'descr': '>i8', 'fortran_order': False, 'shape': (3, 3)}            \n"
-    "F\x00{'descr': '<f4', 'fortran_order': False, 'shape': (0,)}              \n"
-    "F\x00{'descr': '<f4', 'fortran_order': False, 'shape': ()}                \n"
-    "F\x00{'descr': '<f4', 'fortran_order': False, 'shape': (15,)}             \n"
-    "F\x00{'descr': '<f4', 'fortran_order': False, 'shape': (3, 5)}            \n"
-    "F\x00{'descr': '<f4', 'fortran_order': True, 'shape': (5, 3)}             \n"
-    "F\x00{'descr': '<f4', 'fortran_order': False, 'shape': (3, 3)}            \n"
-    "F\x00{'descr': '>f4', 'fortran_order': False, 'shape': (0,)}              \n"
-    "F\x00{'descr': '>f4', 'fortran_order': False, 'shape': ()}                \n"
-    "F\x00{'descr': '>f4', 'fortran_order': False, 'shape': (15,)}             \n"
-    "F\x00{'descr': '>f4', 'fortran_order': False, 'shape': (3, 5)}            \n"
-    "F\x00{'descr': '>f4', 'fortran_order': True, 'shape': (5, 3)}             \n"
-    "F\x00{'descr': '>f4', 'fortran_order': False, 'shape': (3, 3)}            \n"
-    "F\x00{'descr': '<f8', 'fortran_order': False, 'shape': (0,)}              \n"
-    "F\x00{'descr': '<f8', 'fortran_order': False, 'shape': ()}                \n"
-    "F\x00{'descr': '<f8', 'fortran_order': False, 'shape': (15,)}             \n"
-    "F\x00{'descr': '<f8', 'fortran_order': False, 'shape': (3, 5)}            \n"
-    "F\x00{'descr': '<f8', 'fortran_order': True, 'shape': (5, 3)}             \n"
-    "F\x00{'descr': '<f8', 'fortran_order': False, 'shape': (3, 3)}            \n"
-    "F\x00{'descr': '>f8', 'fortran_order': False, 'shape': (0,)}              \n"
-    "F\x00{'descr': '>f8', 'fortran_order': False, 'shape': ()}                \n"
-    "F\x00{'descr': '>f8', 'fortran_order': False, 'shape': (15,)}             \n"
-    "F\x00{'descr': '>f8', 'fortran_order': False, 'shape': (3, 5)}            \n"
-    "F\x00{'descr': '>f8', 'fortran_order': True, 'shape': (5, 3)}             \n"
-    "F\x00{'descr': '>f8', 'fortran_order': False, 'shape': (3, 3)}            \n"
-    "F\x00{'descr': '<c8', 'fortran_order': False, 'shape': (0,)}              \n"
-    "F\x00{'descr': '<c8', 'fortran_order': False, 'shape': ()}                \n"
-    "F\x00{'descr': '<c8', 'fortran_order': False, 'shape': (15,)}             \n"
-    "F\x00{'descr': '<c8', 'fortran_order': False, 'shape': (3, 5)}            \n"
-    "F\x00{'descr': '<c8', 'fortran_order': True, 'shape': (5, 3)}             \n"
-    "F\x00{'descr': '<c8', 'fortran_order': False, 'shape': (3, 3)}            \n"
-    "F\x00{'descr': '>c8', 'fortran_order': False, 'shape': (0,)}              \n"
-    "F\x00{'descr': '>c8', 'fortran_order': False, 'shape': ()}                \n"
-    "F\x00{'descr': '>c8', 'fortran_order': False, 'shape': (15,)}             \n"
-    "F\x00{'descr': '>c8', 'fortran_order': False, 'shape': (3, 5)}            \n"
-    "F\x00{'descr': '>c8', 'fortran_order': True, 'shape': (5, 3)}             \n"
-    "F\x00{'descr': '>c8', 'fortran_order': False, 'shape': (3, 3)}            \n"
-    "F\x00{'descr': '<c16', 'fortran_order': False, 'shape': (0,)}             \n"
-    "F\x00{'descr': '<c16', 'fortran_order': False, 'shape': ()}               \n"
-    "F\x00{'descr': '<c16', 'fortran_order': False, 'shape': (15,)}            \n"
-    "F\x00{'descr': '<c16', 'fortran_order': False, 'shape': (3, 5)}           \n"
-    "F\x00{'descr': '<c16', 'fortran_order': True, 'shape': (5, 3)}            \n"
-    "F\x00{'descr': '<c16', 'fortran_order': False, 'shape': (3, 3)}           \n"
-    "F\x00{'descr': '>c16', 'fortran_order': False, 'shape': (0,)}             \n"
-    "F\x00{'descr': '>c16', 'fortran_order': False, 'shape': ()}               \n"
-    "F\x00{'descr': '>c16', 'fortran_order': False, 'shape': (15,)}            \n"
-    "F\x00{'descr': '>c16', 'fortran_order': False, 'shape': (3, 5)}           \n"
-    "F\x00{'descr': '>c16', 'fortran_order': True, 'shape': (5, 3)}            \n"
-    "F\x00{'descr': '>c16', 'fortran_order': False, 'shape': (3, 3)}           \n"
-    "F\x00{'descr': 'O', 'fortran_order': False, 'shape': (0,)}              \n"
-    "F\x00{'descr': 'O', 'fortran_order': False, 'shape': ()}                \n"
-    "F\x00{'descr': 'O', 'fortran_order': False, 'shape': (15,)}             \n"
-    "F\x00{'descr': 'O', 'fortran_order': False, 'shape': (3, 5)}            \n"
-    "F\x00{'descr': 'O', 'fortran_order': True, 'shape': (5, 3)}             \n"
-    "F\x00{'descr': 'O', 'fortran_order': False, 'shape': (3, 3)}            \n"
-    "F\x00{'descr': 'O', 'fortran_order': False, 'shape': (0,)}              \n"
-    "F\x00{'descr': 'O', 'fortran_order': False, 'shape': ()}                \n"
-    "F\x00{'descr': 'O', 'fortran_order': False, 'shape': (15,)}             \n"
-    "F\x00{'descr': 'O', 'fortran_order': False, 'shape': (3, 5)}            \n"
-    "F\x00{'descr': 'O', 'fortran_order': True, 'shape': (5, 3)}             \n"
-    "F\x00{'descr': 'O', 'fortran_order': False, 'shape': (3, 3)}            \n"
-    "v\x00{'descr': [('x', '<i4', (2,)), ('y', '<f8', (2, 2)), ('z', '|u1')],\n 'fortran_order': False,\n 'shape': (2,)}         \n"
-    "\x16\x02{'descr': [('x', '<i4', (2,)),\n           ('Info',\n            [('value', '<c16'),\n             ('y2', '<f8'),\n             ('Info2',\n              [('name', '|S2'),\n               ('value', '<c16', (2,)),\n               ('y3', '<f8', (2,)),\n               ('z3', '<u4', (2,))]),\n             ('name', '|S2'),\n             ('z2', '|b1')]),\n           ('color', '|S2'),\n           ('info', [('Name', '<U8'), ('Value', '<c16')]),\n           ('y', '<f8', (2, 2)),\n           ('z', '|u1')],\n 'fortran_order': False,\n 'shape': (2,)}      \n"
-    "v\x00{'descr': [('x', '>i4', (2,)), ('y', '>f8', (2, 2)), ('z', '|u1')],\n 'fortran_order': False,\n 'shape': (2,)}         \n"
-    "\x16\x02{'descr': [('x', '>i4', (2,)),\n           ('Info',\n            [('value', '>c16'),\n             ('y2', '>f8'),\n             ('Info2',\n              [('name', '|S2'),\n               ('value', '>c16', (2,)),\n               ('y3', '>f8', (2,)),\n               ('z3', '>u4', (2,))]),\n             ('name', '|S2'),\n             ('z2', '|b1')]),\n           ('color', '|S2'),\n           ('info', [('Name', '>U8'), ('Value', '>c16')]),\n           ('y', '>f8', (2, 2)),\n           ('z', '|u1')],\n 'fortran_order': False,\n 'shape': (2,)}      \n"
-'''
-import sys
-import os
-import warnings
-import pytest
-from io import BytesIO
-
 import numpy as np
-from numpy.testing import (
-    assert_, assert_array_equal, assert_raises, assert_raises_regex,
-    assert_warns, IS_PYPY, IS_WASM
+import pytest
+
+from pandas import (
+    NA,
+    DataFrame,
+    IndexSlice,
+    MultiIndex,
+    NaT,
+    Timestamp,
+    option_context,
+)
+
+pytest.importorskip("jinja2")
+from pandas.io.formats.style import Styler
+from pandas.io.formats.style_render import _str_escape
+
+
+@pytest.fixture
+def df():
+    return DataFrame(
+        data=[[0, -0.609], [1, -1.228]],
+        columns=["A", "B"],
+        index=["x", "y"],
     )
-from numpy.testing._private.utils import requires_memory
-from numpy.lib import format
 
 
-# Generate some basic arrays to test with.
-scalars = [
-    np.uint8,
-    np.int8,
-    np.uint16,
-    np.int16,
-    np.uint32,
-    np.int32,
-    np.uint64,
-    np.int64,
-    np.float32,
-    np.float64,
-    np.complex64,
-    np.complex128,
-    object,
-]
-basic_arrays = []
-for scalar in scalars:
-    for endian in '<>':
-        dtype = np.dtype(scalar).newbyteorder(endian)
-        basic = np.arange(1500).astype(dtype)
-        basic_arrays.extend([
-            # Empty
-            np.array([], dtype=dtype),
-            # Rank-0
-            np.array(10, dtype=dtype),
-            # 1-D
-            basic,
-            # 2-D C-contiguous
-            basic.reshape((30, 50)),
-            # 2-D F-contiguous
-            basic.reshape((30, 50)).T,
-            # 2-D non-contiguous
-            basic.reshape((30, 50))[::-1, ::2],
-        ])
+@pytest.fixture
+def styler(df):
+    return Styler(df, uuid_len=0)
 
-# More complicated record arrays.
-# This is the structure of the table used for plain objects:
-#
-# +-+-+-+
-# |x|y|z|
-# +-+-+-+
 
-# Structure of a plain array description:
-Pdescr = [
-    ('x', 'i4', (2,)),
-    ('y', 'f8', (2, 2)),
-    ('z', 'u1')]
-
-# A plain list of tuples with values for testing:
-PbufferT = [
-    # x     y                  z
-    ([3, 2], [[6., 4.], [6., 4.]], 8),
-    ([4, 3], [[7., 5.], [7., 5.]], 9),
-    ]
-
-
-# This is the structure of the table used for nested objects (DON'T PANIC!):
-#
-# +-+---------------------------------+-----+----------+-+-+
-# |x|Info                             |color|info      |y|z|
-# | +-----+--+----------------+----+--+     +----+-----+ | |
-# | |value|y2|Info2           |name|z2|     |Name|Value| | |
-# | |     |  +----+-----+--+--+    |  |     |    |     | | |
-# | |     |  |name|value|y3|z3|    |  |     |    |     | | |
-# +-+-----+--+----+-----+--+--+----+--+-----+----+-----+-+-+
-#
-
-# The corresponding nested array description:
-Ndescr = [
-    ('x', 'i4', (2,)),
-    ('Info', [
-        ('value', 'c16'),
-        ('y2', 'f8'),
-        ('Info2', [
-            ('name', 'S2'),
-            ('value', 'c16', (2,)),
-            ('y3', 'f8', (2,)),
-            ('z3', 'u4', (2,))]),
-        ('name', 'S2'),
-        ('z2', 'b1')]),
-    ('color', 'S2'),
-    ('info', [
-        ('Name', 'U8'),
-        ('Value', 'c16')]),
-    ('y', 'f8', (2, 2)),
-    ('z', 'u1')]
-
-NbufferT = [
-    # x     Info                                                color info        y                  z
-    #       value y2 Info2                            name z2         Name Value
-    #                name   value    y3       z3
-    ([3, 2], (6j, 6., ('nn', [6j, 4j], [6., 4.], [1, 2]), 'NN', True),
-     'cc', ('NN', 6j), [[6., 4.], [6., 4.]], 8),
-    ([4, 3], (7j, 7., ('oo', [7j, 5j], [7., 5.], [2, 1]), 'OO', False),
-     'dd', ('OO', 7j), [[7., 5.], [7., 5.]], 9),
-    ]
-
-record_arrays = [
-    np.array(PbufferT, dtype=np.dtype(Pdescr).newbyteorder('<')),
-    np.array(NbufferT, dtype=np.dtype(Ndescr).newbyteorder('<')),
-    np.array(PbufferT, dtype=np.dtype(Pdescr).newbyteorder('>')),
-    np.array(NbufferT, dtype=np.dtype(Ndescr).newbyteorder('>')),
-    np.zeros(1, dtype=[('c', ('<f8', (5,)), (2,))])
-]
-
-
-#BytesIO that reads a random number of bytes at a time
-class BytesIOSRandomSize(BytesIO):
-    def read(self, size=None):
-        import random
-        size = random.randint(1, size)
-        return super().read(size)
-
-
-def roundtrip(arr):
-    f = BytesIO()
-    format.write_array(f, arr)
-    f2 = BytesIO(f.getvalue())
-    arr2 = format.read_array(f2, allow_pickle=True)
-    return arr2
-
-
-def roundtrip_randsize(arr):
-    f = BytesIO()
-    format.write_array(f, arr)
-    f2 = BytesIOSRandomSize(f.getvalue())
-    arr2 = format.read_array(f2)
-    return arr2
-
-
-def roundtrip_truncated(arr):
-    f = BytesIO()
-    format.write_array(f, arr)
-    #BytesIO is one byte short
-    f2 = BytesIO(f.getvalue()[0:-1])
-    arr2 = format.read_array(f2)
-    return arr2
-
-
-def assert_equal_(o1, o2):
-    assert_(o1 == o2)
-
-
-def test_roundtrip():
-    for arr in basic_arrays + record_arrays:
-        arr2 = roundtrip(arr)
-        assert_array_equal(arr, arr2)
-
-
-def test_roundtrip_randsize():
-    for arr in basic_arrays + record_arrays:
-        if arr.dtype != object:
-            arr2 = roundtrip_randsize(arr)
-            assert_array_equal(arr, arr2)
-
-
-def test_roundtrip_truncated():
-    for arr in basic_arrays:
-        if arr.dtype != object:
-            assert_raises(ValueError, roundtrip_truncated, arr)
-
-
-def test_long_str():
-    # check items larger than internal buffer size, gh-4027
-    long_str_arr = np.ones(1, dtype=np.dtype((str, format.BUFFER_SIZE + 1)))
-    long_str_arr2 = roundtrip(long_str_arr)
-    assert_array_equal(long_str_arr, long_str_arr2)
-
-
-@pytest.mark.skipif(IS_WASM, reason="memmap doesn't work correctly")
-@pytest.mark.slow
-def test_memmap_roundtrip(tmpdir):
-    for i, arr in enumerate(basic_arrays + record_arrays):
-        if arr.dtype.hasobject:
-            # Skip these since they can't be mmap'ed.
-            continue
-        # Write it out normally and through mmap.
-        nfn = os.path.join(tmpdir, f'normal{i}.npy')
-        mfn = os.path.join(tmpdir, f'memmap{i}.npy')
-        with open(nfn, 'wb') as fp:
-            format.write_array(fp, arr)
-
-        fortran_order = (
-            arr.flags.f_contiguous and not arr.flags.c_contiguous)
-        ma = format.open_memmap(mfn, mode='w+', dtype=arr.dtype,
-                                shape=arr.shape, fortran_order=fortran_order)
-        ma[...] = arr
-        ma.flush()
-
-        # Check that both of these files' contents are the same.
-        with open(nfn, 'rb') as fp:
-            normal_bytes = fp.read()
-        with open(mfn, 'rb') as fp:
-            memmap_bytes = fp.read()
-        assert_equal_(normal_bytes, memmap_bytes)
-
-        # Check that reading the file using memmap works.
-        ma = format.open_memmap(nfn, mode='r')
-        ma.flush()
-
-
-def test_compressed_roundtrip(tmpdir):
-    arr = np.random.rand(200, 200)
-    npz_file = os.path.join(tmpdir, 'compressed.npz')
-    np.savez_compressed(npz_file, arr=arr)
-    with np.load(npz_file) as npz:
-        arr1 = npz['arr']
-    assert_array_equal(arr, arr1)
-
-
-# aligned
-dt1 = np.dtype('i1, i4, i1', align=True)
-# non-aligned, explicit offsets
-dt2 = np.dtype({'names': ['a', 'b'], 'formats': ['i4', 'i4'],
-                'offsets': [1, 6]})
-# nested struct-in-struct
-dt3 = np.dtype({'names': ['c', 'd'], 'formats': ['i4', dt2]})
-# field with '' name
-dt4 = np.dtype({'names': ['a', '', 'b'], 'formats': ['i4']*3})
-# titles
-dt5 = np.dtype({'names': ['a', 'b'], 'formats': ['i4', 'i4'],
-                'offsets': [1, 6], 'titles': ['aa', 'bb']})
-# empty
-dt6 = np.dtype({'names': [], 'formats': [], 'itemsize': 8})
-
-@pytest.mark.parametrize("dt", [dt1, dt2, dt3, dt4, dt5, dt6])
-def test_load_padded_dtype(tmpdir, dt):
-    arr = np.zeros(3, dt)
-    for i in range(3):
-        arr[i] = i + 5
-    npz_file = os.path.join(tmpdir, 'aligned.npz')
-    np.savez(npz_file, arr=arr)
-    with np.load(npz_file) as npz:
-        arr1 = npz['arr']
-    assert_array_equal(arr, arr1)
-
-
-@pytest.mark.skipif(sys.version_info >= (3, 12), reason="see gh-23988")
-@pytest.mark.xfail(IS_WASM, reason="Emscripten NODEFS has a buggy dup")
-def test_python2_python3_interoperability():
-    fname = 'win64python2.npy'
-    path = os.path.join(os.path.dirname(__file__), 'data', fname)
-    with pytest.warns(UserWarning, match="Reading.*this warning\\."):
-        data = np.load(path)
-    assert_array_equal(data, np.ones(2))
-
-
-def test_pickle_python2_python3():
-    # Test that loading object arrays saved on Python 2 works both on
-    # Python 2 and Python 3 and vice versa
-    data_dir = os.path.join(os.path.dirname(__file__), 'data')
-
-    expected = np.array([None, range, '\u512a\u826f',
-                         b'\xe4\xb8\x8d\xe8\x89\xaf'],
-                        dtype=object)
-
-    for fname in ['py2-np0-objarr.npy', 'py2-objarr.npy', 'py2-objarr.npz',
-                  'py3-objarr.npy', 'py3-objarr.npz']:
-        path = os.path.join(data_dir, fname)
-
-        for encoding in ['bytes', 'latin1']:
-            data_f = np.load(path, allow_pickle=True, encoding=encoding)
-            if fname.endswith('.npz'):
-                data = data_f['x']
-                data_f.close()
-            else:
-                data = data_f
-
-            if encoding == 'latin1' and fname.startswith('py2'):
-                assert_(isinstance(data[3], str))
-                assert_array_equal(data[:-1], expected[:-1])
-                # mojibake occurs
-                assert_array_equal(data[-1].encode(encoding), expected[-1])
-            else:
-                assert_(isinstance(data[3], bytes))
-                assert_array_equal(data, expected)
-
-        if fname.startswith('py2'):
-            if fname.endswith('.npz'):
-                data = np.load(path, allow_pickle=True)
-                assert_raises(UnicodeError, data.__getitem__, 'x')
-                data.close()
-                data = np.load(path, allow_pickle=True, fix_imports=False,
-                               encoding='latin1')
-                assert_raises(ImportError, data.__getitem__, 'x')
-                data.close()
-            else:
-                assert_raises(UnicodeError, np.load, path,
-                              allow_pickle=True)
-                assert_raises(ImportError, np.load, path,
-                              allow_pickle=True, fix_imports=False,
-                              encoding='latin1')
-
-
-def test_pickle_disallow(tmpdir):
-    data_dir = os.path.join(os.path.dirname(__file__), 'data')
-
-    path = os.path.join(data_dir, 'py2-objarr.npy')
-    assert_raises(ValueError, np.load, path,
-                  allow_pickle=False, encoding='latin1')
-
-    path = os.path.join(data_dir, 'py2-objarr.npz')
-    with np.load(path, allow_pickle=False, encoding='latin1') as f:
-        assert_raises(ValueError, f.__getitem__, 'x')
-
-    path = os.path.join(tmpdir, 'pickle-disabled.npy')
-    assert_raises(ValueError, np.save, path, np.array([None], dtype=object),
-                  allow_pickle=False)
-
-@pytest.mark.parametrize('dt', [
-    np.dtype(np.dtype([('a', np.int8),
-                       ('b', np.int16),
-                       ('c', np.int32),
-                      ], align=True),
-             (3,)),
-    np.dtype([('x', np.dtype({'names':['a','b'],
-                              'formats':['i1','i1'],
-                              'offsets':[0,4],
-                              'itemsize':8,
-                             },
-                    (3,)),
-               (4,),
-             )]),
-    np.dtype([('x',
-                   ('<f8', (5,)),
-                   (2,),
-               )]),
-    np.dtype([('x', np.dtype((
-        np.dtype((
-            np.dtype({'names':['a','b'],
-                      'formats':['i1','i1'],
-                      'offsets':[0,4],
-                      'itemsize':8}),
-            (3,)
-            )),
-        (4,)
-        )))
-        ]),
-    np.dtype([
-        ('a', np.dtype((
-            np.dtype((
-                np.dtype((
-                    np.dtype([
-                        ('a', int),
-                        ('b', np.dtype({'names':['a','b'],
-                                        'formats':['i1','i1'],
-                                        'offsets':[0,4],
-                                        'itemsize':8})),
-                    ]),
-                    (3,),
-                )),
-                (4,),
-            )),
-            (5,),
-        )))
-        ]),
-    ])
-
-def test_descr_to_dtype(dt):
-    dt1 = format.descr_to_dtype(dt.descr)
-    assert_equal_(dt1, dt)
-    arr1 = np.zeros(3, dt)
-    arr2 = roundtrip(arr1)
-    assert_array_equal(arr1, arr2)
-
-def test_version_2_0():
-    f = BytesIO()
-    # requires more than 2 byte for header
-    dt = [(("%d" % i) * 100, float) for i in range(500)]
-    d = np.ones(1000, dtype=dt)
-
-    format.write_array(f, d, version=(2, 0))
-    with warnings.catch_warnings(record=True) as w:
-        warnings.filterwarnings('always', '', UserWarning)
-        format.write_array(f, d)
-        assert_(w[0].category is UserWarning)
-
-    # check alignment of data portion
-    f.seek(0)
-    header = f.readline()
-    assert_(len(header) % format.ARRAY_ALIGN == 0)
-
-    f.seek(0)
-    n = format.read_array(f, max_header_size=200000)
-    assert_array_equal(d, n)
-
-    # 1.0 requested but data cannot be saved this way
-    assert_raises(ValueError, format.write_array, f, d, (1, 0))
-
-
-@pytest.mark.skipif(IS_WASM, reason="memmap doesn't work correctly")
-def test_version_2_0_memmap(tmpdir):
-    # requires more than 2 byte for header
-    dt = [(("%d" % i) * 100, float) for i in range(500)]
-    d = np.ones(1000, dtype=dt)
-    tf1 = os.path.join(tmpdir, f'version2_01.npy')
-    tf2 = os.path.join(tmpdir, f'version2_02.npy')
-
-    # 1.0 requested but data cannot be saved this way
-    assert_raises(ValueError, format.open_memmap, tf1, mode='w+', dtype=d.dtype,
-                            shape=d.shape, version=(1, 0))
-
-    ma = format.open_memmap(tf1, mode='w+', dtype=d.dtype,
-                            shape=d.shape, version=(2, 0))
-    ma[...] = d
-    ma.flush()
-    ma = format.open_memmap(tf1, mode='r', max_header_size=200000)
-    assert_array_equal(ma, d)
-
-    with warnings.catch_warnings(record=True) as w:
-        warnings.filterwarnings('always', '', UserWarning)
-        ma = format.open_memmap(tf2, mode='w+', dtype=d.dtype,
-                                shape=d.shape, version=None)
-        assert_(w[0].category is UserWarning)
-        ma[...] = d
-        ma.flush()
-
-    ma = format.open_memmap(tf2, mode='r', max_header_size=200000)
-
-    assert_array_equal(ma, d)
-
-@pytest.mark.parametrize("mmap_mode", ["r", None])
-def test_huge_header(tmpdir, mmap_mode):
-    f = os.path.join(tmpdir, f'large_header.npy')
-    arr = np.array(1, dtype="i,"*10000+"i")
-
-    with pytest.warns(UserWarning, match=".*format 2.0"):
-        np.save(f, arr)
-    
-    with pytest.raises(ValueError, match="Header.*large"):
-        np.load(f, mmap_mode=mmap_mode)
-
-    with pytest.raises(ValueError, match="Header.*large"):
-        np.load(f, mmap_mode=mmap_mode, max_header_size=20000)
-
-    res = np.load(f, mmap_mode=mmap_mode, allow_pickle=True)
-    assert_array_equal(res, arr)
-
-    res = np.load(f, mmap_mode=mmap_mode, max_header_size=180000)
-    assert_array_equal(res, arr)
-
-def test_huge_header_npz(tmpdir):
-    f = os.path.join(tmpdir, f'large_header.npz')
-    arr = np.array(1, dtype="i,"*10000+"i")
-
-    with pytest.warns(UserWarning, match=".*format 2.0"):
-        np.savez(f, arr=arr)
-    
-    # Only getting the array from the file actually reads it
-    with pytest.raises(ValueError, match="Header.*large"):
-        np.load(f)["arr"]
-
-    with pytest.raises(ValueError, match="Header.*large"):
-        np.load(f, max_header_size=20000)["arr"]
-
-    res = np.load(f, allow_pickle=True)["arr"]
-    assert_array_equal(res, arr)
-
-    res = np.load(f, max_header_size=180000)["arr"]
-    assert_array_equal(res, arr)
-
-def test_write_version():
-    f = BytesIO()
-    arr = np.arange(1)
-    # These should pass.
-    format.write_array(f, arr, version=(1, 0))
-    format.write_array(f, arr)
-
-    format.write_array(f, arr, version=None)
-    format.write_array(f, arr)
-
-    format.write_array(f, arr, version=(2, 0))
-    format.write_array(f, arr)
-
-    # These should all fail.
-    bad_versions = [
-        (1, 1),
-        (0, 0),
-        (0, 1),
-        (2, 2),
-        (255, 255),
-    ]
-    for version in bad_versions:
-        with assert_raises_regex(ValueError,
-                                 'we only support format version.*'):
-            format.write_array(f, arr, version=version)
-
-
-bad_version_magic = [
-    b'\x93NUMPY\x01\x01',
-    b'\x93NUMPY\x00\x00',
-    b'\x93NUMPY\x00\x01',
-    b'\x93NUMPY\x02\x00',
-    b'\x93NUMPY\x02\x02',
-    b'\x93NUMPY\xff\xff',
-]
-malformed_magic = [
-    b'\x92NUMPY\x01\x00',
-    b'\x00NUMPY\x01\x00',
-    b'\x93numpy\x01\x00',
-    b'\x93MATLB\x01\x00',
-    b'\x93NUMPY\x01',
-    b'\x93NUMPY',
-    b'',
-]
-
-def test_read_magic():
-    s1 = BytesIO()
-    s2 = BytesIO()
-
-    arr = np.ones((3, 6), dtype=float)
-
-    format.write_array(s1, arr, version=(1, 0))
-    format.write_array(s2, arr, version=(2, 0))
-
-    s1.seek(0)
-    s2.seek(0)
-
-    version1 = format.read_magic(s1)
-    version2 = format.read_magic(s2)
-
-    assert_(version1 == (1, 0))
-    assert_(version2 == (2, 0))
-
-    assert_(s1.tell() == format.MAGIC_LEN)
-    assert_(s2.tell() == format.MAGIC_LEN)
-
-def test_read_magic_bad_magic():
-    for magic in malformed_magic:
-        f = BytesIO(magic)
-        assert_raises(ValueError, format.read_array, f)
-
-
-def test_read_version_1_0_bad_magic():
-    for magic in bad_version_magic + malformed_magic:
-        f = BytesIO(magic)
-        assert_raises(ValueError, format.read_array, f)
-
-
-def test_bad_magic_args():
-    assert_raises(ValueError, format.magic, -1, 1)
-    assert_raises(ValueError, format.magic, 256, 1)
-    assert_raises(ValueError, format.magic, 1, -1)
-    assert_raises(ValueError, format.magic, 1, 256)
-
-
-def test_large_header():
-    s = BytesIO()
-    d = {'shape': tuple(), 'fortran_order': False, 'descr': '<i8'}
-    format.write_array_header_1_0(s, d)
-
-    s = BytesIO()
-    d['descr'] = [('x'*256*256, '<i8')]
-    assert_raises(ValueError, format.write_array_header_1_0, s, d)
-
-
-def test_read_array_header_1_0():
-    s = BytesIO()
-
-    arr = np.ones((3, 6), dtype=float)
-    format.write_array(s, arr, version=(1, 0))
-
-    s.seek(format.MAGIC_LEN)
-    shape, fortran, dtype = format.read_array_header_1_0(s)
-
-    assert_(s.tell() % format.ARRAY_ALIGN == 0)
-    assert_((shape, fortran, dtype) == ((3, 6), False, float))
-
-
-def test_read_array_header_2_0():
-    s = BytesIO()
-
-    arr = np.ones((3, 6), dtype=float)
-    format.write_array(s, arr, version=(2, 0))
-
-    s.seek(format.MAGIC_LEN)
-    shape, fortran, dtype = format.read_array_header_2_0(s)
-
-    assert_(s.tell() % format.ARRAY_ALIGN == 0)
-    assert_((shape, fortran, dtype) == ((3, 6), False, float))
-
-
-def test_bad_header():
-    # header of length less than 2 should fail
-    s = BytesIO()
-    assert_raises(ValueError, format.read_array_header_1_0, s)
-    s = BytesIO(b'1')
-    assert_raises(ValueError, format.read_array_header_1_0, s)
-
-    # header shorter than indicated size should fail
-    s = BytesIO(b'\x01\x00')
-    assert_raises(ValueError, format.read_array_header_1_0, s)
-
-    # headers without the exact keys required should fail
-    # d = {"shape": (1, 2),
-    #      "descr": "x"}
-    s = BytesIO(
-        b"\x93NUMPY\x01\x006\x00{'descr': 'x', 'shape': (1, 2), }" +
-        b"                    \n"
+@pytest.fixture
+def df_multi():
+    return DataFrame(
+        data=np.arange(16).reshape(4, 4),
+        columns=MultiIndex.from_product([["A", "B"], ["a", "b"]]),
+        index=MultiIndex.from_product([["X", "Y"], ["x", "y"]]),
     )
-    assert_raises(ValueError, format.read_array_header_1_0, s)
-
-    d = {"shape": (1, 2),
-         "fortran_order": False,
-         "descr": "x",
-         "extrakey": -1}
-    s = BytesIO()
-    format.write_array_header_1_0(s, d)
-    assert_raises(ValueError, format.read_array_header_1_0, s)
 
 
-def test_large_file_support(tmpdir):
-    if (sys.platform == 'win32' or sys.platform == 'cygwin'):
-        pytest.skip("Unknown if Windows has sparse filesystems")
-    # try creating a large sparse file
-    tf_name = os.path.join(tmpdir, 'sparse_file')
-    try:
-        # seek past end would work too, but linux truncate somewhat
-        # increases the chances that we have a sparse filesystem and can
-        # avoid actually writing 5GB
-        import subprocess as sp
-        sp.check_call(["truncate", "-s", "5368709120", tf_name])
-    except Exception:
-        pytest.skip("Could not create 5GB large file")
-    # write a small array to the end
-    with open(tf_name, "wb") as f:
-        f.seek(5368709120)
-        d = np.arange(5)
-        np.save(f, d)
-    # read it back
-    with open(tf_name, "rb") as f:
-        f.seek(5368709120)
-        r = np.load(f)
-    assert_array_equal(r, d)
+@pytest.fixture
+def styler_multi(df_multi):
+    return Styler(df_multi, uuid_len=0)
 
 
-@pytest.mark.skipif(IS_PYPY, reason="flaky on PyPy")
-@pytest.mark.skipif(np.dtype(np.intp).itemsize < 8,
-                    reason="test requires 64-bit system")
-@pytest.mark.slow
-@requires_memory(free_bytes=2 * 2**30)
-def test_large_archive(tmpdir):
-    # Regression test for product of saving arrays with dimensions of array
-    # having a product that doesn't fit in int32.  See gh-7598 for details.
-    shape = (2**30, 2)
-    try:
-        a = np.empty(shape, dtype=np.uint8)
-    except MemoryError:
-        pytest.skip("Could not create large file")
-
-    fname = os.path.join(tmpdir, "large_archive")
-
-    with open(fname, "wb") as f:
-        np.savez(f, arr=a)
-
-    del a
-
-    with open(fname, "rb") as f:
-        new_a = np.load(f)["arr"]
-
-    assert new_a.shape == shape
+def test_display_format(styler):
+    ctx = styler.format("{:0.1f}")._translate(True, True)
+    assert all(["display_value" in c for c in row] for row in ctx["body"])
+    assert all([len(c["display_value"]) <= 3 for c in row[1:]] for row in ctx["body"])
+    assert len(ctx["body"][0][1]["display_value"].lstrip("-")) <= 3
 
 
-def test_empty_npz(tmpdir):
-    # Test for gh-9989
-    fname = os.path.join(tmpdir, "nothing.npz")
-    np.savez(fname)
-    with np.load(fname) as nps:
-        pass
+@pytest.mark.parametrize("index", [True, False])
+@pytest.mark.parametrize("columns", [True, False])
+def test_display_format_index(styler, index, columns):
+    exp_index = ["x", "y"]
+    if index:
+        styler.format_index(lambda v: v.upper(), axis=0)  # test callable
+        exp_index = ["X", "Y"]
+
+    exp_columns = ["A", "B"]
+    if columns:
+        styler.format_index("*{}*", axis=1)  # test string
+        exp_columns = ["*A*", "*B*"]
+
+    ctx = styler._translate(True, True)
+
+    for r, row in enumerate(ctx["body"]):
+        assert row[0]["display_value"] == exp_index[r]
+
+    for c, col in enumerate(ctx["head"][1:]):
+        assert col["display_value"] == exp_columns[c]
 
 
-def test_unicode_field_names(tmpdir):
-    # gh-7391
-    arr = np.array([
-        (1, 3),
-        (1, 2),
-        (1, 3),
-        (1, 2)
-    ], dtype=[
-        ('int', int),
-        ('\N{CJK UNIFIED IDEOGRAPH-6574}\N{CJK UNIFIED IDEOGRAPH-5F62}', int)
-    ])
-    fname = os.path.join(tmpdir, "unicode.npy")
-    with open(fname, 'wb') as f:
-        format.write_array(f, arr, version=(3, 0))
-    with open(fname, 'rb') as f:
-        arr2 = format.read_array(f)
-    assert_array_equal(arr, arr2)
+def test_format_dict(styler):
+    ctx = styler.format({"A": "{:0.1f}", "B": "{0:.2%}"})._translate(True, True)
+    assert ctx["body"][0][1]["display_value"] == "0.0"
+    assert ctx["body"][0][2]["display_value"] == "-60.90%"
 
-    # notifies the user that 3.0 is selected
-    with open(fname, 'wb') as f:
-        with assert_warns(UserWarning):
-            format.write_array(f, arr, version=None)
 
-def test_header_growth_axis():
-    for is_fortran_array, dtype_space, expected_header_length in [
-        [False, 22, 128], [False, 23, 192], [True, 23, 128], [True, 24, 192]
-    ]:
-        for size in [10**i for i in range(format.GROWTH_AXIS_MAX_DIGITS)]:
-            fp = BytesIO()
-            format.write_array_header_1_0(fp, {
-                'shape': (2, size) if is_fortran_array else (size, 2),
-                'fortran_order': is_fortran_array,
-                'descr': np.dtype([(' '*dtype_space, int)])
-            })
+def test_format_index_dict(styler):
+    ctx = styler.format_index({0: lambda v: v.upper()})._translate(True, True)
+    for i, val in enumerate(["X", "Y"]):
+        assert ctx["body"][i][0]["display_value"] == val
 
-            assert len(fp.getvalue()) == expected_header_length
 
-@pytest.mark.parametrize('dt', [
-    np.dtype({'names': ['a', 'b'], 'formats':  [float, np.dtype('S3',
-                 metadata={'some': 'stuff'})]}),
-    np.dtype(int, metadata={'some': 'stuff'}),
-    np.dtype([('subarray', (int, (2,)))], metadata={'some': 'stuff'}),
-    # recursive: metadata on the field of a dtype
-    np.dtype({'names': ['a', 'b'], 'formats': [
-        float, np.dtype({'names': ['c'], 'formats': [np.dtype(int, metadata={})]})
-    ]}),
-    ])
-@pytest.mark.skipif(IS_PYPY and sys.implementation.version <= (7, 3, 8),
-        reason="PyPy bug in error formatting")
-def test_metadata_dtype(dt):
-    # gh-14142
-    arr = np.ones(10, dtype=dt)
-    buf = BytesIO()
-    with assert_warns(UserWarning):
-        np.save(buf, arr)
-    buf.seek(0)
+def test_format_string(styler):
+    ctx = styler.format("{:.2f}")._translate(True, True)
+    assert ctx["body"][0][1]["display_value"] == "0.00"
+    assert ctx["body"][0][2]["display_value"] == "-0.61"
+    assert ctx["body"][1][1]["display_value"] == "1.00"
+    assert ctx["body"][1][2]["display_value"] == "-1.23"
 
-    # Loading should work (metadata was stripped):
-    arr2 = np.load(buf)
-    # BUG: assert_array_equal does not check metadata
-    from numpy.lib._utils_impl import drop_metadata
-    assert_array_equal(arr, arr2)
-    assert drop_metadata(arr.dtype) is not arr.dtype
-    assert drop_metadata(arr2.dtype) is arr2.dtype
+
+def test_format_callable(styler):
+    ctx = styler.format(lambda v: "neg" if v < 0 else "pos")._translate(True, True)
+    assert ctx["body"][0][1]["display_value"] == "pos"
+    assert ctx["body"][0][2]["display_value"] == "neg"
+    assert ctx["body"][1][1]["display_value"] == "pos"
+    assert ctx["body"][1][2]["display_value"] == "neg"
+
+
+def test_format_with_na_rep():
+    # GH 21527 28358
+    df = DataFrame([[None, None], [1.1, 1.2]], columns=["A", "B"])
+
+    ctx = df.style.format(None, na_rep="-")._translate(True, True)
+    assert ctx["body"][0][1]["display_value"] == "-"
+    assert ctx["body"][0][2]["display_value"] == "-"
+
+    ctx = df.style.format("{:.2%}", na_rep="-")._translate(True, True)
+    assert ctx["body"][0][1]["display_value"] == "-"
+    assert ctx["body"][0][2]["display_value"] == "-"
+    assert ctx["body"][1][1]["display_value"] == "110.00%"
+    assert ctx["body"][1][2]["display_value"] == "120.00%"
+
+    ctx = df.style.format("{:.2%}", na_rep="-", subset=["B"])._translate(True, True)
+    assert ctx["body"][0][2]["display_value"] == "-"
+    assert ctx["body"][1][2]["display_value"] == "120.00%"
+
+
+def test_format_index_with_na_rep():
+    df = DataFrame([[1, 2, 3, 4, 5]], columns=["A", None, np.nan, NaT, NA])
+    ctx = df.style.format_index(None, na_rep="--", axis=1)._translate(True, True)
+    assert ctx["head"][0][1]["display_value"] == "A"
+    for i in [2, 3, 4, 5]:
+        assert ctx["head"][0][i]["display_value"] == "--"
+
+
+def test_format_non_numeric_na():
+    # GH 21527 28358
+    df = DataFrame(
+        {
+            "object": [None, np.nan, "foo"],
+            "datetime": [None, NaT, Timestamp("20120101")],
+        }
+    )
+    ctx = df.style.format(None, na_rep="-")._translate(True, True)
+    assert ctx["body"][0][1]["display_value"] == "-"
+    assert ctx["body"][0][2]["display_value"] == "-"
+    assert ctx["body"][1][1]["display_value"] == "-"
+    assert ctx["body"][1][2]["display_value"] == "-"
+
+
+@pytest.mark.parametrize(
+    "func, attr, kwargs",
+    [
+        ("format", "_display_funcs", {}),
+        ("format_index", "_display_funcs_index", {"axis": 0}),
+        ("format_index", "_display_funcs_columns", {"axis": 1}),
+    ],
+)
+def test_format_clear(styler, func, attr, kwargs):
+    assert (0, 0) not in getattr(styler, attr)  # using default
+    getattr(styler, func)("{:.2f}", **kwargs)
+    assert (0, 0) in getattr(styler, attr)  # formatter is specified
+    getattr(styler, func)(**kwargs)
+    assert (0, 0) not in getattr(styler, attr)  # formatter cleared to default
+
+
+@pytest.mark.parametrize(
+    "escape, exp",
+    [
+        ("html", "&lt;&gt;&amp;&#34;%$#_{}~^\\~ ^ \\ "),
+        (
+            "latex",
+            '<>\\&"\\%\\$\\#\\_\\{\\}\\textasciitilde \\textasciicircum '
+            "\\textbackslash \\textasciitilde \\space \\textasciicircum \\space "
+            "\\textbackslash \\space ",
+        ),
+    ],
+)
+def test_format_escape_html(escape, exp):
+    chars = '<>&"%$#_{}~^\\~ ^ \\ '
+    df = DataFrame([[chars]])
+
+    s = Styler(df, uuid_len=0).format("&{0}&", escape=None)
+    expected = f'<td id="T__row0_col0" class="data row0 col0" >&{chars}&</td>'
+    assert expected in s.to_html()
+
+    # only the value should be escaped before passing to the formatter
+    s = Styler(df, uuid_len=0).format("&{0}&", escape=escape)
+    expected = f'<td id="T__row0_col0" class="data row0 col0" >&{exp}&</td>'
+    assert expected in s.to_html()
+
+    # also test format_index()
+    styler = Styler(DataFrame(columns=[chars]), uuid_len=0)
+    styler.format_index("&{0}&", escape=None, axis=1)
+    assert styler._translate(True, True)["head"][0][1]["display_value"] == f"&{chars}&"
+    styler.format_index("&{0}&", escape=escape, axis=1)
+    assert styler._translate(True, True)["head"][0][1]["display_value"] == f"&{exp}&"
+
+
+@pytest.mark.parametrize(
+    "chars, expected",
+    [
+        (
+            r"$ \$&%#_{}~^\ $ &%#_{}~^\ $",
+            "".join(
+                [
+                    r"$ \$&%#_{}~^\ $ ",
+                    r"\&\%\#\_\{\}\textasciitilde \textasciicircum ",
+                    r"\textbackslash \space \$",
+                ]
+            ),
+        ),
+        (
+            r"\( &%#_{}~^\ \) &%#_{}~^\ \(",
+            "".join(
+                [
+                    r"\( &%#_{}~^\ \) ",
+                    r"\&\%\#\_\{\}\textasciitilde \textasciicircum ",
+                    r"\textbackslash \space \textbackslash (",
+                ]
+            ),
+        ),
+        (
+            r"$\&%#_{}^\$",
+            r"\$\textbackslash \&\%\#\_\{\}\textasciicircum \textbackslash \$",
+        ),
+        (
+            r"$ \frac{1}{2} $ \( \frac{1}{2} \)",
+            "".join(
+                [
+                    r"$ \frac{1}{2} $",
+                    r" \textbackslash ( \textbackslash frac\{1\}\{2\} \textbackslash )",
+                ]
+            ),
+        ),
+    ],
+)
+def test_format_escape_latex_math(chars, expected):
+    # GH 51903
+    # latex-math escape works for each DataFrame cell separately. If we have
+    # a combination of dollar signs and brackets, the dollar sign would apply.
+    df = DataFrame([[chars]])
+    s = df.style.format("{0}", escape="latex-math")
+    assert s._translate(True, True)["body"][0][1]["display_value"] == expected
+
+
+def test_format_escape_na_rep():
+    # tests the na_rep is not escaped
+    df = DataFrame([['<>&"', None]])
+    s = Styler(df, uuid_len=0).format("X&{0}>X", escape="html", na_rep="&")
+    ex = '<td id="T__row0_col0" class="data row0 col0" >X&&lt;&gt;&amp;&#34;>X</td>'
+    expected2 = '<td id="T__row0_col1" class="data row0 col1" >&</td>'
+    assert ex in s.to_html()
+    assert expected2 in s.to_html()
+
+    # also test for format_index()
+    df = DataFrame(columns=['<>&"', None])
+    styler = Styler(df, uuid_len=0)
+    styler.format_index("X&{0}>X", escape="html", na_rep="&", axis=1)
+    ctx = styler._translate(True, True)
+    assert ctx["head"][0][1]["display_value"] == "X&&lt;&gt;&amp;&#34;>X"
+    assert ctx["head"][0][2]["display_value"] == "&"
+
+
+def test_format_escape_floats(styler):
+    # test given formatter for number format is not impacted by escape
+    s = styler.format("{:.1f}", escape="html")
+    for expected in [">0.0<", ">1.0<", ">-1.2<", ">-0.6<"]:
+        assert expected in s.to_html()
+    # tests precision of floats is not impacted by escape
+    s = styler.format(precision=1, escape="html")
+    for expected in [">0<", ">1<", ">-1.2<", ">-0.6<"]:
+        assert expected in s.to_html()
+
+
+@pytest.mark.parametrize("formatter", [5, True, [2.0]])
+@pytest.mark.parametrize("func", ["format", "format_index"])
+def test_format_raises(styler, formatter, func):
+    with pytest.raises(TypeError, match="expected str or callable"):
+        getattr(styler, func)(formatter)
+
+
+@pytest.mark.parametrize(
+    "precision, expected",
+    [
+        (1, ["1.0", "2.0", "3.2", "4.6"]),
+        (2, ["1.00", "2.01", "3.21", "4.57"]),
+        (3, ["1.000", "2.009", "3.212", "4.566"]),
+    ],
+)
+def test_format_with_precision(precision, expected):
+    # Issue #13257
+    df = DataFrame([[1.0, 2.0090, 3.2121, 4.566]], columns=[1.0, 2.0090, 3.2121, 4.566])
+    styler = Styler(df)
+    styler.format(precision=precision)
+    styler.format_index(precision=precision, axis=1)
+
+    ctx = styler._translate(True, True)
+    for col, exp in enumerate(expected):
+        assert ctx["body"][0][col + 1]["display_value"] == exp  # format test
+        assert ctx["head"][0][col + 1]["display_value"] == exp  # format_index test
+
+
+@pytest.mark.parametrize("axis", [0, 1])
+@pytest.mark.parametrize(
+    "level, expected",
+    [
+        (0, ["X", "X", "_", "_"]),  # level int
+        ("zero", ["X", "X", "_", "_"]),  # level name
+        (1, ["_", "_", "X", "X"]),  # other level int
+        ("one", ["_", "_", "X", "X"]),  # other level name
+        ([0, 1], ["X", "X", "X", "X"]),  # both levels
+        ([0, "zero"], ["X", "X", "_", "_"]),  # level int and name simultaneous
+        ([0, "one"], ["X", "X", "X", "X"]),  # both levels as int and name
+        (["one", "zero"], ["X", "X", "X", "X"]),  # both level names, reversed
+    ],
+)
+def test_format_index_level(axis, level, expected):
+    midx = MultiIndex.from_arrays([["_", "_"], ["_", "_"]], names=["zero", "one"])
+    df = DataFrame([[1, 2], [3, 4]])
+    if axis == 0:
+        df.index = midx
+    else:
+        df.columns = midx
+
+    styler = df.style.format_index(lambda v: "X", level=level, axis=axis)
+    ctx = styler._translate(True, True)
+
+    if axis == 0:  # compare index
+        result = [ctx["body"][s][0]["display_value"] for s in range(2)]
+        result += [ctx["body"][s][1]["display_value"] for s in range(2)]
+    else:  # compare columns
+        result = [ctx["head"][0][s + 1]["display_value"] for s in range(2)]
+        result += [ctx["head"][1][s + 1]["display_value"] for s in range(2)]
+
+    assert expected == result
+
+
+def test_format_subset():
+    df = DataFrame([[0.1234, 0.1234], [1.1234, 1.1234]], columns=["a", "b"])
+    ctx = df.style.format(
+        {"a": "{:0.1f}", "b": "{0:.2%}"}, subset=IndexSlice[0, :]
+    )._translate(True, True)
+    expected = "0.1"
+    raw_11 = "1.123400"
+    assert ctx["body"][0][1]["display_value"] == expected
+    assert ctx["body"][1][1]["display_value"] == raw_11
+    assert ctx["body"][0][2]["display_value"] == "12.34%"
+
+    ctx = df.style.format("{:0.1f}", subset=IndexSlice[0, :])._translate(True, True)
+    assert ctx["body"][0][1]["display_value"] == expected
+    assert ctx["body"][1][1]["display_value"] == raw_11
+
+    ctx = df.style.format("{:0.1f}", subset=IndexSlice["a"])._translate(True, True)
+    assert ctx["body"][0][1]["display_value"] == expected
+    assert ctx["body"][0][2]["display_value"] == "0.123400"
+
+    ctx = df.style.format("{:0.1f}", subset=IndexSlice[0, "a"])._translate(True, True)
+    assert ctx["body"][0][1]["display_value"] == expected
+    assert ctx["body"][1][1]["display_value"] == raw_11
+
+    ctx = df.style.format("{:0.1f}", subset=IndexSlice[[0, 1], ["a"]])._translate(
+        True, True
+    )
+    assert ctx["body"][0][1]["display_value"] == expected
+    assert ctx["body"][1][1]["display_value"] == "1.1"
+    assert ctx["body"][0][2]["display_value"] == "0.123400"
+    assert ctx["body"][1][2]["display_value"] == raw_11
+
+
+@pytest.mark.parametrize("formatter", [None, "{:,.1f}"])
+@pytest.mark.parametrize("decimal", [".", "*"])
+@pytest.mark.parametrize("precision", [None, 2])
+@pytest.mark.parametrize("func, col", [("format", 1), ("format_index", 0)])
+def test_format_thousands(formatter, decimal, precision, func, col):
+    styler = DataFrame([[1000000.123456789]], index=[1000000.123456789]).style
+    result = getattr(styler, func)(  # testing float
+        thousands="_", formatter=formatter, decimal=decimal, precision=precision
+    )._translate(True, True)
+    assert "1_000_000" in result["body"][0][col]["display_value"]
+
+    styler = DataFrame([[1000000]], index=[1000000]).style
+    result = getattr(styler, func)(  # testing int
+        thousands="_", formatter=formatter, decimal=decimal, precision=precision
+    )._translate(True, True)
+    assert "1_000_000" in result["body"][0][col]["display_value"]
+
+    styler = DataFrame([[1 + 1000000.123456789j]], index=[1 + 1000000.123456789j]).style
+    result = getattr(styler, func)(  # testing complex
+        thousands="_", formatter=formatter, decimal=decimal, precision=precision
+    )._translate(True, True)
+    assert "1_000_000" in result["body"][0][col]["display_value"]
+
+
+@pytest.mark.parametrize("formatter", [None, "{:,.4f}"])
+@pytest.mark.parametrize("thousands", [None, ",", "*"])
+@pytest.mark.parametrize("precision", [None, 4])
+@pytest.mark.parametrize("func, col", [("format", 1), ("format_index", 0)])
+def test_format_decimal(formatter, thousands, precision, func, col):
+    styler = DataFrame([[1000000.123456789]], index=[1000000.123456789]).style
+    result = getattr(styler, func)(  # testing float
+        decimal="_", formatter=formatter, thousands=thousands, precision=precision
+    )._translate(True, True)
+    assert "000_123" in result["body"][0][col]["display_value"]
+
+    styler = DataFrame([[1 + 1000000.123456789j]], index=[1 + 1000000.123456789j]).style
+    result = getattr(styler, func)(  # testing complex
+        decimal="_", formatter=formatter, thousands=thousands, precision=precision
+    )._translate(True, True)
+    assert "000_123" in result["body"][0][col]["display_value"]
+
+
+def test_str_escape_error():
+    msg = "`escape` only permitted in {'html', 'latex', 'latex-math'}, got "
+    with pytest.raises(ValueError, match=msg):
+        _str_escape("text", "bad_escape")
+
+    with pytest.raises(ValueError, match=msg):
+        _str_escape("text", [])
+
+    _str_escape(2.00, "bad_escape")  # OK since dtype is float
+
+
+def test_long_int_formatting():
+    df = DataFrame(data=[[1234567890123456789]], columns=["test"])
+    styler = df.style
+    ctx = styler._translate(True, True)
+    assert ctx["body"][0][1]["display_value"] == "1234567890123456789"
+
+    styler = df.style.format(thousands="_")
+    ctx = styler._translate(True, True)
+    assert ctx["body"][0][1]["display_value"] == "1_234_567_890_123_456_789"
+
+
+def test_format_options():
+    df = DataFrame({"int": [2000, 1], "float": [1.009, None], "str": ["&<", "&~"]})
+    ctx = df.style._translate(True, True)
+
+    # test option: na_rep
+    assert ctx["body"][1][2]["display_value"] == "nan"
+    with option_context("styler.format.na_rep", "MISSING"):
+        ctx_with_op = df.style._translate(True, True)
+        assert ctx_with_op["body"][1][2]["display_value"] == "MISSING"
+
+    # test option: decimal and precision
+    assert ctx["body"][0][2]["display_value"] == "1.009000"
+    with option_context("styler.format.decimal", "_"):
+        ctx_with_op = df.style._translate(True, True)
+        assert ctx_with_op["body"][0][2]["display_value"] == "1_009000"
+    with option_context("styler.format.precision", 2):
+        ctx_with_op = df.style._translate(True, True)
+        assert ctx_with_op["body"][0][2]["display_value"] == "1.01"
+
+    # test option: thousands
+    assert ctx["body"][0][1]["display_value"] == "2000"
+    with option_context("styler.format.thousands", "_"):
+        ctx_with_op = df.style._translate(True, True)
+        assert ctx_with_op["body"][0][1]["display_value"] == "2_000"
+
+    # test option: escape
+    assert ctx["body"][0][3]["display_value"] == "&<"
+    assert ctx["body"][1][3]["display_value"] == "&~"
+    with option_context("styler.format.escape", "html"):
+        ctx_with_op = df.style._translate(True, True)
+        assert ctx_with_op["body"][0][3]["display_value"] == "&amp;&lt;"
+    with option_context("styler.format.escape", "latex"):
+        ctx_with_op = df.style._translate(True, True)
+        assert ctx_with_op["body"][1][3]["display_value"] == "\\&\\textasciitilde "
+    with option_context("styler.format.escape", "latex-math"):
+        ctx_with_op = df.style._translate(True, True)
+        assert ctx_with_op["body"][1][3]["display_value"] == "\\&\\textasciitilde "
+
+    # test option: formatter
+    with option_context("styler.format.formatter", {"int": "{:,.2f}"}):
+        ctx_with_op = df.style._translate(True, True)
+        assert ctx_with_op["body"][0][1]["display_value"] == "2,000.00"
+
+
+def test_precision_zero(df):
+    styler = Styler(df, precision=0)
+    ctx = styler._translate(True, True)
+    assert ctx["body"][0][2]["display_value"] == "-1"
+    assert ctx["body"][1][2]["display_value"] == "-1"
+
+
+@pytest.mark.parametrize(
+    "formatter, exp",
+    [
+        (lambda x: f"{x:.3f}", "9.000"),
+        ("{:.2f}", "9.00"),
+        ({0: "{:.1f}"}, "9.0"),
+        (None, "9"),
+    ],
+)
+def test_formatter_options_validator(formatter, exp):
+    df = DataFrame([[9]])
+    with option_context("styler.format.formatter", formatter):
+        assert f" {exp} " in df.style.to_latex()
+
+
+def test_formatter_options_raises():
+    msg = "Value must be an instance of"
+    with pytest.raises(ValueError, match=msg):
+        with option_context("styler.format.formatter", ["bad", "type"]):
+            DataFrame().style.to_latex()
+
+
+def test_1level_multiindex():
+    # GH 43383
+    midx = MultiIndex.from_product([[1, 2]], names=[""])
+    df = DataFrame(-1, index=midx, columns=[0, 1])
+    ctx = df.style._translate(True, True)
+    assert ctx["body"][0][0]["display_value"] == "1"
+    assert ctx["body"][0][0]["is_visible"] is True
+    assert ctx["body"][1][0]["display_value"] == "2"
+    assert ctx["body"][1][0]["is_visible"] is True
+
+
+def test_boolean_format():
+    # gh 46384: booleans do not collapse to integer representation on display
+    df = DataFrame([[True, False]])
+    ctx = df.style._translate(True, True)
+    assert ctx["body"][0][1]["display_value"] is True
+    assert ctx["body"][0][2]["display_value"] is False
+
+
+@pytest.mark.parametrize(
+    "hide, labels",
+    [
+        (False, [1, 2]),
+        (True, [1, 2, 3, 4]),
+    ],
+)
+def test_relabel_raise_length(styler_multi, hide, labels):
+    if hide:
+        styler_multi.hide(axis=0, subset=[("X", "x"), ("Y", "y")])
+    with pytest.raises(ValueError, match="``labels`` must be of length equal"):
+        styler_multi.relabel_index(labels=labels)
+
+
+def test_relabel_index(styler_multi):
+    labels = [(1, 2), (3, 4)]
+    styler_multi.hide(axis=0, subset=[("X", "x"), ("Y", "y")])
+    styler_multi.relabel_index(labels=labels)
+    ctx = styler_multi._translate(True, True)
+    assert {"value": "X", "display_value": 1}.items() <= ctx["body"][0][0].items()
+    assert {"value": "y", "display_value": 2}.items() <= ctx["body"][0][1].items()
+    assert {"value": "Y", "display_value": 3}.items() <= ctx["body"][1][0].items()
+    assert {"value": "x", "display_value": 4}.items() <= ctx["body"][1][1].items()
+
+
+def test_relabel_columns(styler_multi):
+    labels = [(1, 2), (3, 4)]
+    styler_multi.hide(axis=1, subset=[("A", "a"), ("B", "b")])
+    styler_multi.relabel_index(axis=1, labels=labels)
+    ctx = styler_multi._translate(True, True)
+    assert {"value": "A", "display_value": 1}.items() <= ctx["head"][0][3].items()
+    assert {"value": "B", "display_value": 3}.items() <= ctx["head"][0][4].items()
+    assert {"value": "b", "display_value": 2}.items() <= ctx["head"][1][3].items()
+    assert {"value": "a", "display_value": 4}.items() <= ctx["head"][1][4].items()
+
+
+def test_relabel_roundtrip(styler):
+    styler.relabel_index(["{}", "{}"])
+    ctx = styler._translate(True, True)
+    assert {"value": "x", "display_value": "x"}.items() <= ctx["body"][0][0].items()
+    assert {"value": "y", "display_value": "y"}.items() <= ctx["body"][1][0].items()

@@ -1,184 +1,304 @@
-import numpy as np
+"""
+Tests that work on both the Python and C engines but do not have a
+specific classification into the other test modules.
+"""
+from datetime import datetime
+from io import StringIO
+import os
+
 import pytest
 
 from pandas import (
     DataFrame,
     Index,
-    Series,
+    MultiIndex,
 )
 import pandas._testing as tm
-from pandas.tests.copy_view.util import get_array
 
+pytestmark = pytest.mark.filterwarnings(
+    "ignore:Passing a BlockManager to DataFrame:DeprecationWarning"
+)
 
-def index_view(index_data=[1, 2]):
-    df = DataFrame({"a": index_data, "b": 1.5})
-    view = df[:]
-    df = df.set_index("a", drop=True)
-    idx = df.index
-    # df = None
-    return idx, view
-
-
-def test_set_index_update_column(using_copy_on_write, warn_copy_on_write):
-    df = DataFrame({"a": [1, 2], "b": 1})
-    df = df.set_index("a", drop=False)
-    expected = df.index.copy(deep=True)
-    with tm.assert_cow_warning(warn_copy_on_write):
-        df.iloc[0, 0] = 100
-    if using_copy_on_write:
-        tm.assert_index_equal(df.index, expected)
-    else:
-        tm.assert_index_equal(df.index, Index([100, 2], name="a"))
-
-
-def test_set_index_drop_update_column(using_copy_on_write):
-    df = DataFrame({"a": [1, 2], "b": 1.5})
-    view = df[:]
-    df = df.set_index("a", drop=True)
-    expected = df.index.copy(deep=True)
-    view.iloc[0, 0] = 100
-    tm.assert_index_equal(df.index, expected)
-
-
-def test_set_index_series(using_copy_on_write, warn_copy_on_write):
-    df = DataFrame({"a": [1, 2], "b": 1.5})
-    ser = Series([10, 11])
-    df = df.set_index(ser)
-    expected = df.index.copy(deep=True)
-    with tm.assert_cow_warning(warn_copy_on_write):
-        ser.iloc[0] = 100
-    if using_copy_on_write:
-        tm.assert_index_equal(df.index, expected)
-    else:
-        tm.assert_index_equal(df.index, Index([100, 11]))
-
-
-def test_assign_index_as_series(using_copy_on_write, warn_copy_on_write):
-    df = DataFrame({"a": [1, 2], "b": 1.5})
-    ser = Series([10, 11])
-    df.index = ser
-    expected = df.index.copy(deep=True)
-    with tm.assert_cow_warning(warn_copy_on_write):
-        ser.iloc[0] = 100
-    if using_copy_on_write:
-        tm.assert_index_equal(df.index, expected)
-    else:
-        tm.assert_index_equal(df.index, Index([100, 11]))
-
-
-def test_assign_index_as_index(using_copy_on_write, warn_copy_on_write):
-    df = DataFrame({"a": [1, 2], "b": 1.5})
-    ser = Series([10, 11])
-    rhs_index = Index(ser)
-    df.index = rhs_index
-    rhs_index = None  # overwrite to clear reference
-    expected = df.index.copy(deep=True)
-    with tm.assert_cow_warning(warn_copy_on_write):
-        ser.iloc[0] = 100
-    if using_copy_on_write:
-        tm.assert_index_equal(df.index, expected)
-    else:
-        tm.assert_index_equal(df.index, Index([100, 11]))
-
-
-def test_index_from_series(using_copy_on_write, warn_copy_on_write):
-    ser = Series([1, 2])
-    idx = Index(ser)
-    expected = idx.copy(deep=True)
-    with tm.assert_cow_warning(warn_copy_on_write):
-        ser.iloc[0] = 100
-    if using_copy_on_write:
-        tm.assert_index_equal(idx, expected)
-    else:
-        tm.assert_index_equal(idx, Index([100, 2]))
-
-
-def test_index_from_series_copy(using_copy_on_write):
-    ser = Series([1, 2])
-    idx = Index(ser, copy=True)  # noqa: F841
-    arr = get_array(ser)
-    ser.iloc[0] = 100
-    assert np.shares_memory(get_array(ser), arr)
-
-
-def test_index_from_index(using_copy_on_write, warn_copy_on_write):
-    ser = Series([1, 2])
-    idx = Index(ser)
-    idx = Index(idx)
-    expected = idx.copy(deep=True)
-    with tm.assert_cow_warning(warn_copy_on_write):
-        ser.iloc[0] = 100
-    if using_copy_on_write:
-        tm.assert_index_equal(idx, expected)
-    else:
-        tm.assert_index_equal(idx, Index([100, 2]))
+xfail_pyarrow = pytest.mark.usefixtures("pyarrow_xfail")
+skip_pyarrow = pytest.mark.usefixtures("pyarrow_skip")
 
 
 @pytest.mark.parametrize(
-    "func",
+    "data,kwargs,expected",
     [
-        lambda x: x._shallow_copy(x._values),
-        lambda x: x.view(),
-        lambda x: x.take([0, 1]),
-        lambda x: x.repeat([1, 1]),
-        lambda x: x[slice(0, 2)],
-        lambda x: x[[0, 1]],
-        lambda x: x._getitem_slice(slice(0, 2)),
-        lambda x: x.delete([]),
-        lambda x: x.rename("b"),
-        lambda x: x.astype("Int64", copy=False),
-    ],
-    ids=[
-        "_shallow_copy",
-        "view",
-        "take",
-        "repeat",
-        "getitem_slice",
-        "getitem_list",
-        "_getitem_slice",
-        "delete",
-        "rename",
-        "astype",
+        (
+            """foo,2,3,4,5
+bar,7,8,9,10
+baz,12,13,14,15
+qux,12,13,14,15
+foo2,12,13,14,15
+bar2,12,13,14,15
+""",
+            {"index_col": 0, "names": ["index", "A", "B", "C", "D"]},
+            DataFrame(
+                [
+                    [2, 3, 4, 5],
+                    [7, 8, 9, 10],
+                    [12, 13, 14, 15],
+                    [12, 13, 14, 15],
+                    [12, 13, 14, 15],
+                    [12, 13, 14, 15],
+                ],
+                index=Index(["foo", "bar", "baz", "qux", "foo2", "bar2"], name="index"),
+                columns=["A", "B", "C", "D"],
+            ),
+        ),
+        (
+            """foo,one,2,3,4,5
+foo,two,7,8,9,10
+foo,three,12,13,14,15
+bar,one,12,13,14,15
+bar,two,12,13,14,15
+""",
+            {"index_col": [0, 1], "names": ["index1", "index2", "A", "B", "C", "D"]},
+            DataFrame(
+                [
+                    [2, 3, 4, 5],
+                    [7, 8, 9, 10],
+                    [12, 13, 14, 15],
+                    [12, 13, 14, 15],
+                    [12, 13, 14, 15],
+                ],
+                index=MultiIndex.from_tuples(
+                    [
+                        ("foo", "one"),
+                        ("foo", "two"),
+                        ("foo", "three"),
+                        ("bar", "one"),
+                        ("bar", "two"),
+                    ],
+                    names=["index1", "index2"],
+                ),
+                columns=["A", "B", "C", "D"],
+            ),
+        ),
     ],
 )
-def test_index_ops(using_copy_on_write, func, request):
-    idx, view_ = index_view()
-    expected = idx.copy(deep=True)
-    if "astype" in request.node.callspec.id:
-        expected = expected.astype("Int64")
-    idx = func(idx)
-    view_.iloc[0, 0] = 100
-    if using_copy_on_write:
-        tm.assert_index_equal(idx, expected, check_names=False)
+def test_pass_names_with_index(all_parsers, data, kwargs, expected):
+    parser = all_parsers
+    result = parser.read_csv(StringIO(data), **kwargs)
+    tm.assert_frame_equal(result, expected)
 
 
-def test_infer_objects(using_copy_on_write):
-    idx, view_ = index_view(["a", "b"])
-    expected = idx.copy(deep=True)
-    idx = idx.infer_objects(copy=False)
-    view_.iloc[0, 0] = "aaaa"
-    if using_copy_on_write:
-        tm.assert_index_equal(idx, expected, check_names=False)
+@pytest.mark.parametrize("index_col", [[0, 1], [1, 0]])
+def test_multi_index_no_level_names(
+    request, all_parsers, index_col, using_infer_string
+):
+    data = """index1,index2,A,B,C,D
+foo,one,2,3,4,5
+foo,two,7,8,9,10
+foo,three,12,13,14,15
+bar,one,12,13,14,15
+bar,two,12,13,14,15
+"""
+    headless_data = "\n".join(data.split("\n")[1:])
+
+    names = ["A", "B", "C", "D"]
+    parser = all_parsers
+
+    result = parser.read_csv(
+        StringIO(headless_data), index_col=index_col, header=None, names=names
+    )
+    expected = parser.read_csv(StringIO(data), index_col=index_col)
+
+    # No index names in headless data.
+    expected.index.names = [None] * 2
+    tm.assert_frame_equal(result, expected)
 
 
-def test_index_to_frame(using_copy_on_write):
-    idx = Index([1, 2, 3], name="a")
-    expected = idx.copy(deep=True)
-    df = idx.to_frame()
-    if using_copy_on_write:
-        assert np.shares_memory(get_array(df, "a"), idx._values)
-        assert not df._mgr._has_no_reference(0)
-    else:
-        assert not np.shares_memory(get_array(df, "a"), idx._values)
+@skip_pyarrow
+def test_multi_index_no_level_names_implicit(all_parsers):
+    parser = all_parsers
+    data = """A,B,C,D
+foo,one,2,3,4,5
+foo,two,7,8,9,10
+foo,three,12,13,14,15
+bar,one,12,13,14,15
+bar,two,12,13,14,15
+"""
 
-    df.iloc[0, 0] = 100
-    tm.assert_index_equal(idx, expected)
+    result = parser.read_csv(StringIO(data))
+    expected = DataFrame(
+        [
+            [2, 3, 4, 5],
+            [7, 8, 9, 10],
+            [12, 13, 14, 15],
+            [12, 13, 14, 15],
+            [12, 13, 14, 15],
+        ],
+        columns=["A", "B", "C", "D"],
+        index=MultiIndex.from_tuples(
+            [
+                ("foo", "one"),
+                ("foo", "two"),
+                ("foo", "three"),
+                ("bar", "one"),
+                ("bar", "two"),
+            ]
+        ),
+    )
+    tm.assert_frame_equal(result, expected)
 
 
-def test_index_values(using_copy_on_write):
-    idx = Index([1, 2, 3])
-    result = idx.values
-    if using_copy_on_write:
-        assert result.flags.writeable is False
-    else:
-        assert result.flags.writeable is True
+@xfail_pyarrow  # TypeError: an integer is required
+@pytest.mark.parametrize(
+    "data,expected,header",
+    [
+        ("a,b", DataFrame(columns=["a", "b"]), [0]),
+        (
+            "a,b\nc,d",
+            DataFrame(columns=MultiIndex.from_tuples([("a", "c"), ("b", "d")])),
+            [0, 1],
+        ),
+    ],
+)
+@pytest.mark.parametrize("round_trip", [True, False])
+def test_multi_index_blank_df(all_parsers, data, expected, header, round_trip):
+    # see gh-14545
+    parser = all_parsers
+    data = expected.to_csv(index=False) if round_trip else data
+
+    result = parser.read_csv(StringIO(data), header=header)
+    tm.assert_frame_equal(result, expected)
+
+
+@xfail_pyarrow  # AssertionError: DataFrame.columns are different
+def test_no_unnamed_index(all_parsers):
+    parser = all_parsers
+    data = """ id c0 c1 c2
+0 1 0 a b
+1 2 0 c d
+2 2 2 e f
+"""
+    result = parser.read_csv(StringIO(data), sep=" ")
+    expected = DataFrame(
+        [[0, 1, 0, "a", "b"], [1, 2, 0, "c", "d"], [2, 2, 2, "e", "f"]],
+        columns=["Unnamed: 0", "id", "c0", "c1", "c2"],
+    )
+    tm.assert_frame_equal(result, expected)
+
+
+def test_read_duplicate_index_explicit(all_parsers):
+    data = """index,A,B,C,D
+foo,2,3,4,5
+bar,7,8,9,10
+baz,12,13,14,15
+qux,12,13,14,15
+foo,12,13,14,15
+bar,12,13,14,15
+"""
+    parser = all_parsers
+    result = parser.read_csv(StringIO(data), index_col=0)
+
+    expected = DataFrame(
+        [
+            [2, 3, 4, 5],
+            [7, 8, 9, 10],
+            [12, 13, 14, 15],
+            [12, 13, 14, 15],
+            [12, 13, 14, 15],
+            [12, 13, 14, 15],
+        ],
+        columns=["A", "B", "C", "D"],
+        index=Index(["foo", "bar", "baz", "qux", "foo", "bar"], name="index"),
+    )
+    tm.assert_frame_equal(result, expected)
+
+
+@skip_pyarrow
+def test_read_duplicate_index_implicit(all_parsers):
+    data = """A,B,C,D
+foo,2,3,4,5
+bar,7,8,9,10
+baz,12,13,14,15
+qux,12,13,14,15
+foo,12,13,14,15
+bar,12,13,14,15
+"""
+    parser = all_parsers
+    result = parser.read_csv(StringIO(data))
+
+    expected = DataFrame(
+        [
+            [2, 3, 4, 5],
+            [7, 8, 9, 10],
+            [12, 13, 14, 15],
+            [12, 13, 14, 15],
+            [12, 13, 14, 15],
+            [12, 13, 14, 15],
+        ],
+        columns=["A", "B", "C", "D"],
+        index=Index(["foo", "bar", "baz", "qux", "foo", "bar"]),
+    )
+    tm.assert_frame_equal(result, expected)
+
+
+@skip_pyarrow
+def test_read_csv_no_index_name(all_parsers, csv_dir_path):
+    parser = all_parsers
+    csv2 = os.path.join(csv_dir_path, "test2.csv")
+    result = parser.read_csv(csv2, index_col=0, parse_dates=True)
+
+    expected = DataFrame(
+        [
+            [0.980269, 3.685731, -0.364216805298, -1.159738, "foo"],
+            [1.047916, -0.041232, -0.16181208307, 0.212549, "bar"],
+            [0.498581, 0.731168, -0.537677223318, 1.346270, "baz"],
+            [1.120202, 1.567621, 0.00364077397681, 0.675253, "qux"],
+            [-0.487094, 0.571455, -1.6116394093, 0.103469, "foo2"],
+        ],
+        columns=["A", "B", "C", "D", "E"],
+        index=Index(
+            [
+                datetime(2000, 1, 3),
+                datetime(2000, 1, 4),
+                datetime(2000, 1, 5),
+                datetime(2000, 1, 6),
+                datetime(2000, 1, 7),
+            ]
+        ),
+    )
+    tm.assert_frame_equal(result, expected)
+
+
+@skip_pyarrow
+def test_empty_with_index(all_parsers):
+    # see gh-10184
+    data = "x,y"
+    parser = all_parsers
+    result = parser.read_csv(StringIO(data), index_col=0)
+
+    expected = DataFrame(columns=["y"], index=Index([], name="x"))
+    tm.assert_frame_equal(result, expected)
+
+
+# CSV parse error: Empty CSV file or block: cannot infer number of columns
+@skip_pyarrow
+def test_empty_with_multi_index(all_parsers):
+    # see gh-10467
+    data = "x,y,z"
+    parser = all_parsers
+    result = parser.read_csv(StringIO(data), index_col=["x", "y"])
+
+    expected = DataFrame(
+        columns=["z"], index=MultiIndex.from_arrays([[]] * 2, names=["x", "y"])
+    )
+    tm.assert_frame_equal(result, expected)
+
+
+# CSV parse error: Empty CSV file or block: cannot infer number of columns
+@skip_pyarrow
+def test_empty_with_reversed_multi_index(all_parsers):
+    data = "x,y,z"
+    parser = all_parsers
+    result = parser.read_csv(StringIO(data), index_col=[1, 0])
+
+    expected = DataFrame(
+        columns=["z"], index=MultiIndex.from_arrays([[]] * 2, names=["y", "x"])
+    )
+    tm.assert_frame_equal(result, expected)

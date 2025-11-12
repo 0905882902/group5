@@ -1,1648 +1,1009 @@
-from collections.abc import Iterator
-from functools import partial
-from io import (
-    BytesIO,
-    StringIO,
+from textwrap import (
+    dedent,
+    indent,
 )
-import os
-from pathlib import Path
-import re
-import threading
-from urllib.error import URLError
 
 import numpy as np
 import pytest
 
-from pandas.compat import is_platform_windows
-import pandas.util._test_decorators as td
-
-import pandas as pd
 from pandas import (
-    NA,
     DataFrame,
     MultiIndex,
-    Series,
-    Timestamp,
-    date_range,
-    read_csv,
-    read_html,
-    to_datetime,
+    option_context,
 )
-import pandas._testing as tm
 
-from pandas.io.common import file_path_to_url
-
-
-@pytest.fixture(
-    params=[
-        "chinese_utf-16.html",
-        "chinese_utf-32.html",
-        "chinese_utf-8.html",
-        "letz_latin1.html",
-    ]
-)
-def html_encoding_file(request, datapath):
-    """Parametrized fixture for HTML encoding test filenames."""
-    return datapath("io", "data", "html_encoding", request.param)
+jinja2 = pytest.importorskip("jinja2")
+from pandas.io.formats.style import Styler
 
 
-def assert_framelist_equal(list1, list2, *args, **kwargs):
-    assert len(list1) == len(list2), (
-        "lists are not of equal size "
-        f"len(list1) == {len(list1)}, "
-        f"len(list2) == {len(list2)}"
+@pytest.fixture
+def env():
+    loader = jinja2.PackageLoader("pandas", "io/formats/templates")
+    env = jinja2.Environment(loader=loader, trim_blocks=True)
+    return env
+
+
+@pytest.fixture
+def styler():
+    return Styler(DataFrame([[2.61], [2.69]], index=["a", "b"], columns=["A"]))
+
+
+@pytest.fixture
+def styler_mi():
+    midx = MultiIndex.from_product([["a", "b"], ["c", "d"]])
+    return Styler(DataFrame(np.arange(16).reshape(4, 4), index=midx, columns=midx))
+
+
+@pytest.fixture
+def tpl_style(env):
+    return env.get_template("html_style.tpl")
+
+
+@pytest.fixture
+def tpl_table(env):
+    return env.get_template("html_table.tpl")
+
+
+def test_html_template_extends_options():
+    # make sure if templates are edited tests are updated as are setup fixtures
+    # to understand the dependency
+    with open("pandas/io/formats/templates/html.tpl", encoding="utf-8") as file:
+        result = file.read()
+    assert "{% include html_style_tpl %}" in result
+    assert "{% include html_table_tpl %}" in result
+
+
+def test_exclude_styles(styler):
+    result = styler.to_html(exclude_styles=True, doctype_html=True)
+    expected = dedent(
+        """\
+        <!DOCTYPE html>
+        <html>
+        <head>
+        <meta charset="utf-8">
+        </head>
+        <body>
+        <table>
+          <thead>
+            <tr>
+              <th >&nbsp;</th>
+              <th >A</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <th >a</th>
+              <td >2.610000</td>
+            </tr>
+            <tr>
+              <th >b</th>
+              <td >2.690000</td>
+            </tr>
+          </tbody>
+        </table>
+        </body>
+        </html>
+        """
     )
-    msg = "not all list elements are DataFrames"
-    both_frames = all(
-        map(
-            lambda x, y: isinstance(x, DataFrame) and isinstance(y, DataFrame),
-            list1,
-            list2,
+    assert result == expected
+
+
+def test_w3_html_format(styler):
+    styler.set_uuid("").set_table_styles([{"selector": "th", "props": "att2:v2;"}]).map(
+        lambda x: "att1:v1;"
+    ).set_table_attributes('class="my-cls1" style="attr3:v3;"').set_td_classes(
+        DataFrame(["my-cls2"], index=["a"], columns=["A"])
+    ).format(
+        "{:.1f}"
+    ).set_caption(
+        "A comprehensive test"
+    )
+    expected = dedent(
+        """\
+        <style type="text/css">
+        #T_ th {
+          att2: v2;
+        }
+        #T__row0_col0, #T__row1_col0 {
+          att1: v1;
+        }
+        </style>
+        <table id="T_" class="my-cls1" style="attr3:v3;">
+          <caption>A comprehensive test</caption>
+          <thead>
+            <tr>
+              <th class="blank level0" >&nbsp;</th>
+              <th id="T__level0_col0" class="col_heading level0 col0" >A</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <th id="T__level0_row0" class="row_heading level0 row0" >a</th>
+              <td id="T__row0_col0" class="data row0 col0 my-cls2" >2.6</td>
+            </tr>
+            <tr>
+              <th id="T__level0_row1" class="row_heading level0 row1" >b</th>
+              <td id="T__row1_col0" class="data row1 col0" >2.7</td>
+            </tr>
+          </tbody>
+        </table>
+        """
+    )
+    assert expected == styler.to_html()
+
+
+def test_colspan_w3():
+    # GH 36223
+    df = DataFrame(data=[[1, 2]], columns=[["l0", "l0"], ["l1a", "l1b"]])
+    styler = Styler(df, uuid="_", cell_ids=False)
+    assert '<th class="col_heading level0 col0" colspan="2">l0</th>' in styler.to_html()
+
+
+def test_rowspan_w3():
+    # GH 38533
+    df = DataFrame(data=[[1, 2]], index=[["l0", "l0"], ["l1a", "l1b"]])
+    styler = Styler(df, uuid="_", cell_ids=False)
+    assert '<th class="row_heading level0 row0" rowspan="2">l0</th>' in styler.to_html()
+
+
+def test_styles(styler):
+    styler.set_uuid("abc")
+    styler.set_table_styles([{"selector": "td", "props": "color: red;"}])
+    result = styler.to_html(doctype_html=True)
+    expected = dedent(
+        """\
+        <!DOCTYPE html>
+        <html>
+        <head>
+        <meta charset="utf-8">
+        <style type="text/css">
+        #T_abc td {
+          color: red;
+        }
+        </style>
+        </head>
+        <body>
+        <table id="T_abc">
+          <thead>
+            <tr>
+              <th class="blank level0" >&nbsp;</th>
+              <th id="T_abc_level0_col0" class="col_heading level0 col0" >A</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <th id="T_abc_level0_row0" class="row_heading level0 row0" >a</th>
+              <td id="T_abc_row0_col0" class="data row0 col0" >2.610000</td>
+            </tr>
+            <tr>
+              <th id="T_abc_level0_row1" class="row_heading level0 row1" >b</th>
+              <td id="T_abc_row1_col0" class="data row1 col0" >2.690000</td>
+            </tr>
+          </tbody>
+        </table>
+        </body>
+        </html>
+        """
+    )
+    assert result == expected
+
+
+def test_doctype(styler):
+    result = styler.to_html(doctype_html=False)
+    assert "<html>" not in result
+    assert "<body>" not in result
+    assert "<!DOCTYPE html>" not in result
+    assert "<head>" not in result
+
+
+def test_doctype_encoding(styler):
+    with option_context("styler.render.encoding", "ASCII"):
+        result = styler.to_html(doctype_html=True)
+        assert '<meta charset="ASCII">' in result
+        result = styler.to_html(doctype_html=True, encoding="ANSI")
+        assert '<meta charset="ANSI">' in result
+
+
+def test_bold_headers_arg(styler):
+    result = styler.to_html(bold_headers=True)
+    assert "th {\n  font-weight: bold;\n}" in result
+    result = styler.to_html()
+    assert "th {\n  font-weight: bold;\n}" not in result
+
+
+def test_caption_arg(styler):
+    result = styler.to_html(caption="foo bar")
+    assert "<caption>foo bar</caption>" in result
+    result = styler.to_html()
+    assert "<caption>foo bar</caption>" not in result
+
+
+def test_block_names(tpl_style, tpl_table):
+    # catch accidental removal of a block
+    expected_style = {
+        "before_style",
+        "style",
+        "table_styles",
+        "before_cellstyle",
+        "cellstyle",
+    }
+    expected_table = {
+        "before_table",
+        "table",
+        "caption",
+        "thead",
+        "tbody",
+        "after_table",
+        "before_head_rows",
+        "head_tr",
+        "after_head_rows",
+        "before_rows",
+        "tr",
+        "after_rows",
+    }
+    result1 = set(tpl_style.blocks)
+    assert result1 == expected_style
+
+    result2 = set(tpl_table.blocks)
+    assert result2 == expected_table
+
+
+def test_from_custom_template_table(tmpdir):
+    p = tmpdir.mkdir("tpl").join("myhtml_table.tpl")
+    p.write(
+        dedent(
+            """\
+            {% extends "html_table.tpl" %}
+            {% block table %}
+            <h1>{{custom_title}}</h1>
+            {{ super() }}
+            {% endblock table %}"""
         )
     )
-    assert both_frames, msg
-    for frame_i, frame_j in zip(list1, list2):
-        tm.assert_frame_equal(frame_i, frame_j, *args, **kwargs)
-        assert not frame_i.empty, "frames are both empty"
+    result = Styler.from_custom_template(str(tmpdir.join("tpl")), "myhtml_table.tpl")
+    assert issubclass(result, Styler)
+    assert result.env is not Styler.env
+    assert result.template_html_table is not Styler.template_html_table
+    styler = result(DataFrame({"A": [1, 2]}))
+    assert "<h1>My Title</h1>\n\n\n<table" in styler.to_html(custom_title="My Title")
 
 
-def test_bs4_version_fails(monkeypatch, datapath):
-    bs4 = pytest.importorskip("bs4")
-    pytest.importorskip("html5lib")
-
-    monkeypatch.setattr(bs4, "__version__", "4.2")
-    with pytest.raises(ImportError, match="Pandas requires version"):
-        read_html(datapath("io", "data", "html", "spam.html"), flavor="bs4")
-
-
-def test_invalid_flavor():
-    url = "google.com"
-    flavor = "invalid flavor"
-    msg = r"\{" + flavor + r"\} is not a valid set of flavors"
-
-    with pytest.raises(ValueError, match=msg):
-        read_html(StringIO(url), match="google", flavor=flavor)
-
-
-def test_same_ordering(datapath):
-    pytest.importorskip("bs4")
-    pytest.importorskip("lxml")
-    pytest.importorskip("html5lib")
-
-    filename = datapath("io", "data", "html", "valid_markup.html")
-    dfs_lxml = read_html(filename, index_col=0, flavor=["lxml"])
-    dfs_bs4 = read_html(filename, index_col=0, flavor=["bs4"])
-    assert_framelist_equal(dfs_lxml, dfs_bs4)
+def test_from_custom_template_style(tmpdir):
+    p = tmpdir.mkdir("tpl").join("myhtml_style.tpl")
+    p.write(
+        dedent(
+            """\
+            {% extends "html_style.tpl" %}
+            {% block style %}
+            <link rel="stylesheet" href="mystyle.css">
+            {{ super() }}
+            {% endblock style %}"""
+        )
+    )
+    result = Styler.from_custom_template(
+        str(tmpdir.join("tpl")), html_style="myhtml_style.tpl"
+    )
+    assert issubclass(result, Styler)
+    assert result.env is not Styler.env
+    assert result.template_html_style is not Styler.template_html_style
+    styler = result(DataFrame({"A": [1, 2]}))
+    assert '<link rel="stylesheet" href="mystyle.css">\n\n<style' in styler.to_html()
 
 
-@pytest.fixture(
-    params=[
-        pytest.param("bs4", marks=[td.skip_if_no("bs4"), td.skip_if_no("html5lib")]),
-        pytest.param("lxml", marks=td.skip_if_no("lxml")),
+def test_caption_as_sequence(styler):
+    styler.set_caption(("full cap", "short cap"))
+    assert "<caption>full cap</caption>" in styler.to_html()
+
+
+@pytest.mark.parametrize("index", [False, True])
+@pytest.mark.parametrize("columns", [False, True])
+@pytest.mark.parametrize("index_name", [True, False])
+def test_sticky_basic(styler, index, columns, index_name):
+    if index_name:
+        styler.index.name = "some text"
+    if index:
+        styler.set_sticky(axis=0)
+    if columns:
+        styler.set_sticky(axis=1)
+
+    left_css = (
+        "#T_ {0} {{\n  position: sticky;\n  background-color: inherit;\n"
+        "  left: 0px;\n  z-index: {1};\n}}"
+    )
+    top_css = (
+        "#T_ {0} {{\n  position: sticky;\n  background-color: inherit;\n"
+        "  top: {1}px;\n  z-index: {2};\n{3}}}"
+    )
+
+    res = styler.set_uuid("").to_html()
+
+    # test index stickys over thead and tbody
+    assert (left_css.format("thead tr th:nth-child(1)", "3 !important") in res) is index
+    assert (left_css.format("tbody tr th:nth-child(1)", "1") in res) is index
+
+    # test column stickys including if name row
+    assert (
+        top_css.format("thead tr:nth-child(1) th", "0", "2", "  height: 25px;\n") in res
+    ) is (columns and index_name)
+    assert (
+        top_css.format("thead tr:nth-child(2) th", "25", "2", "  height: 25px;\n")
+        in res
+    ) is (columns and index_name)
+    assert (top_css.format("thead tr:nth-child(1) th", "0", "2", "") in res) is (
+        columns and not index_name
+    )
+
+
+@pytest.mark.parametrize("index", [False, True])
+@pytest.mark.parametrize("columns", [False, True])
+def test_sticky_mi(styler_mi, index, columns):
+    if index:
+        styler_mi.set_sticky(axis=0)
+    if columns:
+        styler_mi.set_sticky(axis=1)
+
+    left_css = (
+        "#T_ {0} {{\n  position: sticky;\n  background-color: inherit;\n"
+        "  left: {1}px;\n  min-width: 75px;\n  max-width: 75px;\n  z-index: {2};\n}}"
+    )
+    top_css = (
+        "#T_ {0} {{\n  position: sticky;\n  background-color: inherit;\n"
+        "  top: {1}px;\n  height: 25px;\n  z-index: {2};\n}}"
+    )
+
+    res = styler_mi.set_uuid("").to_html()
+
+    # test the index stickys for thead and tbody over both levels
+    assert (
+        left_css.format("thead tr th:nth-child(1)", "0", "3 !important") in res
+    ) is index
+    assert (left_css.format("tbody tr th.level0", "0", "1") in res) is index
+    assert (
+        left_css.format("thead tr th:nth-child(2)", "75", "3 !important") in res
+    ) is index
+    assert (left_css.format("tbody tr th.level1", "75", "1") in res) is index
+
+    # test the column stickys for each level row
+    assert (top_css.format("thead tr:nth-child(1) th", "0", "2") in res) is columns
+    assert (top_css.format("thead tr:nth-child(2) th", "25", "2") in res) is columns
+
+
+@pytest.mark.parametrize("index", [False, True])
+@pytest.mark.parametrize("columns", [False, True])
+@pytest.mark.parametrize("levels", [[1], ["one"], "one"])
+def test_sticky_levels(styler_mi, index, columns, levels):
+    styler_mi.index.names, styler_mi.columns.names = ["zero", "one"], ["zero", "one"]
+    if index:
+        styler_mi.set_sticky(axis=0, levels=levels)
+    if columns:
+        styler_mi.set_sticky(axis=1, levels=levels)
+
+    left_css = (
+        "#T_ {0} {{\n  position: sticky;\n  background-color: inherit;\n"
+        "  left: {1}px;\n  min-width: 75px;\n  max-width: 75px;\n  z-index: {2};\n}}"
+    )
+    top_css = (
+        "#T_ {0} {{\n  position: sticky;\n  background-color: inherit;\n"
+        "  top: {1}px;\n  height: 25px;\n  z-index: {2};\n}}"
+    )
+
+    res = styler_mi.set_uuid("").to_html()
+
+    # test no sticking of level0
+    assert "#T_ thead tr th:nth-child(1)" not in res
+    assert "#T_ tbody tr th.level0" not in res
+    assert "#T_ thead tr:nth-child(1) th" not in res
+
+    # test sticking level1
+    assert (
+        left_css.format("thead tr th:nth-child(2)", "0", "3 !important") in res
+    ) is index
+    assert (left_css.format("tbody tr th.level1", "0", "1") in res) is index
+    assert (top_css.format("thead tr:nth-child(2) th", "0", "2") in res) is columns
+
+
+def test_sticky_raises(styler):
+    with pytest.raises(ValueError, match="No axis named bad for object type DataFrame"):
+        styler.set_sticky(axis="bad")
+
+
+@pytest.mark.parametrize(
+    "sparse_index, sparse_columns",
+    [(True, True), (True, False), (False, True), (False, False)],
+)
+def test_sparse_options(sparse_index, sparse_columns):
+    cidx = MultiIndex.from_tuples([("Z", "a"), ("Z", "b"), ("Y", "c")])
+    ridx = MultiIndex.from_tuples([("A", "a"), ("A", "b"), ("B", "c")])
+    df = DataFrame([[1, 2, 3], [4, 5, 6], [7, 8, 9]], index=ridx, columns=cidx)
+    styler = df.style
+
+    default_html = styler.to_html()  # defaults under pd.options to (True , True)
+
+    with option_context(
+        "styler.sparse.index", sparse_index, "styler.sparse.columns", sparse_columns
+    ):
+        html1 = styler.to_html()
+        assert (html1 == default_html) is (sparse_index and sparse_columns)
+    html2 = styler.to_html(sparse_index=sparse_index, sparse_columns=sparse_columns)
+    assert html1 == html2
+
+
+@pytest.mark.parametrize("index", [True, False])
+@pytest.mark.parametrize("columns", [True, False])
+def test_map_header_cell_ids(styler, index, columns):
+    # GH 41893
+    func = lambda v: "attr: val;"
+    styler.uuid, styler.cell_ids = "", False
+    if index:
+        styler.map_index(func, axis="index")
+    if columns:
+        styler.map_index(func, axis="columns")
+
+    result = styler.to_html()
+
+    # test no data cell ids
+    assert '<td class="data row0 col0" >2.610000</td>' in result
+    assert '<td class="data row1 col0" >2.690000</td>' in result
+
+    # test index header ids where needed and css styles
+    assert (
+        '<th id="T__level0_row0" class="row_heading level0 row0" >a</th>' in result
+    ) is index
+    assert (
+        '<th id="T__level0_row1" class="row_heading level0 row1" >b</th>' in result
+    ) is index
+    assert ("#T__level0_row0, #T__level0_row1 {\n  attr: val;\n}" in result) is index
+
+    # test column header ids where needed and css styles
+    assert (
+        '<th id="T__level0_col0" class="col_heading level0 col0" >A</th>' in result
+    ) is columns
+    assert ("#T__level0_col0 {\n  attr: val;\n}" in result) is columns
+
+
+@pytest.mark.parametrize("rows", [True, False])
+@pytest.mark.parametrize("cols", [True, False])
+def test_maximums(styler_mi, rows, cols):
+    result = styler_mi.to_html(
+        max_rows=2 if rows else None,
+        max_columns=2 if cols else None,
+    )
+
+    assert ">5</td>" in result  # [[0,1], [4,5]] always visible
+    assert (">8</td>" in result) is not rows  # first trimmed vertical element
+    assert (">2</td>" in result) is not cols  # first trimmed horizontal element
+
+
+def test_replaced_css_class_names():
+    css = {
+        "row_heading": "ROWHEAD",
+        # "col_heading": "COLHEAD",
+        "index_name": "IDXNAME",
+        # "col": "COL",
+        "row": "ROW",
+        # "col_trim": "COLTRIM",
+        "row_trim": "ROWTRIM",
+        "level": "LEVEL",
+        "data": "DATA",
+        "blank": "BLANK",
+    }
+    midx = MultiIndex.from_product([["a", "b"], ["c", "d"]])
+    styler_mi = Styler(
+        DataFrame(np.arange(16).reshape(4, 4), index=midx, columns=midx),
+        uuid_len=0,
+    ).set_table_styles(css_class_names=css)
+    styler_mi.index.names = ["n1", "n2"]
+    styler_mi.hide(styler_mi.index[1:], axis=0)
+    styler_mi.hide(styler_mi.columns[1:], axis=1)
+    styler_mi.map_index(lambda v: "color: red;", axis=0)
+    styler_mi.map_index(lambda v: "color: green;", axis=1)
+    styler_mi.map(lambda v: "color: blue;")
+    expected = dedent(
+        """\
+    <style type="text/css">
+    #T__ROW0_col0 {
+      color: blue;
+    }
+    #T__LEVEL0_ROW0, #T__LEVEL1_ROW0 {
+      color: red;
+    }
+    #T__LEVEL0_col0, #T__LEVEL1_col0 {
+      color: green;
+    }
+    </style>
+    <table id="T_">
+      <thead>
+        <tr>
+          <th class="BLANK" >&nbsp;</th>
+          <th class="IDXNAME LEVEL0" >n1</th>
+          <th id="T__LEVEL0_col0" class="col_heading LEVEL0 col0" >a</th>
+        </tr>
+        <tr>
+          <th class="BLANK" >&nbsp;</th>
+          <th class="IDXNAME LEVEL1" >n2</th>
+          <th id="T__LEVEL1_col0" class="col_heading LEVEL1 col0" >c</th>
+        </tr>
+        <tr>
+          <th class="IDXNAME LEVEL0" >n1</th>
+          <th class="IDXNAME LEVEL1" >n2</th>
+          <th class="BLANK col0" >&nbsp;</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <th id="T__LEVEL0_ROW0" class="ROWHEAD LEVEL0 ROW0" >a</th>
+          <th id="T__LEVEL1_ROW0" class="ROWHEAD LEVEL1 ROW0" >c</th>
+          <td id="T__ROW0_col0" class="DATA ROW0 col0" >0</td>
+        </tr>
+      </tbody>
+    </table>
+    """
+    )
+    result = styler_mi.to_html()
+    assert result == expected
+
+
+def test_include_css_style_rules_only_for_visible_cells(styler_mi):
+    # GH 43619
+    result = (
+        styler_mi.set_uuid("")
+        .map(lambda v: "color: blue;")
+        .hide(styler_mi.data.columns[1:], axis="columns")
+        .hide(styler_mi.data.index[1:], axis="index")
+        .to_html()
+    )
+    expected_styles = dedent(
+        """\
+        <style type="text/css">
+        #T__row0_col0 {
+          color: blue;
+        }
+        </style>
+        """
+    )
+    assert expected_styles in result
+
+
+def test_include_css_style_rules_only_for_visible_index_labels(styler_mi):
+    # GH 43619
+    result = (
+        styler_mi.set_uuid("")
+        .map_index(lambda v: "color: blue;", axis="index")
+        .hide(styler_mi.data.columns, axis="columns")
+        .hide(styler_mi.data.index[1:], axis="index")
+        .to_html()
+    )
+    expected_styles = dedent(
+        """\
+        <style type="text/css">
+        #T__level0_row0, #T__level1_row0 {
+          color: blue;
+        }
+        </style>
+        """
+    )
+    assert expected_styles in result
+
+
+def test_include_css_style_rules_only_for_visible_column_labels(styler_mi):
+    # GH 43619
+    result = (
+        styler_mi.set_uuid("")
+        .map_index(lambda v: "color: blue;", axis="columns")
+        .hide(styler_mi.data.columns[1:], axis="columns")
+        .hide(styler_mi.data.index, axis="index")
+        .to_html()
+    )
+    expected_styles = dedent(
+        """\
+        <style type="text/css">
+        #T__level0_col0, #T__level1_col0 {
+          color: blue;
+        }
+        </style>
+        """
+    )
+    assert expected_styles in result
+
+
+def test_hiding_index_columns_multiindex_alignment():
+    # gh 43644
+    midx = MultiIndex.from_product(
+        [["i0", "j0"], ["i1"], ["i2", "j2"]], names=["i-0", "i-1", "i-2"]
+    )
+    cidx = MultiIndex.from_product(
+        [["c0"], ["c1", "d1"], ["c2", "d2"]], names=["c-0", "c-1", "c-2"]
+    )
+    df = DataFrame(np.arange(16).reshape(4, 4), index=midx, columns=cidx)
+    styler = Styler(df, uuid_len=0)
+    styler.hide(level=1, axis=0).hide(level=0, axis=1)
+    styler.hide([("j0", "i1", "j2")], axis=0)
+    styler.hide([("c0", "d1", "d2")], axis=1)
+    result = styler.to_html()
+    expected = dedent(
+        """\
+    <style type="text/css">
+    </style>
+    <table id="T_">
+      <thead>
+        <tr>
+          <th class="blank" >&nbsp;</th>
+          <th class="index_name level1" >c-1</th>
+          <th id="T__level1_col0" class="col_heading level1 col0" colspan="2">c1</th>
+          <th id="T__level1_col2" class="col_heading level1 col2" >d1</th>
+        </tr>
+        <tr>
+          <th class="blank" >&nbsp;</th>
+          <th class="index_name level2" >c-2</th>
+          <th id="T__level2_col0" class="col_heading level2 col0" >c2</th>
+          <th id="T__level2_col1" class="col_heading level2 col1" >d2</th>
+          <th id="T__level2_col2" class="col_heading level2 col2" >c2</th>
+        </tr>
+        <tr>
+          <th class="index_name level0" >i-0</th>
+          <th class="index_name level2" >i-2</th>
+          <th class="blank col0" >&nbsp;</th>
+          <th class="blank col1" >&nbsp;</th>
+          <th class="blank col2" >&nbsp;</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <th id="T__level0_row0" class="row_heading level0 row0" rowspan="2">i0</th>
+          <th id="T__level2_row0" class="row_heading level2 row0" >i2</th>
+          <td id="T__row0_col0" class="data row0 col0" >0</td>
+          <td id="T__row0_col1" class="data row0 col1" >1</td>
+          <td id="T__row0_col2" class="data row0 col2" >2</td>
+        </tr>
+        <tr>
+          <th id="T__level2_row1" class="row_heading level2 row1" >j2</th>
+          <td id="T__row1_col0" class="data row1 col0" >4</td>
+          <td id="T__row1_col1" class="data row1 col1" >5</td>
+          <td id="T__row1_col2" class="data row1 col2" >6</td>
+        </tr>
+        <tr>
+          <th id="T__level0_row2" class="row_heading level0 row2" >j0</th>
+          <th id="T__level2_row2" class="row_heading level2 row2" >i2</th>
+          <td id="T__row2_col0" class="data row2 col0" >8</td>
+          <td id="T__row2_col1" class="data row2 col1" >9</td>
+          <td id="T__row2_col2" class="data row2 col2" >10</td>
+        </tr>
+      </tbody>
+    </table>
+    """
+    )
+    assert result == expected
+
+
+def test_hiding_index_columns_multiindex_trimming():
+    # gh 44272
+    df = DataFrame(np.arange(64).reshape(8, 8))
+    df.columns = MultiIndex.from_product([[0, 1, 2, 3], [0, 1]])
+    df.index = MultiIndex.from_product([[0, 1, 2, 3], [0, 1]])
+    df.index.names, df.columns.names = ["a", "b"], ["c", "d"]
+    styler = Styler(df, cell_ids=False, uuid_len=0)
+    styler.hide([(0, 0), (0, 1), (1, 0)], axis=1).hide([(0, 0), (0, 1), (1, 0)], axis=0)
+    with option_context("styler.render.max_rows", 4, "styler.render.max_columns", 4):
+        result = styler.to_html()
+
+    expected = dedent(
+        """\
+    <style type="text/css">
+    </style>
+    <table id="T_">
+      <thead>
+        <tr>
+          <th class="blank" >&nbsp;</th>
+          <th class="index_name level0" >c</th>
+          <th class="col_heading level0 col3" >1</th>
+          <th class="col_heading level0 col4" colspan="2">2</th>
+          <th class="col_heading level0 col6" >3</th>
+        </tr>
+        <tr>
+          <th class="blank" >&nbsp;</th>
+          <th class="index_name level1" >d</th>
+          <th class="col_heading level1 col3" >1</th>
+          <th class="col_heading level1 col4" >0</th>
+          <th class="col_heading level1 col5" >1</th>
+          <th class="col_heading level1 col6" >0</th>
+          <th class="col_heading level1 col_trim" >...</th>
+        </tr>
+        <tr>
+          <th class="index_name level0" >a</th>
+          <th class="index_name level1" >b</th>
+          <th class="blank col3" >&nbsp;</th>
+          <th class="blank col4" >&nbsp;</th>
+          <th class="blank col5" >&nbsp;</th>
+          <th class="blank col6" >&nbsp;</th>
+          <th class="blank col7 col_trim" >&nbsp;</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <th class="row_heading level0 row3" >1</th>
+          <th class="row_heading level1 row3" >1</th>
+          <td class="data row3 col3" >27</td>
+          <td class="data row3 col4" >28</td>
+          <td class="data row3 col5" >29</td>
+          <td class="data row3 col6" >30</td>
+          <td class="data row3 col_trim" >...</td>
+        </tr>
+        <tr>
+          <th class="row_heading level0 row4" rowspan="2">2</th>
+          <th class="row_heading level1 row4" >0</th>
+          <td class="data row4 col3" >35</td>
+          <td class="data row4 col4" >36</td>
+          <td class="data row4 col5" >37</td>
+          <td class="data row4 col6" >38</td>
+          <td class="data row4 col_trim" >...</td>
+        </tr>
+        <tr>
+          <th class="row_heading level1 row5" >1</th>
+          <td class="data row5 col3" >43</td>
+          <td class="data row5 col4" >44</td>
+          <td class="data row5 col5" >45</td>
+          <td class="data row5 col6" >46</td>
+          <td class="data row5 col_trim" >...</td>
+        </tr>
+        <tr>
+          <th class="row_heading level0 row6" >3</th>
+          <th class="row_heading level1 row6" >0</th>
+          <td class="data row6 col3" >51</td>
+          <td class="data row6 col4" >52</td>
+          <td class="data row6 col5" >53</td>
+          <td class="data row6 col6" >54</td>
+          <td class="data row6 col_trim" >...</td>
+        </tr>
+        <tr>
+          <th class="row_heading level0 row_trim" >...</th>
+          <th class="row_heading level1 row_trim" >...</th>
+          <td class="data col3 row_trim" >...</td>
+          <td class="data col4 row_trim" >...</td>
+          <td class="data col5 row_trim" >...</td>
+          <td class="data col6 row_trim" >...</td>
+          <td class="data row_trim col_trim" >...</td>
+        </tr>
+      </tbody>
+    </table>
+    """
+    )
+
+    assert result == expected
+
+
+@pytest.mark.parametrize("type", ["data", "index"])
+@pytest.mark.parametrize(
+    "text, exp, found",
+    [
+        ("no link, just text", False, ""),
+        ("subdomain not www: sub.web.com", False, ""),
+        ("www subdomain: www.web.com other", True, "www.web.com"),
+        ("scheme full structure: http://www.web.com", True, "http://www.web.com"),
+        ("scheme no top-level: http://www.web", True, "http://www.web"),
+        ("no scheme, no top-level: www.web", False, "www.web"),
+        ("https scheme: https://www.web.com", True, "https://www.web.com"),
+        ("ftp scheme: ftp://www.web", True, "ftp://www.web"),
+        ("ftps scheme: ftps://www.web", True, "ftps://www.web"),
+        ("subdirectories: www.web.com/directory", True, "www.web.com/directory"),
+        ("Multiple domains: www.1.2.3.4", True, "www.1.2.3.4"),
+        ("with port: http://web.com:80", True, "http://web.com:80"),
+        (
+            "full net_loc scheme: http://user:pass@web.com",
+            True,
+            "http://user:pass@web.com",
+        ),
+        (
+            "with valid special chars: http://web.com/,.':;~!@#$*()[]",
+            True,
+            "http://web.com/,.':;~!@#$*()[]",
+        ),
     ],
 )
-def flavor_read_html(request):
-    return partial(read_html, flavor=request.param)
-
-
-class TestReadHtml:
-    def test_literal_html_deprecation(self, flavor_read_html):
-        # GH 53785
-        msg = (
-            "Passing literal html to 'read_html' is deprecated and "
-            "will be removed in a future version. To read from a "
-            "literal string, wrap it in a 'StringIO' object."
-        )
-
-        with tm.assert_produces_warning(FutureWarning, match=msg):
-            flavor_read_html(
-                """<table>
-                <thead>
-                    <tr>
-                        <th>A</th>
-                        <th>B</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    <tr>
-                        <td>1</td>
-                        <td>2</td>
-                    </tr>
-                </tbody>
-                <tbody>
-                    <tr>
-                        <td>3</td>
-                        <td>4</td>
-                    </tr>
-                </tbody>
-            </table>"""
-            )
-
-    @pytest.fixture
-    def spam_data(self, datapath):
-        return datapath("io", "data", "html", "spam.html")
-
-    @pytest.fixture
-    def banklist_data(self, datapath):
-        return datapath("io", "data", "html", "banklist.html")
-
-    def test_to_html_compat(self, flavor_read_html):
-        df = (
-            DataFrame(
-                np.random.default_rng(2).random((4, 3)),
-                columns=pd.Index(list("abc")),
-            )
-            # pylint: disable-next=consider-using-f-string
-            .map("{:.3f}".format).astype(float)
-        )
-        out = df.to_html()
-        res = flavor_read_html(
-            StringIO(out), attrs={"class": "dataframe"}, index_col=0
-        )[0]
-        tm.assert_frame_equal(res, df)
-
-    def test_dtype_backend(self, string_storage, dtype_backend, flavor_read_html):
-        # GH#50286
-        df = DataFrame(
-            {
-                "a": Series([1, np.nan, 3], dtype="Int64"),
-                "b": Series([1, 2, 3], dtype="Int64"),
-                "c": Series([1.5, np.nan, 2.5], dtype="Float64"),
-                "d": Series([1.5, 2.0, 2.5], dtype="Float64"),
-                "e": [True, False, None],
-                "f": [True, False, True],
-                "g": ["a", "b", "c"],
-                "h": ["a", "b", None],
-            }
-        )
-
-        out = df.to_html(index=False)
-        with pd.option_context("mode.string_storage", string_storage):
-            result = flavor_read_html(StringIO(out), dtype_backend=dtype_backend)[0]
-
-        if dtype_backend == "pyarrow":
-            pa = pytest.importorskip("pyarrow")
-            string_dtype = pd.ArrowDtype(pa.string())
-        else:
-            string_dtype = pd.StringDtype(string_storage)
-
-        expected = DataFrame(
-            {
-                "a": Series([1, np.nan, 3], dtype="Int64"),
-                "b": Series([1, 2, 3], dtype="Int64"),
-                "c": Series([1.5, np.nan, 2.5], dtype="Float64"),
-                "d": Series([1.5, 2.0, 2.5], dtype="Float64"),
-                "e": Series([True, False, NA], dtype="boolean"),
-                "f": Series([True, False, True], dtype="boolean"),
-                "g": Series(["a", "b", "c"], dtype=string_dtype),
-                "h": Series(["a", "b", None], dtype=string_dtype),
-            }
-        )
-
-        if dtype_backend == "pyarrow":
-            import pyarrow as pa
-
-            from pandas.arrays import ArrowExtensionArray
-
-            expected = DataFrame(
-                {
-                    col: ArrowExtensionArray(pa.array(expected[col], from_pandas=True))
-                    for col in expected.columns
-                }
-            )
-
-        # the storage of the str columns' Index is also affected by the
-        # string_storage setting -> ignore that for checking the result
-        tm.assert_frame_equal(result, expected, check_column_type=False)
-
-    @pytest.mark.network
-    @pytest.mark.single_cpu
-    def test_banklist_url(self, httpserver, banklist_data, flavor_read_html):
-        with open(banklist_data, encoding="utf-8") as f:
-            httpserver.serve_content(content=f.read())
-            df1 = flavor_read_html(
-                # lxml cannot find attrs leave out for now
-                httpserver.url,
-                match="First Federal Bank of Florida",  # attrs={"class": "dataTable"}
-            )
-            # lxml cannot find attrs leave out for now
-            df2 = flavor_read_html(
-                httpserver.url,
-                match="Metcalf Bank",
-            )  # attrs={"class": "dataTable"})
-
-        assert_framelist_equal(df1, df2)
-
-    @pytest.mark.network
-    @pytest.mark.single_cpu
-    def test_spam_url(self, httpserver, spam_data, flavor_read_html):
-        with open(spam_data, encoding="utf-8") as f:
-            httpserver.serve_content(content=f.read())
-            df1 = flavor_read_html(httpserver.url, match=".*Water.*")
-            df2 = flavor_read_html(httpserver.url, match="Unit")
-
-        assert_framelist_equal(df1, df2)
-
-    @pytest.mark.slow
-    def test_banklist(self, banklist_data, flavor_read_html):
-        df1 = flavor_read_html(
-            banklist_data, match=".*Florida.*", attrs={"id": "table"}
-        )
-        df2 = flavor_read_html(
-            banklist_data, match="Metcalf Bank", attrs={"id": "table"}
-        )
-
-        assert_framelist_equal(df1, df2)
-
-    def test_spam(self, spam_data, flavor_read_html):
-        df1 = flavor_read_html(spam_data, match=".*Water.*")
-        df2 = flavor_read_html(spam_data, match="Unit")
-        assert_framelist_equal(df1, df2)
-
-        assert df1[0].iloc[0, 0] == "Proximates"
-        assert df1[0].columns[0] == "Nutrient"
-
-    def test_spam_no_match(self, spam_data, flavor_read_html):
-        dfs = flavor_read_html(spam_data)
-        for df in dfs:
-            assert isinstance(df, DataFrame)
-
-    def test_banklist_no_match(self, banklist_data, flavor_read_html):
-        dfs = flavor_read_html(banklist_data, attrs={"id": "table"})
-        for df in dfs:
-            assert isinstance(df, DataFrame)
-
-    def test_spam_header(self, spam_data, flavor_read_html):
-        df = flavor_read_html(spam_data, match=".*Water.*", header=2)[0]
-        assert df.columns[0] == "Proximates"
-        assert not df.empty
-
-    def test_skiprows_int(self, spam_data, flavor_read_html):
-        df1 = flavor_read_html(spam_data, match=".*Water.*", skiprows=1)
-        df2 = flavor_read_html(spam_data, match="Unit", skiprows=1)
-
-        assert_framelist_equal(df1, df2)
-
-    def test_skiprows_range(self, spam_data, flavor_read_html):
-        df1 = flavor_read_html(spam_data, match=".*Water.*", skiprows=range(2))
-        df2 = flavor_read_html(spam_data, match="Unit", skiprows=range(2))
-
-        assert_framelist_equal(df1, df2)
-
-    def test_skiprows_list(self, spam_data, flavor_read_html):
-        df1 = flavor_read_html(spam_data, match=".*Water.*", skiprows=[1, 2])
-        df2 = flavor_read_html(spam_data, match="Unit", skiprows=[2, 1])
-
-        assert_framelist_equal(df1, df2)
-
-    def test_skiprows_set(self, spam_data, flavor_read_html):
-        df1 = flavor_read_html(spam_data, match=".*Water.*", skiprows={1, 2})
-        df2 = flavor_read_html(spam_data, match="Unit", skiprows={2, 1})
-
-        assert_framelist_equal(df1, df2)
-
-    def test_skiprows_slice(self, spam_data, flavor_read_html):
-        df1 = flavor_read_html(spam_data, match=".*Water.*", skiprows=1)
-        df2 = flavor_read_html(spam_data, match="Unit", skiprows=1)
-
-        assert_framelist_equal(df1, df2)
-
-    def test_skiprows_slice_short(self, spam_data, flavor_read_html):
-        df1 = flavor_read_html(spam_data, match=".*Water.*", skiprows=slice(2))
-        df2 = flavor_read_html(spam_data, match="Unit", skiprows=slice(2))
-
-        assert_framelist_equal(df1, df2)
-
-    def test_skiprows_slice_long(self, spam_data, flavor_read_html):
-        df1 = flavor_read_html(spam_data, match=".*Water.*", skiprows=slice(2, 5))
-        df2 = flavor_read_html(spam_data, match="Unit", skiprows=slice(4, 1, -1))
-
-        assert_framelist_equal(df1, df2)
-
-    def test_skiprows_ndarray(self, spam_data, flavor_read_html):
-        df1 = flavor_read_html(spam_data, match=".*Water.*", skiprows=np.arange(2))
-        df2 = flavor_read_html(spam_data, match="Unit", skiprows=np.arange(2))
-
-        assert_framelist_equal(df1, df2)
-
-    def test_skiprows_invalid(self, spam_data, flavor_read_html):
-        with pytest.raises(TypeError, match=("is not a valid type for skipping rows")):
-            flavor_read_html(spam_data, match=".*Water.*", skiprows="asdf")
-
-    def test_index(self, spam_data, flavor_read_html):
-        df1 = flavor_read_html(spam_data, match=".*Water.*", index_col=0)
-        df2 = flavor_read_html(spam_data, match="Unit", index_col=0)
-        assert_framelist_equal(df1, df2)
-
-    def test_header_and_index_no_types(self, spam_data, flavor_read_html):
-        df1 = flavor_read_html(spam_data, match=".*Water.*", header=1, index_col=0)
-        df2 = flavor_read_html(spam_data, match="Unit", header=1, index_col=0)
-        assert_framelist_equal(df1, df2)
-
-    def test_header_and_index_with_types(self, spam_data, flavor_read_html):
-        df1 = flavor_read_html(spam_data, match=".*Water.*", header=1, index_col=0)
-        df2 = flavor_read_html(spam_data, match="Unit", header=1, index_col=0)
-        assert_framelist_equal(df1, df2)
-
-    def test_infer_types(self, spam_data, flavor_read_html):
-        # 10892 infer_types removed
-        df1 = flavor_read_html(spam_data, match=".*Water.*", index_col=0)
-        df2 = flavor_read_html(spam_data, match="Unit", index_col=0)
-        assert_framelist_equal(df1, df2)
-
-    def test_string_io(self, spam_data, flavor_read_html):
-        with open(spam_data, encoding="UTF-8") as f:
-            data1 = StringIO(f.read())
-
-        with open(spam_data, encoding="UTF-8") as f:
-            data2 = StringIO(f.read())
-
-        df1 = flavor_read_html(data1, match=".*Water.*")
-        df2 = flavor_read_html(data2, match="Unit")
-        assert_framelist_equal(df1, df2)
-
-    def test_string(self, spam_data, flavor_read_html):
-        with open(spam_data, encoding="UTF-8") as f:
-            data = f.read()
-
-        df1 = flavor_read_html(StringIO(data), match=".*Water.*")
-        df2 = flavor_read_html(StringIO(data), match="Unit")
-
-        assert_framelist_equal(df1, df2)
-
-    def test_file_like(self, spam_data, flavor_read_html):
-        with open(spam_data, encoding="UTF-8") as f:
-            df1 = flavor_read_html(f, match=".*Water.*")
-
-        with open(spam_data, encoding="UTF-8") as f:
-            df2 = flavor_read_html(f, match="Unit")
-
-        assert_framelist_equal(df1, df2)
-
-    @pytest.mark.network
-    @pytest.mark.single_cpu
-    def test_bad_url_protocol(self, httpserver, flavor_read_html):
-        httpserver.serve_content("urlopen error unknown url type: git", code=404)
-        with pytest.raises(URLError, match="urlopen error unknown url type: git"):
-            flavor_read_html("git://github.com", match=".*Water.*")
-
-    @pytest.mark.slow
-    @pytest.mark.network
-    @pytest.mark.single_cpu
-    def test_invalid_url(self, httpserver, flavor_read_html):
-        httpserver.serve_content("Name or service not known", code=404)
-        with pytest.raises((URLError, ValueError), match="HTTP Error 404: NOT FOUND"):
-            flavor_read_html(httpserver.url, match=".*Water.*")
-
-    @pytest.mark.slow
-    def test_file_url(self, banklist_data, flavor_read_html):
-        url = banklist_data
-        dfs = flavor_read_html(
-            file_path_to_url(os.path.abspath(url)), match="First", attrs={"id": "table"}
-        )
-        assert isinstance(dfs, list)
-        for df in dfs:
-            assert isinstance(df, DataFrame)
-
-    @pytest.mark.slow
-    def test_invalid_table_attrs(self, banklist_data, flavor_read_html):
-        url = banklist_data
-        with pytest.raises(ValueError, match="No tables found"):
-            flavor_read_html(
-                url, match="First Federal Bank of Florida", attrs={"id": "tasdfable"}
-            )
-
-    @pytest.mark.slow
-    def test_multiindex_header(self, banklist_data, flavor_read_html):
-        df = flavor_read_html(
-            banklist_data, match="Metcalf", attrs={"id": "table"}, header=[0, 1]
-        )[0]
-        assert isinstance(df.columns, MultiIndex)
-
-    @pytest.mark.slow
-    def test_multiindex_index(self, banklist_data, flavor_read_html):
-        df = flavor_read_html(
-            banklist_data, match="Metcalf", attrs={"id": "table"}, index_col=[0, 1]
-        )[0]
-        assert isinstance(df.index, MultiIndex)
-
-    @pytest.mark.slow
-    def test_multiindex_header_index(self, banklist_data, flavor_read_html):
-        df = flavor_read_html(
-            banklist_data,
-            match="Metcalf",
-            attrs={"id": "table"},
-            header=[0, 1],
-            index_col=[0, 1],
-        )[0]
-        assert isinstance(df.columns, MultiIndex)
-        assert isinstance(df.index, MultiIndex)
-
-    @pytest.mark.slow
-    def test_multiindex_header_skiprows_tuples(self, banklist_data, flavor_read_html):
-        df = flavor_read_html(
-            banklist_data,
-            match="Metcalf",
-            attrs={"id": "table"},
-            header=[0, 1],
-            skiprows=1,
-        )[0]
-        assert isinstance(df.columns, MultiIndex)
-
-    @pytest.mark.slow
-    def test_multiindex_header_skiprows(self, banklist_data, flavor_read_html):
-        df = flavor_read_html(
-            banklist_data,
-            match="Metcalf",
-            attrs={"id": "table"},
-            header=[0, 1],
-            skiprows=1,
-        )[0]
-        assert isinstance(df.columns, MultiIndex)
-
-    @pytest.mark.slow
-    def test_multiindex_header_index_skiprows(self, banklist_data, flavor_read_html):
-        df = flavor_read_html(
-            banklist_data,
-            match="Metcalf",
-            attrs={"id": "table"},
-            header=[0, 1],
-            index_col=[0, 1],
-            skiprows=1,
-        )[0]
-        assert isinstance(df.index, MultiIndex)
-        assert isinstance(df.columns, MultiIndex)
-
-    @pytest.mark.slow
-    def test_regex_idempotency(self, banklist_data, flavor_read_html):
-        url = banklist_data
-        dfs = flavor_read_html(
-            file_path_to_url(os.path.abspath(url)),
-            match=re.compile(re.compile("Florida")),
-            attrs={"id": "table"},
-        )
-        assert isinstance(dfs, list)
-        for df in dfs:
-            assert isinstance(df, DataFrame)
-
-    def test_negative_skiprows(self, spam_data, flavor_read_html):
-        msg = r"\(you passed a negative value\)"
-        with pytest.raises(ValueError, match=msg):
-            flavor_read_html(spam_data, match="Water", skiprows=-1)
-
-    @pytest.fixture
-    def python_docs(self):
-        return """
-          <table class="contentstable" align="center"><tr>
-            <td width="50%">
-            <p class="biglink"><a class="biglink" href="whatsnew/2.7.html">What's new in Python 2.7?</a><br/>
-                <span class="linkdescr">or <a href="whatsnew/index.html">all "What's new" documents</a> since 2.0</span></p>
-            <p class="biglink"><a class="biglink" href="tutorial/index.html">Tutorial</a><br/>
-                <span class="linkdescr">start here</span></p>
-            <p class="biglink"><a class="biglink" href="library/index.html">Library Reference</a><br/>
-                <span class="linkdescr">keep this under your pillow</span></p>
-            <p class="biglink"><a class="biglink" href="reference/index.html">Language Reference</a><br/>
-                <span class="linkdescr">describes syntax and language elements</span></p>
-            <p class="biglink"><a class="biglink" href="using/index.html">Python Setup and Usage</a><br/>
-                <span class="linkdescr">how to use Python on different platforms</span></p>
-            <p class="biglink"><a class="biglink" href="howto/index.html">Python HOWTOs</a><br/>
-                <span class="linkdescr">in-depth documents on specific topics</span></p>
-            </td><td width="50%">
-            <p class="biglink"><a class="biglink" href="installing/index.html">Installing Python Modules</a><br/>
-                <span class="linkdescr">installing from the Python Package Index &amp; other sources</span></p>
-            <p class="biglink"><a class="biglink" href="distributing/index.html">Distributing Python Modules</a><br/>
-                <span class="linkdescr">publishing modules for installation by others</span></p>
-            <p class="biglink"><a class="biglink" href="extending/index.html">Extending and Embedding</a><br/>
-                <span class="linkdescr">tutorial for C/C++ programmers</span></p>
-            <p class="biglink"><a class="biglink" href="c-api/index.html">Python/C API</a><br/>
-                <span class="linkdescr">reference for C/C++ programmers</span></p>
-            <p class="biglink"><a class="biglink" href="faq/index.html">FAQs</a><br/>
-                <span class="linkdescr">frequently asked questions (with answers!)</span></p>
-            </td></tr>
-        </table>
-
-        <p><strong>Indices and tables:</strong></p>
-        <table class="contentstable" align="center"><tr>
-            <td width="50%">
-            <p class="biglink"><a class="biglink" href="py-modindex.html">Python Global Module Index</a><br/>
-                <span class="linkdescr">quick access to all modules</span></p>
-            <p class="biglink"><a class="biglink" href="genindex.html">General Index</a><br/>
-                <span class="linkdescr">all functions, classes, terms</span></p>
-            <p class="biglink"><a class="biglink" href="glossary.html">Glossary</a><br/>
-                <span class="linkdescr">the most important terms explained</span></p>
-            </td><td width="50%">
-            <p class="biglink"><a class="biglink" href="search.html">Search page</a><br/>
-                <span class="linkdescr">search this documentation</span></p>
-            <p class="biglink"><a class="biglink" href="contents.html">Complete Table of Contents</a><br/>
-                <span class="linkdescr">lists all sections and subsections</span></p>
-            </td></tr>
-        </table>
-        """  # noqa: E501
-
-    @pytest.mark.network
-    @pytest.mark.single_cpu
-    def test_multiple_matches(self, python_docs, httpserver, flavor_read_html):
-        httpserver.serve_content(content=python_docs)
-        dfs = flavor_read_html(httpserver.url, match="Python")
-        assert len(dfs) > 1
-
-    @pytest.mark.network
-    @pytest.mark.single_cpu
-    def test_python_docs_table(self, python_docs, httpserver, flavor_read_html):
-        httpserver.serve_content(content=python_docs)
-        dfs = flavor_read_html(httpserver.url, match="Python")
-        zz = [df.iloc[0, 0][0:4] for df in dfs]
-        assert sorted(zz) == ["Pyth", "What"]
-
-    def test_empty_tables(self, flavor_read_html):
-        """
-        Make sure that read_html ignores empty tables.
-        """
-        html = """
-            <table>
-                <thead>
-                    <tr>
-                        <th>A</th>
-                        <th>B</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    <tr>
-                        <td>1</td>
-                        <td>2</td>
-                    </tr>
-                </tbody>
-            </table>
-            <table>
-                <tbody>
-                </tbody>
-            </table>
-        """
-        result = flavor_read_html(StringIO(html))
-        assert len(result) == 1
-
-    def test_multiple_tbody(self, flavor_read_html):
-        # GH-20690
-        # Read all tbody tags within a single table.
-        result = flavor_read_html(
-            StringIO(
-                """<table>
-            <thead>
-                <tr>
-                    <th>A</th>
-                    <th>B</th>
-                </tr>
-            </thead>
-            <tbody>
-                <tr>
-                    <td>1</td>
-                    <td>2</td>
-                </tr>
-            </tbody>
-            <tbody>
-                <tr>
-                    <td>3</td>
-                    <td>4</td>
-                </tr>
-            </tbody>
-        </table>"""
-            )
-        )[0]
-
-        expected = DataFrame(data=[[1, 2], [3, 4]], columns=["A", "B"])
-
-        tm.assert_frame_equal(result, expected)
-
-    def test_header_and_one_column(self, flavor_read_html):
-        """
-        Don't fail with bs4 when there is a header and only one column
-        as described in issue #9178
-        """
-        result = flavor_read_html(
-            StringIO(
-                """<table>
-                <thead>
-                    <tr>
-                        <th>Header</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    <tr>
-                        <td>first</td>
-                    </tr>
-                </tbody>
-            </table>"""
-            )
-        )[0]
-
-        expected = DataFrame(data={"Header": "first"}, index=[0])
-
-        tm.assert_frame_equal(result, expected)
-
-    def test_thead_without_tr(self, flavor_read_html):
-        """
-        Ensure parser adds <tr> within <thead> on malformed HTML.
-        """
-        result = flavor_read_html(
-            StringIO(
-                """<table>
-            <thead>
-                <tr>
-                    <th>Country</th>
-                    <th>Municipality</th>
-                    <th>Year</th>
-                </tr>
-            </thead>
-            <tbody>
-                <tr>
-                    <td>Ukraine</td>
-                    <th>Odessa</th>
-                    <td>1944</td>
-                </tr>
-            </tbody>
-        </table>"""
-            )
-        )[0]
-
-        expected = DataFrame(
-            data=[["Ukraine", "Odessa", 1944]],
-            columns=["Country", "Municipality", "Year"],
-        )
-
-        tm.assert_frame_equal(result, expected)
-
-    def test_tfoot_read(self, flavor_read_html):
-        """
-        Make sure that read_html reads tfoot, containing td or th.
-        Ignores empty tfoot
-        """
-        data_template = """<table>
-            <thead>
-                <tr>
-                    <th>A</th>
-                    <th>B</th>
-                </tr>
-            </thead>
-            <tbody>
-                <tr>
-                    <td>bodyA</td>
-                    <td>bodyB</td>
-                </tr>
-            </tbody>
-            <tfoot>
-                {footer}
-            </tfoot>
-        </table>"""
-
-        expected1 = DataFrame(data=[["bodyA", "bodyB"]], columns=["A", "B"])
-
-        expected2 = DataFrame(
-            data=[["bodyA", "bodyB"], ["footA", "footB"]], columns=["A", "B"]
-        )
-
-        data1 = data_template.format(footer="")
-        data2 = data_template.format(footer="<tr><td>footA</td><th>footB</th></tr>")
-
-        result1 = flavor_read_html(StringIO(data1))[0]
-        result2 = flavor_read_html(StringIO(data2))[0]
-
-        tm.assert_frame_equal(result1, expected1)
-        tm.assert_frame_equal(result2, expected2)
-
-    def test_parse_header_of_non_string_column(self, flavor_read_html):
-        # GH5048: if header is specified explicitly, an int column should be
-        # parsed as int while its header is parsed as str
-        result = flavor_read_html(
-            StringIO(
-                """
-            <table>
-                <tr>
-                    <td>S</td>
-                    <td>I</td>
-                </tr>
-                <tr>
-                    <td>text</td>
-                    <td>1944</td>
-                </tr>
-            </table>
-        """
-            ),
-            header=0,
-        )[0]
-
-        expected = DataFrame([["text", 1944]], columns=("S", "I"))
-
-        tm.assert_frame_equal(result, expected)
-
-    @pytest.mark.slow
-    def test_banklist_header(self, banklist_data, datapath, flavor_read_html):
-        from pandas.io.html import _remove_whitespace
-
-        def try_remove_ws(x):
-            try:
-                return _remove_whitespace(x)
-            except AttributeError:
-                return x
-
-        df = flavor_read_html(banklist_data, match="Metcalf", attrs={"id": "table"})[0]
-        ground_truth = read_csv(
-            datapath("io", "data", "csv", "banklist.csv"),
-            converters={"Updated Date": Timestamp, "Closing Date": Timestamp},
-        )
-        assert df.shape == ground_truth.shape
-        old = [
-            "First Vietnamese American Bank In Vietnamese",
-            "Westernbank Puerto Rico En Espanol",
-            "R-G Premier Bank of Puerto Rico En Espanol",
-            "Eurobank En Espanol",
-            "Sanderson State Bank En Espanol",
-            "Washington Mutual Bank (Including its subsidiary Washington "
-            "Mutual Bank FSB)",
-            "Silver State Bank En Espanol",
-            "AmTrade International Bank En Espanol",
-            "Hamilton Bank, NA En Espanol",
-            "The Citizens Savings Bank Pioneer Community Bank, Inc.",
-        ]
-        new = [
-            "First Vietnamese American Bank",
-            "Westernbank Puerto Rico",
-            "R-G Premier Bank of Puerto Rico",
-            "Eurobank",
-            "Sanderson State Bank",
-            "Washington Mutual Bank",
-            "Silver State Bank",
-            "AmTrade International Bank",
-            "Hamilton Bank, NA",
-            "The Citizens Savings Bank",
-        ]
-        dfnew = df.map(try_remove_ws).replace(old, new)
-        gtnew = ground_truth.map(try_remove_ws)
-        converted = dfnew
-        date_cols = ["Closing Date", "Updated Date"]
-        converted[date_cols] = converted[date_cols].apply(to_datetime)
-        tm.assert_frame_equal(converted, gtnew)
-
-    @pytest.mark.slow
-    def test_gold_canyon(self, banklist_data, flavor_read_html):
-        gc = "Gold Canyon"
-        with open(banklist_data, encoding="utf-8") as f:
-            raw_text = f.read()
-
-        assert gc in raw_text
-        df = flavor_read_html(
-            banklist_data, match="Gold Canyon", attrs={"id": "table"}
-        )[0]
-        assert gc in df.to_string()
-
-    def test_different_number_of_cols(self, flavor_read_html):
-        expected = flavor_read_html(
-            StringIO(
-                """<table>
-                        <thead>
-                            <tr style="text-align: right;">
-                            <th></th>
-                            <th>C_l0_g0</th>
-                            <th>C_l0_g1</th>
-                            <th>C_l0_g2</th>
-                            <th>C_l0_g3</th>
-                            <th>C_l0_g4</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            <tr>
-                            <th>R_l0_g0</th>
-                            <td> 0.763</td>
-                            <td> 0.233</td>
-                            <td> nan</td>
-                            <td> nan</td>
-                            <td> nan</td>
-                            </tr>
-                            <tr>
-                            <th>R_l0_g1</th>
-                            <td> 0.244</td>
-                            <td> 0.285</td>
-                            <td> 0.392</td>
-                            <td> 0.137</td>
-                            <td> 0.222</td>
-                            </tr>
-                        </tbody>
-                    </table>"""
-            ),
-            index_col=0,
-        )[0]
-
-        result = flavor_read_html(
-            StringIO(
-                """<table>
-                    <thead>
-                        <tr style="text-align: right;">
-                        <th></th>
-                        <th>C_l0_g0</th>
-                        <th>C_l0_g1</th>
-                        <th>C_l0_g2</th>
-                        <th>C_l0_g3</th>
-                        <th>C_l0_g4</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        <tr>
-                        <th>R_l0_g0</th>
-                        <td> 0.763</td>
-                        <td> 0.233</td>
-                        </tr>
-                        <tr>
-                        <th>R_l0_g1</th>
-                        <td> 0.244</td>
-                        <td> 0.285</td>
-                        <td> 0.392</td>
-                        <td> 0.137</td>
-                        <td> 0.222</td>
-                        </tr>
-                    </tbody>
-                 </table>"""
-            ),
-            index_col=0,
-        )[0]
-
-        tm.assert_frame_equal(result, expected)
-
-    def test_colspan_rowspan_1(self, flavor_read_html):
-        # GH17054
-        result = flavor_read_html(
-            StringIO(
-                """
-            <table>
-                <tr>
-                    <th>A</th>
-                    <th colspan="1">B</th>
-                    <th rowspan="1">C</th>
-                </tr>
-                <tr>
-                    <td>a</td>
-                    <td>b</td>
-                    <td>c</td>
-                </tr>
-            </table>
-        """
-            )
-        )[0]
-
-        expected = DataFrame([["a", "b", "c"]], columns=["A", "B", "C"])
-
-        tm.assert_frame_equal(result, expected)
-
-    def test_colspan_rowspan_copy_values(self, flavor_read_html):
-        # GH17054
-
-        # In ASCII, with lowercase letters being copies:
-        #
-        # X x Y Z W
-        # A B b z C
-
-        result = flavor_read_html(
-            StringIO(
-                """
-            <table>
-                <tr>
-                    <td colspan="2">X</td>
-                    <td>Y</td>
-                    <td rowspan="2">Z</td>
-                    <td>W</td>
-                </tr>
-                <tr>
-                    <td>A</td>
-                    <td colspan="2">B</td>
-                    <td>C</td>
-                </tr>
-            </table>
-        """
-            ),
-            header=0,
-        )[0]
-
-        expected = DataFrame(
-            data=[["A", "B", "B", "Z", "C"]], columns=["X", "X.1", "Y", "Z", "W"]
-        )
-
-        tm.assert_frame_equal(result, expected)
-
-    def test_colspan_rowspan_both_not_1(self, flavor_read_html):
-        # GH17054
-
-        # In ASCII, with lowercase letters being copies:
-        #
-        # A B b b C
-        # a b b b D
-
-        result = flavor_read_html(
-            StringIO(
-                """
-            <table>
-                <tr>
-                    <td rowspan="2">A</td>
-                    <td rowspan="2" colspan="3">B</td>
-                    <td>C</td>
-                </tr>
-                <tr>
-                    <td>D</td>
-                </tr>
-            </table>
-        """
-            ),
-            header=0,
-        )[0]
-
-        expected = DataFrame(
-            data=[["A", "B", "B", "B", "D"]], columns=["A", "B", "B.1", "B.2", "C"]
-        )
-
-        tm.assert_frame_equal(result, expected)
-
-    def test_rowspan_at_end_of_row(self, flavor_read_html):
-        # GH17054
-
-        # In ASCII, with lowercase letters being copies:
-        #
-        # A B
-        # C b
-
-        result = flavor_read_html(
-            StringIO(
-                """
-            <table>
-                <tr>
-                    <td>A</td>
-                    <td rowspan="2">B</td>
-                </tr>
-                <tr>
-                    <td>C</td>
-                </tr>
-            </table>
-        """
-            ),
-            header=0,
-        )[0]
-
-        expected = DataFrame(data=[["C", "B"]], columns=["A", "B"])
-
-        tm.assert_frame_equal(result, expected)
-
-    def test_rowspan_only_rows(self, flavor_read_html):
-        # GH17054
-
-        result = flavor_read_html(
-            StringIO(
-                """
-            <table>
-                <tr>
-                    <td rowspan="3">A</td>
-                    <td rowspan="3">B</td>
-                </tr>
-            </table>
-        """
-            ),
-            header=0,
-        )[0]
-
-        expected = DataFrame(data=[["A", "B"], ["A", "B"]], columns=["A", "B"])
-
-        tm.assert_frame_equal(result, expected)
-
-    def test_header_inferred_from_rows_with_only_th(self, flavor_read_html):
-        # GH17054
-        result = flavor_read_html(
-            StringIO(
-                """
-            <table>
-                <tr>
-                    <th>A</th>
-                    <th>B</th>
-                </tr>
-                <tr>
-                    <th>a</th>
-                    <th>b</th>
-                </tr>
-                <tr>
-                    <td>1</td>
-                    <td>2</td>
-                </tr>
-            </table>
-        """
-            )
-        )[0]
-
-        columns = MultiIndex(levels=[["A", "B"], ["a", "b"]], codes=[[0, 1], [0, 1]])
-        expected = DataFrame(data=[[1, 2]], columns=columns)
-
-        tm.assert_frame_equal(result, expected)
-
-    def test_parse_dates_list(self, flavor_read_html):
-        df = DataFrame({"date": date_range("1/1/2001", periods=10)})
-        expected = df.to_html()
-        res = flavor_read_html(StringIO(expected), parse_dates=[1], index_col=0)
-        tm.assert_frame_equal(df, res[0])
-        res = flavor_read_html(StringIO(expected), parse_dates=["date"], index_col=0)
-        tm.assert_frame_equal(df, res[0])
-
-    def test_parse_dates_combine(self, flavor_read_html):
-        raw_dates = Series(date_range("1/1/2001", periods=10))
-        df = DataFrame(
-            {
-                "date": raw_dates.map(lambda x: str(x.date())),
-                "time": raw_dates.map(lambda x: str(x.time())),
-            }
-        )
-        res = flavor_read_html(
-            StringIO(df.to_html()), parse_dates={"datetime": [1, 2]}, index_col=1
-        )
-        newdf = DataFrame({"datetime": raw_dates})
-        tm.assert_frame_equal(newdf, res[0])
-
-    def test_wikipedia_states_table(self, datapath, flavor_read_html):
-        data = datapath("io", "data", "html", "wikipedia_states.html")
-        assert os.path.isfile(data), f"{repr(data)} is not a file"
-        assert os.path.getsize(data), f"{repr(data)} is an empty file"
-        result = flavor_read_html(data, match="Arizona", header=1)[0]
-        assert result.shape == (60, 12)
-        assert "Unnamed" in result.columns[-1]
-        assert result["sq mi"].dtype == np.dtype("float64")
-        assert np.allclose(result.loc[0, "sq mi"], 665384.04)
-
-    def test_wikipedia_states_multiindex(self, datapath, flavor_read_html):
-        data = datapath("io", "data", "html", "wikipedia_states.html")
-        result = flavor_read_html(data, match="Arizona", index_col=0)[0]
-        assert result.shape == (60, 11)
-        assert "Unnamed" in result.columns[-1][1]
-        assert result.columns.nlevels == 2
-        assert np.allclose(result.loc["Alaska", ("Total area[2]", "sq mi")], 665384.04)
-
-    def test_parser_error_on_empty_header_row(self, flavor_read_html):
-        result = flavor_read_html(
-            StringIO(
-                """
-                <table>
-                    <thead>
-                        <tr><th></th><th></tr>
-                        <tr><th>A</th><th>B</th></tr>
-                    </thead>
-                    <tbody>
-                        <tr><td>a</td><td>b</td></tr>
-                    </tbody>
-                </table>
-            """
-            ),
-            header=[0, 1],
-        )
-        expected = DataFrame(
-            [["a", "b"]],
-            columns=MultiIndex.from_tuples(
-                [("Unnamed: 0_level_0", "A"), ("Unnamed: 1_level_0", "B")]
-            ),
-        )
-        tm.assert_frame_equal(result[0], expected)
-
-    def test_decimal_rows(self, flavor_read_html):
-        # GH 12907
-        result = flavor_read_html(
-            StringIO(
-                """<html>
-            <body>
-             <table>
-                <thead>
-                    <tr>
-                        <th>Header</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    <tr>
-                        <td>1100#101</td>
-                    </tr>
-                </tbody>
-            </table>
-            </body>
-        </html>"""
-            ),
-            decimal="#",
-        )[0]
-
-        expected = DataFrame(data={"Header": 1100.101}, index=[0])
-
-        assert result["Header"].dtype == np.dtype("float64")
-        tm.assert_frame_equal(result, expected)
-
-    @pytest.mark.parametrize("arg", [True, False])
-    def test_bool_header_arg(self, spam_data, arg, flavor_read_html):
-        # GH 6114
-        msg = re.escape(
-            "Passing a bool to header is invalid. Use header=None for no header or "
-            "header=int or list-like of ints to specify the row(s) making up the "
-            "column names"
-        )
-        with pytest.raises(TypeError, match=msg):
-            flavor_read_html(spam_data, header=arg)
-
-    def test_converters(self, flavor_read_html):
-        # GH 13461
-        result = flavor_read_html(
-            StringIO(
-                """<table>
-                 <thead>
-                   <tr>
-                     <th>a</th>
-                    </tr>
-                 </thead>
-                 <tbody>
-                   <tr>
-                     <td> 0.763</td>
-                   </tr>
-                   <tr>
-                     <td> 0.244</td>
-                   </tr>
-                 </tbody>
-               </table>"""
-            ),
-            converters={"a": str},
-        )[0]
-
-        expected = DataFrame({"a": ["0.763", "0.244"]})
-
-        tm.assert_frame_equal(result, expected)
-
-    def test_na_values(self, flavor_read_html):
-        # GH 13461
-        result = flavor_read_html(
-            StringIO(
-                """<table>
-                 <thead>
-                   <tr>
-                     <th>a</th>
-                   </tr>
-                 </thead>
-                 <tbody>
-                   <tr>
-                     <td> 0.763</td>
-                   </tr>
-                   <tr>
-                     <td> 0.244</td>
-                   </tr>
-                 </tbody>
-               </table>"""
-            ),
-            na_values=[0.244],
-        )[0]
-
-        expected = DataFrame({"a": [0.763, np.nan]})
-
-        tm.assert_frame_equal(result, expected)
-
-    def test_keep_default_na(self, flavor_read_html):
-        html_data = """<table>
-                        <thead>
-                            <tr>
-                            <th>a</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            <tr>
-                            <td> N/A</td>
-                            </tr>
-                            <tr>
-                            <td> NA</td>
-                            </tr>
-                        </tbody>
-                    </table>"""
-
-        expected_df = DataFrame({"a": ["N/A", "NA"]})
-        html_df = flavor_read_html(StringIO(html_data), keep_default_na=False)[0]
-        tm.assert_frame_equal(expected_df, html_df)
-
-        expected_df = DataFrame({"a": [np.nan, np.nan]})
-        html_df = flavor_read_html(StringIO(html_data), keep_default_na=True)[0]
-        tm.assert_frame_equal(expected_df, html_df)
-
-    def test_preserve_empty_rows(self, flavor_read_html):
-        result = flavor_read_html(
-            StringIO(
-                """
-            <table>
-                <tr>
-                    <th>A</th>
-                    <th>B</th>
-                </tr>
-                <tr>
-                    <td>a</td>
-                    <td>b</td>
-                </tr>
-                <tr>
-                    <td></td>
-                    <td></td>
-                </tr>
-            </table>
-        """
-            )
-        )[0]
-
-        expected = DataFrame(data=[["a", "b"], [np.nan, np.nan]], columns=["A", "B"])
-
-        tm.assert_frame_equal(result, expected)
-
-    def test_ignore_empty_rows_when_inferring_header(self, flavor_read_html):
-        result = flavor_read_html(
-            StringIO(
-                """
-            <table>
-                <thead>
-                    <tr><th></th><th></tr>
-                    <tr><th>A</th><th>B</th></tr>
-                    <tr><th>a</th><th>b</th></tr>
-                </thead>
-                <tbody>
-                    <tr><td>1</td><td>2</td></tr>
-                </tbody>
-            </table>
-        """
-            )
-        )[0]
-
-        columns = MultiIndex(levels=[["A", "B"], ["a", "b"]], codes=[[0, 1], [0, 1]])
-        expected = DataFrame(data=[[1, 2]], columns=columns)
-
-        tm.assert_frame_equal(result, expected)
-
-    def test_multiple_header_rows(self, flavor_read_html):
-        # Issue #13434
-        expected_df = DataFrame(
-            data=[("Hillary", 68, "D"), ("Bernie", 74, "D"), ("Donald", 69, "R")]
-        )
-        expected_df.columns = [
-            ["Unnamed: 0_level_0", "Age", "Party"],
-            ["Name", "Unnamed: 1_level_1", "Unnamed: 2_level_1"],
-        ]
-        html = expected_df.to_html(index=False)
-        html_df = flavor_read_html(StringIO(html))[0]
-        tm.assert_frame_equal(expected_df, html_df)
-
-    def test_works_on_valid_markup(self, datapath, flavor_read_html):
-        filename = datapath("io", "data", "html", "valid_markup.html")
-        dfs = flavor_read_html(filename, index_col=0)
-        assert isinstance(dfs, list)
-        assert isinstance(dfs[0], DataFrame)
-
-    @pytest.mark.slow
-    def test_fallback_success(self, datapath, flavor_read_html):
-        banklist_data = datapath("io", "data", "html", "banklist.html")
-
-        flavor_read_html(banklist_data, match=".*Water.*", flavor=["lxml", "html5lib"])
-
-    def test_to_html_timestamp(self):
-        rng = date_range("2000-01-01", periods=10)
-        df = DataFrame(np.random.default_rng(2).standard_normal((10, 4)), index=rng)
-
-        result = df.to_html()
-        assert "2000-01-01" in result
-
-    def test_to_html_borderless(self):
-        df = DataFrame([{"A": 1, "B": 2}])
-        out_border_default = df.to_html()
-        out_border_true = df.to_html(border=True)
-        out_border_explicit_default = df.to_html(border=1)
-        out_border_nondefault = df.to_html(border=2)
-        out_border_zero = df.to_html(border=0)
-
-        out_border_false = df.to_html(border=False)
-
-        assert ' border="1"' in out_border_default
-        assert out_border_true == out_border_default
-        assert out_border_default == out_border_explicit_default
-        assert out_border_default != out_border_nondefault
-        assert ' border="2"' in out_border_nondefault
-        assert ' border="0"' not in out_border_zero
-        assert " border" not in out_border_false
-        assert out_border_zero == out_border_false
-
-    @pytest.mark.parametrize(
-        "displayed_only,exp0,exp1",
-        [
-            (True, DataFrame(["foo"]), None),
-            (False, DataFrame(["foo  bar  baz  qux"]), DataFrame(["foo"])),
-        ],
+def test_rendered_links(type, text, exp, found):
+    if type == "data":
+        df = DataFrame([text])
+        styler = df.style.format(hyperlinks="html")
+    else:
+        df = DataFrame([0], index=[text])
+        styler = df.style.format_index(hyperlinks="html")
+
+    rendered = f'<a href="{found}" target="_blank">{found}</a>'
+    result = styler.to_html()
+    assert (rendered in result) is exp
+    assert (text in result) is not exp  # test conversion done when expected and not
+
+
+def test_multiple_rendered_links():
+    links = ("www.a.b", "http://a.c", "https://a.d", "ftp://a.e")
+    # pylint: disable-next=consider-using-f-string
+    df = DataFrame(["text {} {} text {} {}".format(*links)])
+    result = df.style.format(hyperlinks="html").to_html()
+    href = '<a href="{0}" target="_blank">{0}</a>'
+    for link in links:
+        assert href.format(link) in result
+    assert href.format("text") not in result
+
+
+def test_concat(styler):
+    other = styler.data.agg(["mean"]).style
+    styler.concat(other).set_uuid("X")
+    result = styler.to_html()
+    fp = "foot0_"
+    expected = dedent(
+        f"""\
+    <tr>
+      <th id="T_X_level0_row1" class="row_heading level0 row1" >b</th>
+      <td id="T_X_row1_col0" class="data row1 col0" >2.690000</td>
+    </tr>
+    <tr>
+      <th id="T_X_level0_{fp}row0" class="{fp}row_heading level0 {fp}row0" >mean</th>
+      <td id="T_X_{fp}row0_col0" class="{fp}data {fp}row0 col0" >2.650000</td>
+    </tr>
+  </tbody>
+</table>
+    """
     )
-    def test_displayed_only(self, displayed_only, exp0, exp1, flavor_read_html):
-        # GH 20027
-        data = """<html>
-          <body>
-            <table>
-              <tr>
-                <td>
-                  foo
-                  <span style="display:none;text-align:center">bar</span>
-                  <span style="display:none">baz</span>
-                  <span style="display: none">qux</span>
-                </td>
-              </tr>
-            </table>
-            <table style="display: none">
-              <tr>
-                <td>foo</td>
-              </tr>
-            </table>
-          </body>
-        </html>"""
+    assert expected in result
 
-        dfs = flavor_read_html(StringIO(data), displayed_only=displayed_only)
-        tm.assert_frame_equal(dfs[0], exp0)
 
-        if exp1 is not None:
-            tm.assert_frame_equal(dfs[1], exp1)
-        else:
-            assert len(dfs) == 1  # Should not parse hidden table
-
-    @pytest.mark.parametrize("displayed_only", [True, False])
-    def test_displayed_only_with_many_elements(self, displayed_only, flavor_read_html):
-        html_table = """
-        <table>
-            <tr>
-                <th>A</th>
-                <th>B</th>
-            </tr>
-            <tr>
-                <td>1</td>
-                <td>2</td>
-            </tr>
-            <tr>
-                <td><span style="display:none"></span>4</td>
-                <td>5</td>
-            </tr>
-        </table>
-        """
-        result = flavor_read_html(StringIO(html_table), displayed_only=displayed_only)[
-            0
-        ]
-        expected = DataFrame({"A": [1, 4], "B": [2, 5]})
-        tm.assert_frame_equal(result, expected)
-
-    @td.skip_if_windows()
-    @pytest.mark.filterwarnings(
-        "ignore:You provided Unicode markup but also provided a value for "
-        "from_encoding.*:UserWarning"
+def test_concat_recursion(styler):
+    df = styler.data
+    styler1 = styler
+    styler2 = Styler(df.agg(["mean"]), precision=3)
+    styler3 = Styler(df.agg(["mean"]), precision=4)
+    styler1.concat(styler2.concat(styler3)).set_uuid("X")
+    result = styler.to_html()
+    # notice that the second concat (last <tr> of the output html),
+    # there are two `foot_` in the id and class
+    fp1 = "foot0_"
+    fp2 = "foot0_foot0_"
+    expected = dedent(
+        f"""\
+    <tr>
+      <th id="T_X_level0_row1" class="row_heading level0 row1" >b</th>
+      <td id="T_X_row1_col0" class="data row1 col0" >2.690000</td>
+    </tr>
+    <tr>
+      <th id="T_X_level0_{fp1}row0" class="{fp1}row_heading level0 {fp1}row0" >mean</th>
+      <td id="T_X_{fp1}row0_col0" class="{fp1}data {fp1}row0 col0" >2.650</td>
+    </tr>
+    <tr>
+      <th id="T_X_level0_{fp2}row0" class="{fp2}row_heading level0 {fp2}row0" >mean</th>
+      <td id="T_X_{fp2}row0_col0" class="{fp2}data {fp2}row0 col0" >2.6500</td>
+    </tr>
+  </tbody>
+</table>
+    """
     )
-    def test_encode(self, html_encoding_file, flavor_read_html):
-        base_path = os.path.basename(html_encoding_file)
-        root = os.path.splitext(base_path)[0]
-        _, encoding = root.split("_")
+    assert expected in result
 
-        try:
-            with open(html_encoding_file, "rb") as fobj:
-                from_string = flavor_read_html(
-                    fobj.read(), encoding=encoding, index_col=0
-                ).pop()
 
-            with open(html_encoding_file, "rb") as fobj:
-                from_file_like = flavor_read_html(
-                    BytesIO(fobj.read()), encoding=encoding, index_col=0
-                ).pop()
+def test_concat_chain(styler):
+    df = styler.data
+    styler1 = styler
+    styler2 = Styler(df.agg(["mean"]), precision=3)
+    styler3 = Styler(df.agg(["mean"]), precision=4)
+    styler1.concat(styler2).concat(styler3).set_uuid("X")
+    result = styler.to_html()
+    fp1 = "foot0_"
+    fp2 = "foot1_"
+    expected = dedent(
+        f"""\
+    <tr>
+      <th id="T_X_level0_row1" class="row_heading level0 row1" >b</th>
+      <td id="T_X_row1_col0" class="data row1 col0" >2.690000</td>
+    </tr>
+    <tr>
+      <th id="T_X_level0_{fp1}row0" class="{fp1}row_heading level0 {fp1}row0" >mean</th>
+      <td id="T_X_{fp1}row0_col0" class="{fp1}data {fp1}row0 col0" >2.650</td>
+    </tr>
+    <tr>
+      <th id="T_X_level0_{fp2}row0" class="{fp2}row_heading level0 {fp2}row0" >mean</th>
+      <td id="T_X_{fp2}row0_col0" class="{fp2}data {fp2}row0 col0" >2.6500</td>
+    </tr>
+  </tbody>
+</table>
+    """
+    )
+    assert expected in result
 
-            from_filename = flavor_read_html(
-                html_encoding_file, encoding=encoding, index_col=0
-            ).pop()
-            tm.assert_frame_equal(from_string, from_file_like)
-            tm.assert_frame_equal(from_string, from_filename)
-        except Exception:
-            # seems utf-16/32 fail on windows
-            if is_platform_windows():
-                if "16" in encoding or "32" in encoding:
-                    pytest.skip()
-            raise
 
-    def test_parse_failure_unseekable(self, flavor_read_html):
-        # Issue #17975
-
-        if flavor_read_html.keywords.get("flavor") == "lxml":
-            pytest.skip("Not applicable for lxml")
-
-        class UnseekableStringIO(StringIO):
-            def seekable(self):
-                return False
-
-        bad = UnseekableStringIO(
-            """
-            <table><tr><td>spam<foobr />eggs</td></tr></table>"""
+def test_concat_combined():
+    def html_lines(foot_prefix: str):
+        assert foot_prefix.endswith("_") or foot_prefix == ""
+        fp = foot_prefix
+        return indent(
+            dedent(
+                f"""\
+        <tr>
+          <th id="T_X_level0_{fp}row0" class="{fp}row_heading level0 {fp}row0" >a</th>
+          <td id="T_X_{fp}row0_col0" class="{fp}data {fp}row0 col0" >2.610000</td>
+        </tr>
+        <tr>
+          <th id="T_X_level0_{fp}row1" class="{fp}row_heading level0 {fp}row1" >b</th>
+          <td id="T_X_{fp}row1_col0" class="{fp}data {fp}row1 col0" >2.690000</td>
+        </tr>
+        """
+            ),
+            prefix=" " * 4,
         )
 
-        assert flavor_read_html(bad)
+    df = DataFrame([[2.61], [2.69]], index=["a", "b"], columns=["A"])
+    s1 = df.style.highlight_max(color="red")
+    s2 = df.style.highlight_max(color="green")
+    s3 = df.style.highlight_max(color="blue")
+    s4 = df.style.highlight_max(color="yellow")
 
-        with pytest.raises(ValueError, match="passed a non-rewindable file object"):
-            flavor_read_html(bad)
-
-    def test_parse_failure_rewinds(self, flavor_read_html):
-        # Issue #17975
-
-        class MockFile:
-            def __init__(self, data) -> None:
-                self.data = data
-                self.at_end = False
-
-            def read(self, size=None):
-                data = "" if self.at_end else self.data
-                self.at_end = True
-                return data
-
-            def seek(self, offset):
-                self.at_end = False
-
-            def seekable(self):
-                return True
-
-            # GH 49036 pylint checks for presence of __next__ for iterators
-            def __next__(self):
-                ...
-
-            def __iter__(self) -> Iterator:
-                # `is_file_like` depends on the presence of
-                # the __iter__ attribute.
-                return self
-
-        good = MockFile("<table><tr><td>spam<br />eggs</td></tr></table>")
-        bad = MockFile("<table><tr><td>spam<foobr />eggs</td></tr></table>")
-
-        assert flavor_read_html(good)
-        assert flavor_read_html(bad)
-
-    @pytest.mark.slow
-    @pytest.mark.single_cpu
-    def test_importcheck_thread_safety(self, datapath, flavor_read_html):
-        # see gh-16928
-
-        class ErrorThread(threading.Thread):
-            def run(self):
-                try:
-                    super().run()
-                except Exception as err:
-                    self.err = err
-                else:
-                    self.err = None
-
-        filename = datapath("io", "data", "html", "valid_markup.html")
-        helper_thread1 = ErrorThread(target=flavor_read_html, args=(filename,))
-        helper_thread2 = ErrorThread(target=flavor_read_html, args=(filename,))
-
-        helper_thread1.start()
-        helper_thread2.start()
-
-        while helper_thread1.is_alive() or helper_thread2.is_alive():
-            pass
-        assert None is helper_thread1.err is helper_thread2.err
-
-    def test_parse_path_object(self, datapath, flavor_read_html):
-        # GH 37705
-        file_path_string = datapath("io", "data", "html", "spam.html")
-        file_path = Path(file_path_string)
-        df1 = flavor_read_html(file_path_string)[0]
-        df2 = flavor_read_html(file_path)[0]
-        tm.assert_frame_equal(df1, df2)
-
-    def test_parse_br_as_space(self, flavor_read_html):
-        # GH 29528: pd.read_html() convert <br> to space
-        result = flavor_read_html(
-            StringIO(
-                """
-            <table>
-                <tr>
-                    <th>A</th>
-                </tr>
-                <tr>
-                    <td>word1<br>word2</td>
-                </tr>
-            </table>
-        """
-            )
-        )[0]
-
-        expected = DataFrame(data=[["word1 word2"]], columns=["A"])
-
-        tm.assert_frame_equal(result, expected)
-
-    @pytest.mark.parametrize("arg", ["all", "body", "header", "footer"])
-    def test_extract_links(self, arg, flavor_read_html):
-        gh_13141_data = """
-          <table>
-            <tr>
-              <th>HTTP</th>
-              <th>FTP</th>
-              <th><a href="https://en.wiktionary.org/wiki/linkless">Linkless</a></th>
-            </tr>
-            <tr>
-              <td><a href="https://en.wikipedia.org/">Wikipedia</a></td>
-              <td>SURROUNDING <a href="ftp://ftp.us.debian.org/">Debian</a> TEXT</td>
-              <td>Linkless</td>
-            </tr>
-            <tfoot>
-              <tr>
-                <td><a href="https://en.wikipedia.org/wiki/Page_footer">Footer</a></td>
-                <td>
-                  Multiple <a href="1">links:</a> <a href="2">Only first captured.</a>
-                </td>
-              </tr>
-            </tfoot>
-          </table>
-          """
-
-        gh_13141_expected = {
-            "head_ignore": ["HTTP", "FTP", "Linkless"],
-            "head_extract": [
-                ("HTTP", None),
-                ("FTP", None),
-                ("Linkless", "https://en.wiktionary.org/wiki/linkless"),
-            ],
-            "body_ignore": ["Wikipedia", "SURROUNDING Debian TEXT", "Linkless"],
-            "body_extract": [
-                ("Wikipedia", "https://en.wikipedia.org/"),
-                ("SURROUNDING Debian TEXT", "ftp://ftp.us.debian.org/"),
-                ("Linkless", None),
-            ],
-            "footer_ignore": [
-                "Footer",
-                "Multiple links: Only first captured.",
-                None,
-            ],
-            "footer_extract": [
-                ("Footer", "https://en.wikipedia.org/wiki/Page_footer"),
-                ("Multiple links: Only first captured.", "1"),
-                None,
-            ],
+    result = s1.concat(s2).concat(s3.concat(s4)).set_uuid("X").to_html()
+    expected_css = dedent(
+        """\
+        <style type="text/css">
+        #T_X_row1_col0 {
+          background-color: red;
         }
-
-        data_exp = gh_13141_expected["body_ignore"]
-        foot_exp = gh_13141_expected["footer_ignore"]
-        head_exp = gh_13141_expected["head_ignore"]
-        if arg == "all":
-            data_exp = gh_13141_expected["body_extract"]
-            foot_exp = gh_13141_expected["footer_extract"]
-            head_exp = gh_13141_expected["head_extract"]
-        elif arg == "body":
-            data_exp = gh_13141_expected["body_extract"]
-        elif arg == "footer":
-            foot_exp = gh_13141_expected["footer_extract"]
-        elif arg == "header":
-            head_exp = gh_13141_expected["head_extract"]
-
-        result = flavor_read_html(StringIO(gh_13141_data), extract_links=arg)[0]
-        expected = DataFrame([data_exp, foot_exp], columns=head_exp)
-        expected = expected.fillna(np.nan)
-        tm.assert_frame_equal(result, expected)
-
-    def test_extract_links_bad(self, spam_data):
-        msg = (
-            "`extract_links` must be one of "
-            '{None, "header", "footer", "body", "all"}, got "incorrect"'
-        )
-        with pytest.raises(ValueError, match=msg):
-            read_html(spam_data, extract_links="incorrect")
-
-    def test_extract_links_all_no_header(self, flavor_read_html):
-        # GH 48316
-        data = """
-        <table>
-          <tr>
-            <td>
-              <a href='https://google.com'>Google.com</a>
-            </td>
-          </tr>
-        </table>
+        #T_X_foot0_row1_col0 {
+          background-color: green;
+        }
+        #T_X_foot1_row1_col0 {
+          background-color: blue;
+        }
+        #T_X_foot1_foot0_row1_col0 {
+          background-color: yellow;
+        }
+        </style>
         """
-        result = flavor_read_html(StringIO(data), extract_links="all")[0]
-        expected = DataFrame([[("Google.com", "https://google.com")]])
-        tm.assert_frame_equal(result, expected)
-
-    def test_invalid_dtype_backend(self):
-        msg = (
-            "dtype_backend numpy is invalid, only 'numpy_nullable' and "
-            "'pyarrow' are allowed."
+    )
+    expected_table = (
+        dedent(
+            """\
+            <table id="T_X">
+              <thead>
+                <tr>
+                  <th class="blank level0" >&nbsp;</th>
+                  <th id="T_X_level0_col0" class="col_heading level0 col0" >A</th>
+                </tr>
+              </thead>
+              <tbody>
+            """
         )
-        with pytest.raises(ValueError, match=msg):
-            read_html("test", dtype_backend="numpy")
+        + html_lines("")
+        + html_lines("foot0_")
+        + html_lines("foot1_")
+        + html_lines("foot1_foot0_")
+        + dedent(
+            """\
+              </tbody>
+            </table>
+            """
+        )
+    )
+    assert expected_css + expected_table == result
 
-    def test_style_tag(self, flavor_read_html):
-        # GH 48316
-        data = """
-        <table>
-            <tr>
-                <th>
-                    <style>.style</style>
-                    A
-                    </th>
-                <th>B</th>
-            </tr>
-            <tr>
-                <td>A1</td>
-                <td>B1</td>
-            </tr>
-            <tr>
-                <td>A2</td>
-                <td>B2</td>
-            </tr>
-        </table>
-        """
-        result = flavor_read_html(StringIO(data))[0]
-        expected = DataFrame(data=[["A1", "B1"], ["A2", "B2"]], columns=["A", "B"])
-        tm.assert_frame_equal(result, expected)
+
+def test_to_html_na_rep_non_scalar_data(datapath):
+    # GH47103
+    df = DataFrame([{"a": 1, "b": [1, 2, 3], "c": np.nan}])
+    result = df.style.format(na_rep="-").to_html(table_uuid="test")
+    expected = """\
+<style type="text/css">
+</style>
+<table id="T_test">
+  <thead>
+    <tr>
+      <th class="blank level0" >&nbsp;</th>
+      <th id="T_test_level0_col0" class="col_heading level0 col0" >a</th>
+      <th id="T_test_level0_col1" class="col_heading level0 col1" >b</th>
+      <th id="T_test_level0_col2" class="col_heading level0 col2" >c</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <th id="T_test_level0_row0" class="row_heading level0 row0" >0</th>
+      <td id="T_test_row0_col0" class="data row0 col0" >1</td>
+      <td id="T_test_row0_col1" class="data row0 col1" >[1, 2, 3]</td>
+      <td id="T_test_row0_col2" class="data row0 col2" >-</td>
+    </tr>
+  </tbody>
+</table>
+"""
+    assert result == expected
