@@ -1,560 +1,503 @@
-import pytest
+"""
+This file contains a minimal set of tests for compliance with the extension
+array interface test suite, and should contain no other tests.
+The test suite for the full functionality of the array is located in
+`pandas/tests/arrays/`.
+
+The tests in this file are inherited from the BaseExtensionTests, and only
+minimal tweaks should be applied to get the tests passing (by overwriting a
+parent method).
+
+Additional tests should either be added to one of the BaseExtensionTests
+classes (if they are relevant for the extension interface for all dtypes), or
+be added to the array-specific tests in `pandas/tests/arrays/`.
+
+"""
 
 import numpy as np
-from numpy.testing import assert_array_almost_equal, assert_array_equal
-from scipy import sparse
+import pytest
 
-from sklearn import datasets, svm, linear_model, base
-from sklearn.datasets import make_classification, load_digits, make_blobs
-from sklearn.svm.tests import test_svm
-from sklearn.exceptions import ConvergenceWarning
-from sklearn.utils.extmath import safe_sparse_dot
-from sklearn.utils._testing import ignore_warnings, skip_if_32bit
+from pandas.errors import PerformanceWarning
 
-
-# test sample 1
-X = np.array([[-2, -1], [-1, -1], [-1, -2], [1, 1], [1, 2], [2, 1]])
-X_sp = sparse.lil_matrix(X)
-Y = [1, 1, 1, 2, 2, 2]
-T = np.array([[-1, -1], [2, 2], [3, 2]])
-true_result = [1, 2, 2]
-
-# test sample 2
-X2 = np.array(
-    [
-        [0, 0, 0],
-        [1, 1, 1],
-        [2, 0, 0],
-        [0, 0, 2],
-        [3, 3, 3],
-    ]
-)
-X2_sp = sparse.dok_matrix(X2)
-Y2 = [1, 2, 2, 2, 3]
-T2 = np.array([[-1, -1, -1], [1, 1, 1], [2, 2, 2]])
-true_result2 = [1, 2, 3]
+import pandas as pd
+from pandas import SparseDtype
+import pandas._testing as tm
+from pandas.arrays import SparseArray
+from pandas.tests.extension import base
 
 
-iris = datasets.load_iris()
-# permute
-rng = np.random.RandomState(0)
-perm = rng.permutation(iris.target.size)
-iris.data = iris.data[perm]
-iris.target = iris.target[perm]
-# sparsify
-iris.data = sparse.csr_matrix(iris.data)
-
-
-def check_svm_model_equal(dense_svm, sparse_svm, X_train, y_train, X_test):
-    dense_svm.fit(X_train.toarray(), y_train)
-    if sparse.isspmatrix(X_test):
-        X_test_dense = X_test.toarray()
+def make_data(fill_value):
+    rng = np.random.default_rng(2)
+    if np.isnan(fill_value):
+        data = rng.uniform(size=100)
     else:
-        X_test_dense = X_test
-    sparse_svm.fit(X_train, y_train)
-    assert sparse.issparse(sparse_svm.support_vectors_)
-    assert sparse.issparse(sparse_svm.dual_coef_)
-    assert_array_almost_equal(
-        dense_svm.support_vectors_, sparse_svm.support_vectors_.toarray()
-    )
-    assert_array_almost_equal(dense_svm.dual_coef_, sparse_svm.dual_coef_.toarray())
-    if dense_svm.kernel == "linear":
-        assert sparse.issparse(sparse_svm.coef_)
-        assert_array_almost_equal(dense_svm.coef_, sparse_svm.coef_.toarray())
-    assert_array_almost_equal(dense_svm.support_, sparse_svm.support_)
-    assert_array_almost_equal(
-        dense_svm.predict(X_test_dense), sparse_svm.predict(X_test)
-    )
-    assert_array_almost_equal(
-        dense_svm.decision_function(X_test_dense), sparse_svm.decision_function(X_test)
-    )
-    assert_array_almost_equal(
-        dense_svm.decision_function(X_test_dense),
-        sparse_svm.decision_function(X_test_dense),
-    )
-    if isinstance(dense_svm, svm.OneClassSVM):
-        msg = "cannot use sparse input in 'OneClassSVM' trained on dense data"
-    else:
-        assert_array_almost_equal(
-            dense_svm.predict_proba(X_test_dense), sparse_svm.predict_proba(X_test), 4
+        data = rng.integers(1, 100, size=100, dtype=int)
+        if data[0] == data[1]:
+            data[0] += 1
+
+    data[2::3] = fill_value
+    return data
+
+
+@pytest.fixture
+def dtype():
+    return SparseDtype()
+
+
+@pytest.fixture(params=[0, np.nan])
+def data(request):
+    """Length-100 PeriodArray for semantics test."""
+    res = SparseArray(make_data(request.param), fill_value=request.param)
+    return res
+
+
+@pytest.fixture
+def data_for_twos():
+    return SparseArray(np.ones(100) * 2)
+
+
+@pytest.fixture(params=[0, np.nan])
+def data_missing(request):
+    """Length 2 array with [NA, Valid]"""
+    return SparseArray([np.nan, 1], fill_value=request.param)
+
+
+@pytest.fixture(params=[0, np.nan])
+def data_repeated(request):
+    """Return different versions of data for count times"""
+
+    def gen(count):
+        for _ in range(count):
+            yield SparseArray(make_data(request.param), fill_value=request.param)
+
+    yield gen
+
+
+@pytest.fixture(params=[0, np.nan])
+def data_for_sorting(request):
+    return SparseArray([2, 3, 1], fill_value=request.param)
+
+
+@pytest.fixture(params=[0, np.nan])
+def data_missing_for_sorting(request):
+    return SparseArray([2, np.nan, 1], fill_value=request.param)
+
+
+@pytest.fixture
+def na_cmp():
+    return lambda left, right: pd.isna(left) and pd.isna(right)
+
+
+@pytest.fixture(params=[0, np.nan])
+def data_for_grouping(request):
+    return SparseArray([1, 1, np.nan, np.nan, 2, 2, 1, 3], fill_value=request.param)
+
+
+@pytest.fixture(params=[0, np.nan])
+def data_for_compare(request):
+    return SparseArray([0, 0, np.nan, -2, -1, 4, 2, 3, 0, 0], fill_value=request.param)
+
+
+class TestSparseArray(base.ExtensionTests):
+    def _supports_reduction(self, obj, op_name: str) -> bool:
+        return True
+
+    @pytest.mark.parametrize("skipna", [True, False])
+    def test_reduce_series_numeric(self, data, all_numeric_reductions, skipna, request):
+        if all_numeric_reductions in [
+            "prod",
+            "median",
+            "var",
+            "std",
+            "sem",
+            "skew",
+            "kurt",
+        ]:
+            mark = pytest.mark.xfail(
+                reason="This should be viable but is not implemented"
+            )
+            request.node.add_marker(mark)
+        elif (
+            all_numeric_reductions in ["sum", "max", "min", "mean"]
+            and data.dtype.kind == "f"
+            and not skipna
+        ):
+            mark = pytest.mark.xfail(reason="getting a non-nan float")
+            request.node.add_marker(mark)
+
+        super().test_reduce_series_numeric(data, all_numeric_reductions, skipna)
+
+    @pytest.mark.parametrize("skipna", [True, False])
+    def test_reduce_frame(self, data, all_numeric_reductions, skipna, request):
+        if all_numeric_reductions in [
+            "prod",
+            "median",
+            "var",
+            "std",
+            "sem",
+            "skew",
+            "kurt",
+        ]:
+            mark = pytest.mark.xfail(
+                reason="This should be viable but is not implemented"
+            )
+            request.node.add_marker(mark)
+        elif (
+            all_numeric_reductions in ["sum", "max", "min", "mean"]
+            and data.dtype.kind == "f"
+            and not skipna
+        ):
+            mark = pytest.mark.xfail(reason="ExtensionArray NA mask are different")
+            request.node.add_marker(mark)
+
+        super().test_reduce_frame(data, all_numeric_reductions, skipna)
+
+    def _check_unsupported(self, data):
+        if data.dtype == SparseDtype(int, 0):
+            pytest.skip("Can't store nan in int array.")
+
+    def test_concat_mixed_dtypes(self, data):
+        # https://github.com/pandas-dev/pandas/issues/20762
+        # This should be the same, aside from concat([sparse, float])
+        df1 = pd.DataFrame({"A": data[:3]})
+        df2 = pd.DataFrame({"A": [1, 2, 3]})
+        df3 = pd.DataFrame({"A": ["a", "b", "c"]}).astype("category")
+        dfs = [df1, df2, df3]
+
+        # dataframes
+        result = pd.concat(dfs)
+        expected = pd.concat(
+            [x.apply(lambda s: np.asarray(s).astype(object)) for x in dfs]
         )
-        msg = "cannot use sparse input in 'SVC' trained on dense data"
-    if sparse.isspmatrix(X_test):
+        tm.assert_frame_equal(result, expected)
+
+    @pytest.mark.filterwarnings(
+        "ignore:The previous implementation of stack is deprecated"
+    )
+    @pytest.mark.parametrize(
+        "columns",
+        [
+            ["A", "B"],
+            pd.MultiIndex.from_tuples(
+                [("A", "a"), ("A", "b")], names=["outer", "inner"]
+            ),
+        ],
+    )
+    @pytest.mark.parametrize("future_stack", [True, False])
+    def test_stack(self, data, columns, future_stack):
+        super().test_stack(data, columns, future_stack)
+
+    def test_concat_columns(self, data, na_value):
+        self._check_unsupported(data)
+        super().test_concat_columns(data, na_value)
+
+    def test_concat_extension_arrays_copy_false(self, data, na_value):
+        self._check_unsupported(data)
+        super().test_concat_extension_arrays_copy_false(data, na_value)
+
+    def test_align(self, data, na_value):
+        self._check_unsupported(data)
+        super().test_align(data, na_value)
+
+    def test_align_frame(self, data, na_value):
+        self._check_unsupported(data)
+        super().test_align_frame(data, na_value)
+
+    def test_align_series_frame(self, data, na_value):
+        self._check_unsupported(data)
+        super().test_align_series_frame(data, na_value)
+
+    def test_merge(self, data, na_value):
+        self._check_unsupported(data)
+        super().test_merge(data, na_value)
+
+    def test_get(self, data):
+        ser = pd.Series(data, index=[2 * i for i in range(len(data))])
+        if np.isnan(ser.values.fill_value):
+            assert np.isnan(ser.get(4)) and np.isnan(ser.iloc[2])
+        else:
+            assert ser.get(4) == ser.iloc[2]
+        assert ser.get(2) == ser.iloc[1]
+
+    def test_reindex(self, data, na_value):
+        self._check_unsupported(data)
+        super().test_reindex(data, na_value)
+
+    def test_isna(self, data_missing):
+        sarr = SparseArray(data_missing)
+        expected_dtype = SparseDtype(bool, pd.isna(data_missing.dtype.fill_value))
+        expected = SparseArray([True, False], dtype=expected_dtype)
+        result = sarr.isna()
+        tm.assert_sp_array_equal(result, expected)
+
+        # test isna for arr without na
+        sarr = sarr.fillna(0)
+        expected_dtype = SparseDtype(bool, pd.isna(data_missing.dtype.fill_value))
+        expected = SparseArray([False, False], fill_value=False, dtype=expected_dtype)
+        tm.assert_equal(sarr.isna(), expected)
+
+    def test_fillna_limit_backfill(self, data_missing):
+        warns = (PerformanceWarning, FutureWarning)
+        with tm.assert_produces_warning(warns, check_stacklevel=False):
+            super().test_fillna_limit_backfill(data_missing)
+
+    def test_fillna_no_op_returns_copy(self, data, request):
+        if np.isnan(data.fill_value):
+            request.applymarker(
+                pytest.mark.xfail(reason="returns array with different fill value")
+            )
+        super().test_fillna_no_op_returns_copy(data)
+
+    @pytest.mark.xfail(reason="Unsupported")
+    def test_fillna_series(self, data_missing):
+        # this one looks doable.
+        # TODO: this fails bc we do not pass through data_missing. If we did,
+        #  the 0-fill case would xpass
+        super().test_fillna_series()
+
+    def test_fillna_frame(self, data_missing):
+        # Have to override to specify that fill_value will change.
+        fill_value = data_missing[1]
+
+        result = pd.DataFrame({"A": data_missing, "B": [1, 2]}).fillna(fill_value)
+
+        if pd.isna(data_missing.fill_value):
+            dtype = SparseDtype(data_missing.dtype, fill_value)
+        else:
+            dtype = data_missing.dtype
+
+        expected = pd.DataFrame(
+            {
+                "A": data_missing._from_sequence([fill_value, fill_value], dtype=dtype),
+                "B": [1, 2],
+            }
+        )
+
+        tm.assert_frame_equal(result, expected)
+
+    _combine_le_expected_dtype = "Sparse[bool]"
+
+    def test_fillna_copy_frame(self, data_missing, using_copy_on_write):
+        arr = data_missing.take([1, 1])
+        df = pd.DataFrame({"A": arr}, copy=False)
+
+        filled_val = df.iloc[0, 0]
+        result = df.fillna(filled_val)
+
+        if hasattr(df._mgr, "blocks"):
+            if using_copy_on_write:
+                assert df.values.base is result.values.base
+            else:
+                assert df.values.base is not result.values.base
+        assert df.A._values.to_dense() is arr.to_dense()
+
+    def test_fillna_copy_series(self, data_missing, using_copy_on_write):
+        arr = data_missing.take([1, 1])
+        ser = pd.Series(arr, copy=False)
+
+        filled_val = ser[0]
+        result = ser.fillna(filled_val)
+
+        if using_copy_on_write:
+            assert ser._values is result._values
+
+        else:
+            assert ser._values is not result._values
+        assert ser._values.to_dense() is arr.to_dense()
+
+    @pytest.mark.xfail(reason="Not Applicable")
+    def test_fillna_length_mismatch(self, data_missing):
+        super().test_fillna_length_mismatch(data_missing)
+
+    def test_where_series(self, data, na_value):
+        assert data[0] != data[1]
+        cls = type(data)
+        a, b = data[:2]
+
+        ser = pd.Series(cls._from_sequence([a, a, b, b], dtype=data.dtype))
+
+        cond = np.array([True, True, False, False])
+        result = ser.where(cond)
+
+        new_dtype = SparseDtype("float", 0.0)
+        expected = pd.Series(
+            cls._from_sequence([a, a, na_value, na_value], dtype=new_dtype)
+        )
+        tm.assert_series_equal(result, expected)
+
+        other = cls._from_sequence([a, b, a, b], dtype=data.dtype)
+        cond = np.array([True, False, True, True])
+        result = ser.where(cond, other)
+        expected = pd.Series(cls._from_sequence([a, b, b, b], dtype=data.dtype))
+        tm.assert_series_equal(result, expected)
+
+    def test_searchsorted(self, data_for_sorting, as_series):
+        with tm.assert_produces_warning(PerformanceWarning, check_stacklevel=False):
+            super().test_searchsorted(data_for_sorting, as_series)
+
+    def test_shift_0_periods(self, data):
+        # GH#33856 shifting with periods=0 should return a copy, not same obj
+        result = data.shift(0)
+
+        data._sparse_values[0] = data._sparse_values[1]
+        assert result._sparse_values[0] != result._sparse_values[1]
+
+    @pytest.mark.parametrize("method", ["argmax", "argmin"])
+    def test_argmin_argmax_all_na(self, method, data, na_value):
+        # overriding because Sparse[int64, 0] cannot handle na_value
+        self._check_unsupported(data)
+        super().test_argmin_argmax_all_na(method, data, na_value)
+
+    @pytest.mark.fails_arm_wheels
+    @pytest.mark.parametrize("box", [pd.array, pd.Series, pd.DataFrame])
+    def test_equals(self, data, na_value, as_series, box):
+        self._check_unsupported(data)
+        super().test_equals(data, na_value, as_series, box)
+
+    @pytest.mark.fails_arm_wheels
+    def test_equals_same_data_different_object(self, data):
+        super().test_equals_same_data_different_object(data)
+
+    @pytest.mark.parametrize(
+        "func, na_action, expected",
+        [
+            (lambda x: x, None, SparseArray([1.0, np.nan])),
+            (lambda x: x, "ignore", SparseArray([1.0, np.nan])),
+            (str, None, SparseArray(["1.0", "nan"], fill_value="nan")),
+            (str, "ignore", SparseArray(["1.0", np.nan])),
+        ],
+    )
+    def test_map(self, func, na_action, expected):
+        # GH52096
+        data = SparseArray([1, np.nan])
+        result = data.map(func, na_action=na_action)
+        tm.assert_extension_array_equal(result, expected)
+
+    @pytest.mark.parametrize("na_action", [None, "ignore"])
+    def test_map_raises(self, data, na_action):
+        # GH52096
+        msg = "fill value in the sparse values not supported"
         with pytest.raises(ValueError, match=msg):
-            dense_svm.predict(X_test)
+            data.map(lambda x: np.nan, na_action=na_action)
 
+    @pytest.mark.xfail(raises=TypeError, reason="no sparse StringDtype")
+    def test_astype_string(self, data, nullable_string_dtype):
+        # TODO: this fails bc we do not pass through nullable_string_dtype;
+        #  If we did, the 0-cases would xpass
+        super().test_astype_string(data)
 
-@skip_if_32bit
-def test_svc():
-    """Check that sparse SVC gives the same result as SVC"""
-    # many class dataset:
-    X_blobs, y_blobs = make_blobs(n_samples=100, centers=10, random_state=0)
-    X_blobs = sparse.csr_matrix(X_blobs)
+    series_scalar_exc = None
+    frame_scalar_exc = None
+    divmod_exc = None
+    series_array_exc = None
 
-    datasets = [
-        [X_sp, Y, T],
-        [X2_sp, Y2, T2],
-        [X_blobs[:80], y_blobs[:80], X_blobs[80:]],
-        [iris.data, iris.target, iris.data],
-    ]
-    kernels = ["linear", "poly", "rbf", "sigmoid"]
-    for dataset in datasets:
-        for kernel in kernels:
-            clf = svm.SVC(
-                gamma=1,
-                kernel=kernel,
-                probability=True,
-                random_state=0,
-                decision_function_shape="ovo",
-            )
-            sp_clf = svm.SVC(
-                gamma=1,
-                kernel=kernel,
-                probability=True,
-                random_state=0,
-                decision_function_shape="ovo",
-            )
-            check_svm_model_equal(clf, sp_clf, *dataset)
+    def _skip_if_different_combine(self, data):
+        if data.fill_value == 0:
+            # arith ops call on dtype.fill_value so that the sparsity
+            # is maintained. Combine can't be called on a dtype in
+            # general, so we can't make the expected. This is tested elsewhere
+            pytest.skip("Incorrected expected from Series.combine and tested elsewhere")
 
+    def test_arith_series_with_scalar(self, data, all_arithmetic_operators):
+        self._skip_if_different_combine(data)
+        super().test_arith_series_with_scalar(data, all_arithmetic_operators)
 
-def test_unsorted_indices():
-    # test that the result with sorted and unsorted indices in csr is the same
-    # we use a subset of digits as iris, blobs or make_classification didn't
-    # show the problem
-    X, y = load_digits(return_X_y=True)
-    X_test = sparse.csr_matrix(X[50:100])
-    X, y = X[:50], y[:50]
+    def test_arith_series_with_array(self, data, all_arithmetic_operators):
+        self._skip_if_different_combine(data)
+        super().test_arith_series_with_array(data, all_arithmetic_operators)
 
-    X_sparse = sparse.csr_matrix(X)
-    coef_dense = (
-        svm.SVC(kernel="linear", probability=True, random_state=0).fit(X, y).coef_
-    )
-    sparse_svc = svm.SVC(kernel="linear", probability=True, random_state=0).fit(
-        X_sparse, y
-    )
-    coef_sorted = sparse_svc.coef_
-    # make sure dense and sparse SVM give the same result
-    assert_array_almost_equal(coef_dense, coef_sorted.toarray())
+    def test_arith_frame_with_scalar(self, data, all_arithmetic_operators, request):
+        if data.dtype.fill_value != 0:
+            pass
+        elif all_arithmetic_operators.strip("_") not in [
+            "mul",
+            "rmul",
+            "floordiv",
+            "rfloordiv",
+            "pow",
+            "mod",
+            "rmod",
+        ]:
+            mark = pytest.mark.xfail(reason="result dtype.fill_value mismatch")
+            request.applymarker(mark)
+        super().test_arith_frame_with_scalar(data, all_arithmetic_operators)
 
-    # reverse each row's indices
-    def scramble_indices(X):
-        new_data = []
-        new_indices = []
-        for i in range(1, len(X.indptr)):
-            row_slice = slice(*X.indptr[i - 1 : i + 1])
-            new_data.extend(X.data[row_slice][::-1])
-            new_indices.extend(X.indices[row_slice][::-1])
-        return sparse.csr_matrix((new_data, new_indices, X.indptr), shape=X.shape)
-
-    X_sparse_unsorted = scramble_indices(X_sparse)
-    X_test_unsorted = scramble_indices(X_test)
-
-    assert not X_sparse_unsorted.has_sorted_indices
-    assert not X_test_unsorted.has_sorted_indices
-
-    unsorted_svc = svm.SVC(kernel="linear", probability=True, random_state=0).fit(
-        X_sparse_unsorted, y
-    )
-    coef_unsorted = unsorted_svc.coef_
-    # make sure unsorted indices give same result
-    assert_array_almost_equal(coef_unsorted.toarray(), coef_sorted.toarray())
-    assert_array_almost_equal(
-        sparse_svc.predict_proba(X_test_unsorted), sparse_svc.predict_proba(X_test)
-    )
-
-
-def test_svc_with_custom_kernel():
-    def kfunc(x, y):
-        return safe_sparse_dot(x, y.T)
-
-    clf_lin = svm.SVC(kernel="linear").fit(X_sp, Y)
-    clf_mylin = svm.SVC(kernel=kfunc).fit(X_sp, Y)
-    assert_array_equal(clf_lin.predict(X_sp), clf_mylin.predict(X_sp))
-
-
-@skip_if_32bit
-def test_svc_iris():
-    # Test the sparse SVC with the iris dataset
-    for k in ("linear", "poly", "rbf"):
-        sp_clf = svm.SVC(kernel=k).fit(iris.data, iris.target)
-        clf = svm.SVC(kernel=k).fit(iris.data.toarray(), iris.target)
-
-        assert_array_almost_equal(
-            clf.support_vectors_, sp_clf.support_vectors_.toarray()
-        )
-        assert_array_almost_equal(clf.dual_coef_, sp_clf.dual_coef_.toarray())
-        assert_array_almost_equal(
-            clf.predict(iris.data.toarray()), sp_clf.predict(iris.data)
-        )
-        if k == "linear":
-            assert_array_almost_equal(clf.coef_, sp_clf.coef_.toarray())
-
-
-def test_sparse_decision_function():
-    # Test decision_function
-
-    # Sanity check, test that decision_function implemented in python
-    # returns the same as the one in libsvm
-
-    # multi class:
-    svc = svm.SVC(kernel="linear", C=0.1, decision_function_shape="ovo")
-    clf = svc.fit(iris.data, iris.target)
-
-    dec = safe_sparse_dot(iris.data, clf.coef_.T) + clf.intercept_
-
-    assert_array_almost_equal(dec, clf.decision_function(iris.data))
-
-    # binary:
-    clf.fit(X, Y)
-    dec = np.dot(X, clf.coef_.T) + clf.intercept_
-    prediction = clf.predict(X)
-    assert_array_almost_equal(dec.ravel(), clf.decision_function(X))
-    assert_array_almost_equal(
-        prediction, clf.classes_[(clf.decision_function(X) > 0).astype(int).ravel()]
-    )
-    expected = np.array([-1.0, -0.66, -1.0, 0.66, 1.0, 1.0])
-    assert_array_almost_equal(clf.decision_function(X), expected, 2)
-
-
-def test_error():
-    # Test that it gives proper exception on deficient input
-    # impossible value of C
-    with pytest.raises(ValueError):
-        svm.SVC(C=-1).fit(X, Y)
-
-    # impossible value of nu
-    clf = svm.NuSVC(nu=0.0)
-    with pytest.raises(ValueError):
-        clf.fit(X_sp, Y)
-
-    Y2 = Y[:-1]  # wrong dimensions for labels
-    with pytest.raises(ValueError):
-        clf.fit(X_sp, Y2)
-
-    clf = svm.SVC()
-    clf.fit(X_sp, Y)
-    assert_array_equal(clf.predict(T), true_result)
-
-
-def test_linearsvc():
-    # Similar to test_SVC
-    clf = svm.LinearSVC(random_state=0).fit(X, Y)
-    sp_clf = svm.LinearSVC(random_state=0).fit(X_sp, Y)
-
-    assert sp_clf.fit_intercept
-
-    assert_array_almost_equal(clf.coef_, sp_clf.coef_, decimal=4)
-    assert_array_almost_equal(clf.intercept_, sp_clf.intercept_, decimal=4)
-
-    assert_array_almost_equal(clf.predict(X), sp_clf.predict(X_sp))
-
-    clf.fit(X2, Y2)
-    sp_clf.fit(X2_sp, Y2)
-
-    assert_array_almost_equal(clf.coef_, sp_clf.coef_, decimal=4)
-    assert_array_almost_equal(clf.intercept_, sp_clf.intercept_, decimal=4)
-
-
-def test_linearsvc_iris():
-    # Test the sparse LinearSVC with the iris dataset
-
-    sp_clf = svm.LinearSVC(random_state=0).fit(iris.data, iris.target)
-    clf = svm.LinearSVC(random_state=0).fit(iris.data.toarray(), iris.target)
-
-    assert clf.fit_intercept == sp_clf.fit_intercept
-
-    assert_array_almost_equal(clf.coef_, sp_clf.coef_, decimal=1)
-    assert_array_almost_equal(clf.intercept_, sp_clf.intercept_, decimal=1)
-    assert_array_almost_equal(
-        clf.predict(iris.data.toarray()), sp_clf.predict(iris.data)
-    )
-
-    # check decision_function
-    pred = np.argmax(sp_clf.decision_function(iris.data), 1)
-    assert_array_almost_equal(pred, clf.predict(iris.data.toarray()))
-
-    # sparsify the coefficients on both models and check that they still
-    # produce the same results
-    clf.sparsify()
-    assert_array_equal(pred, clf.predict(iris.data))
-    sp_clf.sparsify()
-    assert_array_equal(pred, sp_clf.predict(iris.data))
-
-
-def test_weight():
-    # Test class weights
-    X_, y_ = make_classification(
-        n_samples=200, n_features=100, weights=[0.833, 0.167], random_state=0
-    )
-
-    X_ = sparse.csr_matrix(X_)
-    for clf in (
-        linear_model.LogisticRegression(),
-        svm.LinearSVC(random_state=0),
-        svm.SVC(),
+    def _compare_other(
+        self, ser: pd.Series, data_for_compare: SparseArray, comparison_op, other
     ):
-        clf.set_params(class_weight={0: 5})
-        clf.fit(X_[:180], y_[:180])
-        y_pred = clf.predict(X_[180:])
-        assert np.sum(y_pred == y_[180:]) >= 11
+        op = comparison_op
+
+        result = op(data_for_compare, other)
+        if isinstance(other, pd.Series):
+            assert isinstance(result, pd.Series)
+            assert isinstance(result.dtype, SparseDtype)
+        else:
+            assert isinstance(result, SparseArray)
+        assert result.dtype.subtype == np.bool_
+
+        if isinstance(other, pd.Series):
+            fill_value = op(data_for_compare.fill_value, other._values.fill_value)
+            expected = SparseArray(
+                op(data_for_compare.to_dense(), np.asarray(other)),
+                fill_value=fill_value,
+                dtype=np.bool_,
+            )
+
+        else:
+            fill_value = np.all(
+                op(np.asarray(data_for_compare.fill_value), np.asarray(other))
+            )
+
+            expected = SparseArray(
+                op(data_for_compare.to_dense(), np.asarray(other)),
+                fill_value=fill_value,
+                dtype=np.bool_,
+            )
+        if isinstance(other, pd.Series):
+            # error: Incompatible types in assignment
+            expected = pd.Series(expected)  # type: ignore[assignment]
+        tm.assert_equal(result, expected)
+
+    def test_scalar(self, data_for_compare: SparseArray, comparison_op):
+        ser = pd.Series(data_for_compare)
+        self._compare_other(ser, data_for_compare, comparison_op, 0)
+        self._compare_other(ser, data_for_compare, comparison_op, 1)
+        self._compare_other(ser, data_for_compare, comparison_op, -1)
+        self._compare_other(ser, data_for_compare, comparison_op, np.nan)
+
+    def test_array(self, data_for_compare: SparseArray, comparison_op, request):
+        if data_for_compare.dtype.fill_value == 0 and comparison_op.__name__ in [
+            "eq",
+            "ge",
+            "le",
+        ]:
+            mark = pytest.mark.xfail(reason="Wrong fill_value")
+            request.applymarker(mark)
+
+        arr = np.linspace(-4, 5, 10)
+        ser = pd.Series(data_for_compare)
+        self._compare_other(ser, data_for_compare, comparison_op, arr)
+
+    def test_sparse_array(self, data_for_compare: SparseArray, comparison_op, request):
+        if data_for_compare.dtype.fill_value == 0 and comparison_op.__name__ != "gt":
+            mark = pytest.mark.xfail(reason="Wrong fill_value")
+            request.applymarker(mark)
+
+        ser = pd.Series(data_for_compare)
+        arr = data_for_compare + 1
+        self._compare_other(ser, data_for_compare, comparison_op, arr)
+        arr = data_for_compare * 2
+        self._compare_other(ser, data_for_compare, comparison_op, arr)
+
+    @pytest.mark.xfail(reason="Different repr")
+    def test_array_repr(self, data, size):
+        super().test_array_repr(data, size)
+
+    @pytest.mark.xfail(reason="result does not match expected")
+    @pytest.mark.parametrize("as_index", [True, False])
+    def test_groupby_extension_agg(self, as_index, data_for_grouping):
+        super().test_groupby_extension_agg(as_index, data_for_grouping)
 
 
-def test_sample_weights():
-    # Test weights on individual samples
-    clf = svm.SVC()
-    clf.fit(X_sp, Y)
-    assert_array_equal(clf.predict([X[2]]), [1.0])
-
-    sample_weight = [0.1] * 3 + [10] * 3
-    clf.fit(X_sp, Y, sample_weight=sample_weight)
-    assert_array_equal(clf.predict([X[2]]), [2.0])
-
-
-def test_sparse_liblinear_intercept_handling():
-    # Test that sparse liblinear honours intercept_scaling param
-    test_svm.test_dense_liblinear_intercept_handling(svm.LinearSVC)
-
-
-@pytest.mark.parametrize("datasets_index", range(4))
-@pytest.mark.parametrize("kernel", ["linear", "poly", "rbf", "sigmoid"])
-@skip_if_32bit
-def test_sparse_oneclasssvm(datasets_index, kernel):
-    # Check that sparse OneClassSVM gives the same result as dense OneClassSVM
-    # many class dataset:
-    X_blobs, _ = make_blobs(n_samples=100, centers=10, random_state=0)
-    X_blobs = sparse.csr_matrix(X_blobs)
-    datasets = [
-        [X_sp, None, T],
-        [X2_sp, None, T2],
-        [X_blobs[:80], None, X_blobs[80:]],
-        [iris.data, None, iris.data],
-    ]
-    dataset = datasets[datasets_index]
-    clf = svm.OneClassSVM(gamma=1, kernel=kernel)
-    sp_clf = svm.OneClassSVM(gamma=1, kernel=kernel)
-    check_svm_model_equal(clf, sp_clf, *dataset)
-
-
-def test_sparse_realdata():
-    # Test on a subset from the 20newsgroups dataset.
-    # This catches some bugs if input is not correctly converted into
-    # sparse format or weights are not correctly initialized.
-
-    data = np.array([0.03771744, 0.1003567, 0.01174647, 0.027069])
-    indices = np.array([6, 5, 35, 31])
-    indptr = np.array(
-        [
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            2,
-            2,
-            2,
-            2,
-            2,
-            2,
-            2,
-            2,
-            2,
-            2,
-            2,
-            2,
-            2,
-            2,
-            2,
-            2,
-            2,
-            2,
-            2,
-            2,
-            2,
-            2,
-            2,
-            2,
-            2,
-            2,
-            2,
-            2,
-            2,
-            2,
-            2,
-            2,
-            2,
-            2,
-            2,
-            2,
-            2,
-            2,
-            4,
-            4,
-            4,
-        ]
-    )
-    X = sparse.csr_matrix((data, indices, indptr))
-    y = np.array(
-        [
-            1.0,
-            0.0,
-            2.0,
-            2.0,
-            1.0,
-            1.0,
-            1.0,
-            2.0,
-            2.0,
-            0.0,
-            1.0,
-            2.0,
-            2.0,
-            0.0,
-            2.0,
-            0.0,
-            3.0,
-            0.0,
-            3.0,
-            0.0,
-            1.0,
-            1.0,
-            3.0,
-            2.0,
-            3.0,
-            2.0,
-            0.0,
-            3.0,
-            1.0,
-            0.0,
-            2.0,
-            1.0,
-            2.0,
-            0.0,
-            1.0,
-            0.0,
-            2.0,
-            3.0,
-            1.0,
-            3.0,
-            0.0,
-            1.0,
-            0.0,
-            0.0,
-            2.0,
-            0.0,
-            1.0,
-            2.0,
-            2.0,
-            2.0,
-            3.0,
-            2.0,
-            0.0,
-            3.0,
-            2.0,
-            1.0,
-            2.0,
-            3.0,
-            2.0,
-            2.0,
-            0.0,
-            1.0,
-            0.0,
-            1.0,
-            2.0,
-            3.0,
-            0.0,
-            0.0,
-            2.0,
-            2.0,
-            1.0,
-            3.0,
-            1.0,
-            1.0,
-            0.0,
-            1.0,
-            2.0,
-            1.0,
-            1.0,
-            3.0,
-        ]
-    )
-
-    clf = svm.SVC(kernel="linear").fit(X.toarray(), y)
-    sp_clf = svm.SVC(kernel="linear").fit(sparse.coo_matrix(X), y)
-
-    assert_array_equal(clf.support_vectors_, sp_clf.support_vectors_.toarray())
-    assert_array_equal(clf.dual_coef_, sp_clf.dual_coef_.toarray())
-
-
-def test_sparse_svc_clone_with_callable_kernel():
-    # Test that the "dense_fit" is called even though we use sparse input
-    # meaning that everything works fine.
-    a = svm.SVC(C=1, kernel=lambda x, y: x * y.T, probability=True, random_state=0)
-    b = base.clone(a)
-
-    b.fit(X_sp, Y)
-    pred = b.predict(X_sp)
-    b.predict_proba(X_sp)
-
-    dense_svm = svm.SVC(
-        C=1, kernel=lambda x, y: np.dot(x, y.T), probability=True, random_state=0
-    )
-    pred_dense = dense_svm.fit(X, Y).predict(X)
-    assert_array_equal(pred_dense, pred)
-    # b.decision_function(X_sp)  # XXX : should be supported
-
-
-def test_timeout():
-    sp = svm.SVC(
-        C=1, kernel=lambda x, y: x * y.T, probability=True, random_state=0, max_iter=1
-    )
-    warning_msg = (
-        r"Solver terminated early \(max_iter=1\).  Consider pre-processing "
-        r"your data with StandardScaler or MinMaxScaler."
-    )
-    with pytest.warns(ConvergenceWarning, match=warning_msg):
-        sp.fit(X_sp, Y)
-
-
-def test_consistent_proba():
-    a = svm.SVC(probability=True, max_iter=1, random_state=0)
-    with ignore_warnings(category=ConvergenceWarning):
-        proba_1 = a.fit(X, Y).predict_proba(X)
-    a = svm.SVC(probability=True, max_iter=1, random_state=0)
-    with ignore_warnings(category=ConvergenceWarning):
-        proba_2 = a.fit(X, Y).predict_proba(X)
-    assert_array_almost_equal(proba_1, proba_2)
+def test_array_type_with_arg(dtype):
+    assert dtype.construct_array_type() is SparseArray

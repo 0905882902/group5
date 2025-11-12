@@ -1,176 +1,190 @@
-"""
-Missing data handling for arithmetic operations.
-
-In particular, pandas conventions regarding division by zero differ
-from numpy in the following ways:
-    1) np.array([-1, 0, 1], dtype=dtype1) // np.array([0, 0, 0], dtype=dtype2)
-       gives [nan, nan, nan] for most dtype combinations, and [0, 0, 0] for
-       the remaining pairs
-       (the remaining being dtype1==dtype2==intN and dtype==dtype2==uintN).
-
-       pandas convention is to return [-inf, nan, inf] for all dtype
-       combinations.
-
-       Note: the numpy behavior described here is py3-specific.
-
-    2) np.array([-1, 0, 1], dtype=dtype1) % np.array([0, 0, 0], dtype=dtype2)
-       gives precisely the same results as the // operation.
-
-       pandas convention is to return [nan, nan, nan] for all dtype
-       combinations.
-
-    3) divmod behavior consistent with 1) and 2).
-"""
-from __future__ import annotations
-
-import operator
-
 import numpy as np
+import pytest
 
-from pandas.core import roperator
-
-
-def _fill_zeros(result: np.ndarray, x, y):
-    """
-    If this is a reversed op, then flip x,y
-
-    If we have an integer value (or array in y)
-    and we have 0's, fill them with np.nan,
-    return the result.
-
-    Mask the nan's from x.
-    """
-    if result.dtype.kind == "f":
-        return result
-
-    is_variable_type = hasattr(y, "dtype")
-    is_scalar_type = not isinstance(y, np.ndarray)
-
-    if not is_variable_type and not is_scalar_type:
-        # e.g. test_series_ops_name_retention with mod we get here with list/tuple
-        return result
-
-    if is_scalar_type:
-        y = np.array(y)
-
-    if y.dtype.kind in "iu":
-        ymask = y == 0
-        if ymask.any():
-            # GH#7325, mask and nans must be broadcastable
-            mask = ymask & ~np.isnan(result)
-
-            # GH#9308 doing ravel on result and mask can improve putmask perf,
-            #  but can also make unwanted copies.
-            result = result.astype("float64", copy=False)
-
-            np.putmask(result, mask, np.nan)
-
-    return result
+import pandas as pd
+import pandas._testing as tm
 
 
-def mask_zero_div_zero(x, y, result: np.ndarray) -> np.ndarray:
-    """
-    Set results of  0 // 0 to np.nan, regardless of the dtypes
-    of the numerator or the denominator.
+class BaseMissingTests:
+    def test_isna(self, data_missing):
+        expected = np.array([True, False])
 
-    Parameters
-    ----------
-    x : ndarray
-    y : ndarray
-    result : ndarray
+        result = pd.isna(data_missing)
+        tm.assert_numpy_array_equal(result, expected)
 
-    Returns
-    -------
-    ndarray
-        The filled result.
+        result = pd.Series(data_missing).isna()
+        expected = pd.Series(expected)
+        tm.assert_series_equal(result, expected)
 
-    Examples
-    --------
-    >>> x = np.array([1, 0, -1], dtype=np.int64)
-    >>> x
-    array([ 1,  0, -1])
-    >>> y = 0       # int 0; numpy behavior is different with float
-    >>> result = x // y
-    >>> result      # raw numpy result does not fill division by zero
-    array([0, 0, 0])
-    >>> mask_zero_div_zero(x, y, result)
-    array([ inf,  nan, -inf])
-    """
+        # GH 21189
+        result = pd.Series(data_missing).drop([0, 1]).isna()
+        expected = pd.Series([], dtype=bool)
+        tm.assert_series_equal(result, expected)
 
-    if not hasattr(y, "dtype"):
-        # e.g. scalar, tuple
-        y = np.array(y)
-    if not hasattr(x, "dtype"):
-        # e.g scalar, tuple
-        x = np.array(x)
+    @pytest.mark.parametrize("na_func", ["isna", "notna"])
+    def test_isna_returns_copy(self, data_missing, na_func):
+        result = pd.Series(data_missing)
+        expected = result.copy()
+        mask = getattr(result, na_func)()
+        if isinstance(mask.dtype, pd.SparseDtype):
+            # TODO: GH 57739
+            mask = np.array(mask)
+            mask.flags.writeable = True
 
-    zmask = y == 0
+        mask[:] = True
+        tm.assert_series_equal(result, expected)
 
-    if zmask.any():
-        # Flip sign if necessary for -0.0
-        zneg_mask = zmask & np.signbit(y)
-        zpos_mask = zmask & ~zneg_mask
+    def test_dropna_array(self, data_missing):
+        result = data_missing.dropna()
+        expected = data_missing[[1]]
+        tm.assert_extension_array_equal(result, expected)
 
-        x_lt0 = x < 0
-        x_gt0 = x > 0
-        nan_mask = zmask & (x == 0)
-        neginf_mask = (zpos_mask & x_lt0) | (zneg_mask & x_gt0)
-        posinf_mask = (zpos_mask & x_gt0) | (zneg_mask & x_lt0)
+    def test_dropna_series(self, data_missing):
+        ser = pd.Series(data_missing)
+        result = ser.dropna()
+        expected = ser.iloc[[1]]
+        tm.assert_series_equal(result, expected)
 
-        if nan_mask.any() or neginf_mask.any() or posinf_mask.any():
-            # Fill negative/0 with -inf, positive/0 with +inf, 0/0 with NaN
-            result = result.astype("float64", copy=False)
+    def test_dropna_frame(self, data_missing):
+        df = pd.DataFrame({"A": data_missing}, columns=pd.Index(["A"], dtype=object))
 
-            result[nan_mask] = np.nan
-            result[posinf_mask] = np.inf
-            result[neginf_mask] = -np.inf
+        # defaults
+        result = df.dropna()
+        expected = df.iloc[[1]]
+        tm.assert_frame_equal(result, expected)
 
-    return result
+        # axis = 1
+        result = df.dropna(axis="columns")
+        expected = pd.DataFrame(index=pd.RangeIndex(2), columns=pd.Index([]))
+        tm.assert_frame_equal(result, expected)
 
+        # multiple
+        df = pd.DataFrame({"A": data_missing, "B": [1, np.nan]})
+        result = df.dropna()
+        expected = df.iloc[:0]
+        tm.assert_frame_equal(result, expected)
 
-def dispatch_fill_zeros(op, left, right, result):
-    """
-    Call _fill_zeros with the appropriate fill value depending on the operation,
-    with special logic for divmod and rdivmod.
+    def test_fillna_scalar(self, data_missing):
+        valid = data_missing[1]
+        result = data_missing.fillna(valid)
+        expected = data_missing.fillna(valid)
+        tm.assert_extension_array_equal(result, expected)
 
-    Parameters
-    ----------
-    op : function (operator.add, operator.div, ...)
-    left : object (np.ndarray for non-reversed ops)
-        We have excluded ExtensionArrays here
-    right : object (np.ndarray for reversed ops)
-        We have excluded ExtensionArrays here
-    result : ndarray
+    @pytest.mark.filterwarnings(
+        "ignore:Series.fillna with 'method' is deprecated:FutureWarning"
+    )
+    def test_fillna_limit_pad(self, data_missing):
+        arr = data_missing.take([1, 0, 0, 0, 1])
+        result = pd.Series(arr).ffill(limit=2)
+        expected = pd.Series(data_missing.take([1, 1, 1, 0, 1]))
+        tm.assert_series_equal(result, expected)
 
-    Returns
-    -------
-    result : np.ndarray
+    @pytest.mark.parametrize(
+        "limit_area, input_ilocs, expected_ilocs",
+        [
+            ("outside", [1, 0, 0, 0, 1], [1, 0, 0, 0, 1]),
+            ("outside", [1, 0, 1, 0, 1], [1, 0, 1, 0, 1]),
+            ("outside", [0, 1, 1, 1, 0], [0, 1, 1, 1, 1]),
+            ("outside", [0, 1, 0, 1, 0], [0, 1, 0, 1, 1]),
+            ("inside", [1, 0, 0, 0, 1], [1, 1, 1, 1, 1]),
+            ("inside", [1, 0, 1, 0, 1], [1, 1, 1, 1, 1]),
+            ("inside", [0, 1, 1, 1, 0], [0, 1, 1, 1, 0]),
+            ("inside", [0, 1, 0, 1, 0], [0, 1, 1, 1, 0]),
+        ],
+    )
+    def test_ffill_limit_area(
+        self, data_missing, limit_area, input_ilocs, expected_ilocs
+    ):
+        # GH#56616
+        arr = data_missing.take(input_ilocs)
+        result = pd.Series(arr).ffill(limit_area=limit_area)
+        expected = pd.Series(data_missing.take(expected_ilocs))
+        tm.assert_series_equal(result, expected)
 
-    Notes
-    -----
-    For divmod and rdivmod, the `result` parameter and returned `result`
-    is a 2-tuple of ndarray objects.
-    """
-    if op is divmod:
-        result = (
-            mask_zero_div_zero(left, right, result[0]),
-            _fill_zeros(result[1], left, right),
+    @pytest.mark.filterwarnings(
+        "ignore:Series.fillna with 'method' is deprecated:FutureWarning"
+    )
+    def test_fillna_limit_backfill(self, data_missing):
+        arr = data_missing.take([1, 0, 0, 0, 1])
+        result = pd.Series(arr).fillna(method="backfill", limit=2)
+        expected = pd.Series(data_missing.take([1, 0, 1, 1, 1]))
+        tm.assert_series_equal(result, expected)
+
+    def test_fillna_no_op_returns_copy(self, data):
+        data = data[~data.isna()]
+
+        valid = data[0]
+        result = data.fillna(valid)
+        assert result is not data
+        tm.assert_extension_array_equal(result, data)
+
+        result = data._pad_or_backfill(method="backfill")
+        assert result is not data
+        tm.assert_extension_array_equal(result, data)
+
+    def test_fillna_series(self, data_missing):
+        fill_value = data_missing[1]
+        ser = pd.Series(data_missing)
+
+        result = ser.fillna(fill_value)
+        expected = pd.Series(
+            data_missing._from_sequence(
+                [fill_value, fill_value], dtype=data_missing.dtype
+            )
         )
-    elif op is roperator.rdivmod:
-        result = (
-            mask_zero_div_zero(right, left, result[0]),
-            _fill_zeros(result[1], right, left),
+        tm.assert_series_equal(result, expected)
+
+        # Fill with a series
+        result = ser.fillna(expected)
+        tm.assert_series_equal(result, expected)
+
+        # Fill with a series not affecting the missing values
+        result = ser.fillna(ser)
+        tm.assert_series_equal(result, ser)
+
+    def test_fillna_series_method(self, data_missing, fillna_method):
+        fill_value = data_missing[1]
+
+        if fillna_method == "ffill":
+            data_missing = data_missing[::-1]
+
+        result = getattr(pd.Series(data_missing), fillna_method)()
+        expected = pd.Series(
+            data_missing._from_sequence(
+                [fill_value, fill_value], dtype=data_missing.dtype
+            )
         )
-    elif op is operator.floordiv:
-        # Note: no need to do this for truediv; in py3 numpy behaves the way
-        #  we want.
-        result = mask_zero_div_zero(left, right, result)
-    elif op is roperator.rfloordiv:
-        # Note: no need to do this for rtruediv; in py3 numpy behaves the way
-        #  we want.
-        result = mask_zero_div_zero(right, left, result)
-    elif op is operator.mod:
-        result = _fill_zeros(result, left, right)
-    elif op is roperator.rmod:
-        result = _fill_zeros(result, right, left)
-    return result
+
+        tm.assert_series_equal(result, expected)
+
+    def test_fillna_frame(self, data_missing):
+        fill_value = data_missing[1]
+
+        result = pd.DataFrame({"A": data_missing, "B": [1, 2]}).fillna(fill_value)
+
+        expected = pd.DataFrame(
+            {
+                "A": data_missing._from_sequence(
+                    [fill_value, fill_value], dtype=data_missing.dtype
+                ),
+                "B": [1, 2],
+            }
+        )
+
+        tm.assert_frame_equal(result, expected)
+
+    def test_fillna_fill_other(self, data):
+        result = pd.DataFrame({"A": data, "B": [np.nan] * len(data)}).fillna({"B": 0.0})
+
+        expected = pd.DataFrame({"A": data, "B": [0.0] * len(result)})
+
+        tm.assert_frame_equal(result, expected)
+
+    def test_use_inf_as_na_no_effect(self, data_missing):
+        ser = pd.Series(data_missing)
+        expected = ser.isna()
+        msg = "use_inf_as_na option is deprecated"
+        with tm.assert_produces_warning(FutureWarning, match=msg):
+            with pd.option_context("mode.use_inf_as_na", True):
+                result = ser.isna()
+        tm.assert_series_equal(result, expected)
