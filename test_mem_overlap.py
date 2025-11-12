@@ -2,8 +2,8 @@ import itertools
 import pytest
 
 import numpy as np
-from numpy._core._multiarray_tests import solve_diophantine, internal_overlap
-from numpy._core import _umath_tests
+from numpy.core._multiarray_tests import solve_diophantine, internal_overlap
+from numpy.core import _umath_tests
 from numpy.lib.stride_tricks import as_strided
 from numpy.testing import (
     assert_, assert_raises, assert_equal, assert_array_equal
@@ -385,9 +385,7 @@ def test_shares_memory_api():
     b = x[:,::3,::2]
     assert_equal(np.shares_memory(a, b), True)
     assert_equal(np.shares_memory(a, b, max_work=None), True)
-    assert_raises(
-        np.exceptions.TooHardError, np.shares_memory, a, b, max_work=1
-    )
+    assert_raises(np.TooHardError, np.shares_memory, a, b, max_work=1)
 
 
 def test_may_share_memory_bad_max_work():
@@ -553,7 +551,7 @@ def test_non_ndarray_inputs():
         def __init__(self, data):
             self.data = data
 
-        def __array__(self, dtype=None, copy=None):
+        def __array__(self):
             return self.data
 
     for cls in [MyArray, MyArray2]:
@@ -568,7 +566,7 @@ def test_non_ndarray_inputs():
 
 def view_element_first_byte(x):
     """Construct an array viewing the first byte of each element of `x`"""
-    from numpy.lib._stride_tricks_impl import DummyArray
+    from numpy.lib.stride_tricks import DummyArray
     interface = dict(x.__array_interface__)
     interface['typestr'] = '|b1'
     interface['descr'] = [('', '|b1')]
@@ -811,7 +809,7 @@ class TestUFunc:
             assert_array_equal(c1, c2)
 
             # Trigger "fancy ufunc loop" code path
-            mask = view_element_first_byte(b).view(np.bool)
+            mask = view_element_first_byte(b).view(np.bool_)
 
             a[...] = a_orig
             b[...] = b_orig
@@ -876,7 +874,7 @@ class TestUFunc:
             assert_array_equal(c1, c2)
 
         # Check behavior with same input and output arrays
-        x = np.arange(100).astype(np.bool)
+        x = np.arange(100).astype(np.bool_)
         check(x, x, x)
         check(x, x.copy(), x)
         check(x, x, x.copy())

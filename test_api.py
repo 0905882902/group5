@@ -1,8 +1,7 @@
 import sys
 
 import numpy as np
-import numpy._core.umath as ncu
-from numpy._core._rational_tests import rational
+from numpy.core._rational_tests import rational
 import pytest
 from numpy.testing import (
      assert_, assert_equal, assert_array_equal, assert_raises, assert_warns,
@@ -87,15 +86,13 @@ def test_array_array():
     assert_equal(bytes(np.array(o).data), bytes(a.data))
 
     # test array
-    def custom__array__(self, dtype=None, copy=None):
-        return np.array(100.0, dtype=dtype, copy=copy)
-
-    o = type("o", (object,), dict(__array__=custom__array__))()
+    o = type("o", (object,),
+             dict(__array__=lambda *x: np.array(100.0, dtype=np.float64)))()
     assert_equal(np.array(o, dtype=np.float64), np.array(100.0, np.float64))
 
     # test recursion
     nested = 1.5
-    for i in range(ncu.MAXDIMS):
+    for i in range(np.MAXDIMS):
         nested = [nested]
 
     # no error
@@ -163,6 +160,21 @@ def test_array_impossible_casts(array):
         np.array(rt, dtype="M8")
 
 
+# TODO: remove when fastCopyAndTranspose deprecation expires
+@pytest.mark.parametrize("a",
+    (
+        np.array(2),  # 0D array
+        np.array([3, 2, 7, 0]),  # 1D array
+        np.arange(6).reshape(2, 3)  # 2D array
+    ),
+)
+def test_fastCopyAndTranspose(a):
+    with pytest.deprecated_call():
+        b = np.fastCopyAndTranspose(a)
+        assert_equal(b, a.T)
+        assert b.flags.owndata
+
+
 def test_array_astype():
     a = np.arange(6, dtype='f4').reshape(2, 3)
     # Default behavior: allows unsafe casts, keeps memory layout,
@@ -179,7 +191,7 @@ def test_array_astype():
     assert_equal(a, b)
     assert_(not (a is b))
 
-    # copy=False parameter skips a copy
+    # copy=False parameter can sometimes skip a copy
     b = a.astype('f4', copy=False)
     assert_(a is b)
 
@@ -302,35 +314,42 @@ def test_object_array_astype_to_void():
     assert arr.dtype == "V8"
 
 @pytest.mark.parametrize("t",
-    np._core.sctypes['uint'] + 
-    np._core.sctypes['int'] + 
-    np._core.sctypes['float']
+    np.sctypes['uint'] + np.sctypes['int'] + np.sctypes['float']
 )
 def test_array_astype_warning(t):
     # test ComplexWarning when casting from complex to float or int
-    a = np.array(10, dtype=np.complex128)
-    assert_warns(np.exceptions.ComplexWarning, a.astype, t)
+    a = np.array(10, dtype=np.complex_)
+    assert_warns(np.ComplexWarning, a.astype, t)
 
 @pytest.mark.parametrize(["dtype", "out_dtype"],
-        [(np.bytes_, np.bool),
-         (np.str_, np.bool),
-         (np.dtype("S10,S9"), np.dtype("?,?")),
-         # The following also checks unaligned unicode access:
-         (np.dtype("S7,U9"), np.dtype("?,?"))])
+        [(np.bytes_, np.bool_),
+         (np.str_, np.bool_),
+         (np.dtype("S10,S9"), np.dtype("?,?"))])
 def test_string_to_boolean_cast(dtype, out_dtype):
-    # Only the last two (empty) strings are falsy (the `\0` is stripped):
-    arr = np.array(
-            ["10", "10\0\0\0", "0\0\0", "0", "False", " ", "", "\0"],
-            dtype=dtype)
-    expected = np.array(
-            [True, True, True, True, True, True, False, False],
-            dtype=out_dtype)
+    """
+    Currently, for `astype` strings are cast to booleans effectively by
+    calling `bool(int(string)`. This is not consistent (see gh-9875) and
+    will eventually be deprecated.
+    """
+    arr = np.array(["10", "10\0\0\0", "0\0\0", "0"], dtype=dtype)
+    expected = np.array([True, True, False, False], dtype=out_dtype)
     assert_array_equal(arr.astype(out_dtype), expected)
-    # As it's similar, check that nonzero behaves the same (structs are
-    # nonzero if all entries are)
-    assert_array_equal(np.nonzero(arr), np.nonzero(expected))
 
-@pytest.mark.parametrize("str_type", [str, bytes, np.str_])
+@pytest.mark.parametrize(["dtype", "out_dtype"],
+        [(np.bytes_, np.bool_),
+         (np.str_, np.bool_),
+         (np.dtype("S10,S9"), np.dtype("?,?"))])
+def test_string_to_boolean_cast_errors(dtype, out_dtype):
+    """
+    These currently error out, since cast to integers fails, but should not
+    error out in the future.
+    """
+    for invalid in ["False", "True", "", "\0", "non-empty"]:
+        arr = np.array([invalid], dtype=dtype)
+        with assert_raises(ValueError):
+            arr.astype(out_dtype)
+
+@pytest.mark.parametrize("str_type", [str, bytes, np.str_, np.unicode_])
 @pytest.mark.parametrize("scalar_type",
         [np.complex64, np.complex128, np.clongdouble])
 def test_string_to_complex_cast(str_type, scalar_type):
@@ -538,9 +557,9 @@ def test_contiguous_flags():
     check_contig(np.empty((2, 2), order='F'), False, True)
 
     # Check that np.array creates correct contiguous flags:
-    check_contig(np.array(a, copy=None), False, False)
-    check_contig(np.array(a, copy=None, order='C'), True, False)
-    check_contig(np.array(a, ndmin=4, copy=None, order='F'), False, True)
+    check_contig(np.array(a, copy=False), False, False)
+    check_contig(np.array(a, copy=False, order='C'), True, False)
+    check_contig(np.array(a, ndmin=4, copy=False, order='F'), False, True)
 
     # Check slicing update of flags and :
     check_contig(a[0], True, True)
@@ -572,14 +591,25 @@ def test_astype_copyflag():
     arr = np.arange(10, dtype=np.intp)
 
     res_true = arr.astype(np.intp, copy=True)
-    assert not np.shares_memory(arr, res_true)
+    assert not np.may_share_memory(arr, res_true)
+    res_always = arr.astype(np.intp, copy=np._CopyMode.ALWAYS)
+    assert not np.may_share_memory(arr, res_always)
 
     res_false = arr.astype(np.intp, copy=False)
-    assert np.shares_memory(arr, res_false)
+    # `res_false is arr` currently, but check `may_share_memory`.
+    assert np.may_share_memory(arr, res_false)
+    res_if_needed = arr.astype(np.intp, copy=np._CopyMode.IF_NEEDED)
+    # `res_if_needed is arr` currently, but check `may_share_memory`.
+    assert np.may_share_memory(arr, res_if_needed)
 
-    res_false_float = arr.astype(np.float64, copy=False)
-    assert not np.shares_memory(arr, res_false_float)
+    res_never = arr.astype(np.intp, copy=np._CopyMode.NEVER)
+    assert np.may_share_memory(arr, res_never)
 
-    # _CopyMode enum isn't allowed
+    # Simple tests for when a copy is necessary:
+    res_false = arr.astype(np.float64, copy=False)
+    assert_array_equal(res_false, arr)
+    res_if_needed = arr.astype(np.float64, 
+                               copy=np._CopyMode.IF_NEEDED)
+    assert_array_equal(res_if_needed, arr)
     assert_raises(ValueError, arr.astype, np.float64,
                   copy=np._CopyMode.NEVER)

@@ -4,7 +4,7 @@ import pytest
 
 import numpy as np
 from numpy.testing import assert_, assert_equal, IS_MUSL
-from numpy._core.tests._locales import CommaDecimalPointLocale
+from numpy.core.tests._locales import CommaDecimalPointLocale
 
 
 from io import StringIO
@@ -156,8 +156,8 @@ def test_complex_type_print(tp):
 
 def test_scalar_format():
     """Test the str.format method with NumPy scalar types"""
-    tests = [('{0}', True, np.bool),
-            ('{0}', False, np.bool),
+    tests = [('{0}', True, np.bool_),
+            ('{0}', False, np.bool_),
             ('{0:d}', 130, np.uint8),
             ('{0:d}', 50000, np.uint16),
             ('{0:d}', 3000000000, np.uint32),

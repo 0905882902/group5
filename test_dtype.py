@@ -5,15 +5,15 @@ import ctypes
 import gc
 import types
 from typing import Any
-import pickle
 
 import numpy as np
 import numpy.dtypes
-from numpy._core._rational_tests import rational
-from numpy._core._multiarray_tests import create_custom_field_dtype
+from numpy.core._rational_tests import rational
+from numpy.core._multiarray_tests import create_custom_field_dtype
 from numpy.testing import (
     assert_, assert_equal, assert_array_equal, assert_raises, HAS_REFCOUNT,
     IS_PYSTON, _OLD_PROMOTION)
+from numpy.compat import pickle
 from itertools import permutations
 import random
 
@@ -33,7 +33,8 @@ def assert_dtype_not_equal(a, b):
             "two different types hash to the same value !")
 
 class TestBuiltin:
-    @pytest.mark.parametrize('t', [int, float, complex, np.int32, str, object])
+    @pytest.mark.parametrize('t', [int, float, complex, np.int32, str, object,
+                                   np.compat.unicode])
     def test_run(self, t):
         """Only test hash runs at all."""
         dt = np.dtype(t)
@@ -96,11 +97,6 @@ class TestBuiltin:
             assert_raises(TypeError, np.dtype, 'q8')
             assert_raises(TypeError, np.dtype, 'Q8')
 
-        # Make sure negative-sized dtype raises an error
-        assert_raises(TypeError, np.dtype, 'S-1')
-        assert_raises(TypeError, np.dtype, 'U-1')
-        assert_raises(TypeError, np.dtype, 'V-1')
-
     def test_richcompare_invalid_dtype_equality(self):
         # Make sure objects that cannot be converted to valid
         # dtypes results in False/True when compared to valid dtypes.
@@ -131,27 +127,19 @@ class TestBuiltin:
         with assert_raises(TypeError):
             np.dtype(dtype)
 
-    def test_expired_dtypes_with_bad_bytesize(self):
-        match: str = r".*removed in NumPy 2.0.*"
-        with pytest.raises(TypeError, match=match):
-            np.dtype("int0")
-        with pytest.raises(TypeError, match=match):
-            np.dtype("uint0")
-        with pytest.raises(TypeError, match=match):
-            np.dtype("bool8")
-        with pytest.raises(TypeError, match=match):
-            np.dtype("bytes0")
-        with pytest.raises(TypeError, match=match):
-            np.dtype("str0")
-        with pytest.raises(TypeError, match=match):
-            np.dtype("object0")
-        with pytest.raises(TypeError, match=match):
-            np.dtype("void0")
+    def test_remaining_dtypes_with_bad_bytesize(self):
+        # The np.<name> aliases were deprecated, these probably should be too 
+        assert np.dtype("int0") is np.dtype("intp")
+        assert np.dtype("uint0") is np.dtype("uintp")
+        assert np.dtype("bool8") is np.dtype("bool")
+        assert np.dtype("bytes0") is np.dtype("bytes")
+        assert np.dtype("str0") is np.dtype("str")
+        assert np.dtype("object0") is np.dtype("object")
 
     @pytest.mark.parametrize(
         'value',
         ['m8', 'M8', 'datetime64', 'timedelta64',
-         'i4, (2,3)f8, f4', 'S3, 3u8, (3,4)S10',
+         'i4, (2,3)f8, f4', 'a3, 3u8, (3,4)a10',
          '>f', '<f', '=f', '|f',
         ])
     def test_dtype_bytes_str_equivalence(self, value):
@@ -166,7 +154,7 @@ class TestBuiltin:
         # Byte order indicator, but no type
         assert_raises(TypeError, np.dtype, b'|')
 
-        # Single character with ordinal < NPY_NTYPES_LEGACY returns
+        # Single character with ordinal < NPY_NTYPES returns
         # type by index into _builtin_descrs
         assert_dtype_equal(np.dtype(bytes([0])), np.dtype('bool'))
         assert_dtype_equal(np.dtype(bytes([17])), np.dtype(object))
@@ -236,22 +224,6 @@ class TestBuiltin:
         with pytest.raises(ValueError):
             type(np.dtype("U"))(-1)
 
-        # OverflowError on 32 bit
-        with pytest.raises((TypeError, OverflowError)):
-            # see gh-26556
-            type(np.dtype("S"))(2**61)
-
-        with pytest.raises(TypeError):
-            np.dtype("S1234hello")
-
-    def test_leading_zero_parsing(self):
-        dt1 = np.dtype('S010')
-        dt2 = np.dtype('S10')
-
-        assert dt1 == dt2
-        assert repr(dt1) == "dtype('S10')"
-        assert dt1.itemsize == 10
-
 
 class TestRecord:
     def test_equivalent_record(self):
@@ -303,13 +275,6 @@ class TestRecord:
         a.__setstate__(state)
         assert_dtype_equal(a, b)
         assert_dtype_not_equal(a, c)
-
-    def test_init_simple_structured(self):
-        dt1 = np.dtype("i, i")
-        assert dt1.names == ("f0", "f1")
-
-        dt2 = np.dtype("i,")
-        assert dt2.names == ("f0",)
 
     def test_mutate_error(self):
         # NOTE: Mutating should be deprecated, but new API added to replace it.
@@ -384,21 +349,6 @@ class TestRecord:
                                  ('b', [('f0', '<i2'), ('', '|V2'),
                                  ('f1', '<f4')], (2,))])
 
-    def test_empty_struct_alignment(self):
-        # Empty dtypes should have an alignment of 1
-        dt = np.dtype([], align=True)
-        assert_equal(dt.alignment, 1)
-        dt = np.dtype([('f0', [])], align=True)
-        assert_equal(dt.alignment, 1)
-        dt = np.dtype({'names': [],
-                       'formats': [],
-                       'offsets': []}, align=True)
-        assert_equal(dt.alignment, 1)
-        dt = np.dtype({'names': ['f0'],
-                       'formats': [[]],
-                       'offsets': [0]}, align=True)
-        assert_equal(dt.alignment, 1)
-
     def test_union_struct(self):
         # Should be able to create union dtypes
         dt = np.dtype({'names':['f0', 'f1', 'f2'], 'formats':['<u4', '<u2', '<u2'],
@@ -447,11 +397,11 @@ class TestRecord:
                        'offsets':[np.dtype('intp').itemsize, 0]})
 
     @pytest.mark.parametrize(["obj", "dtype", "expected"],
-        [([], ("2f4"), np.empty((0, 2), dtype="f4")),
-         (3, "(3,)f4", [3, 3, 3]),
-         (np.float64(2), "(2,)f4", [2, 2]),
+        [([], ("(2)f4,"), np.empty((0, 2), dtype="f4")),
+         (3, "(3)f4,", [3, 3, 3]),
+         (np.float64(2), "(2)f4,", [2, 2]),
          ([((0, 1), (1, 2)), ((2,),)], '(2,2)f4', None),
-         (["1", "2"], "2i", None)])
+         (["1", "2"], "(2)i,", None)])
     def test_subarray_list(self, obj, dtype, expected):
         dtype = np.dtype(dtype)
         res = np.array(obj, dtype=dtype)
@@ -463,17 +413,6 @@ class TestRecord:
                 expected[i] = obj[i]
 
         assert_array_equal(res, expected)
-
-    def test_parenthesized_single_number(self):
-        with pytest.raises(TypeError, match="not understood"):
-            np.dtype("(2)f4")
-
-        # Deprecation also tested in
-        # test_deprecations.py::TestDeprecatedDTypeParenthesizedRepeatCount
-        # Left here to allow easy conversion to an exception check.
-        with pytest.warns(DeprecationWarning,
-                          match="parenthesized single number"):
-            np.dtype("(2)f4,")
 
     def test_comma_datetime(self):
         dt = np.dtype('M8[D],datetime64[Y],i8')
@@ -616,7 +555,7 @@ class TestRecord:
     def test_nonstructured_with_object(self):
         # See gh-23277, the dtype here thinks it contain objects, if the
         # assert about that fails, the test becomes meaningless (which is OK)
-        arr = np.recarray((0,), dtype="O")
+        arr = np.recarray((0,), dtype="O") 
         assert arr.dtype.names is None  # no fields
         assert arr.dtype.hasobject  # but claims to contain objects
         del arr  # the deletion failed previously.
@@ -654,8 +593,10 @@ class TestSubarray:
     def test_shape_equal(self):
         """Test some data types that are equal"""
         assert_dtype_equal(np.dtype('f8'), np.dtype(('f8', tuple())))
-        assert_dtype_equal(np.dtype('(1,)f8'), np.dtype(('f8', 1)))
-        assert np.dtype(('f8', 1)).shape == (1,)
+        # FutureWarning during deprecation period; after it is passed this
+        # should instead check that "(1)f8" == "1f8" == ("f8", 1).
+        with pytest.warns(FutureWarning):
+            assert_dtype_equal(np.dtype('f8'), np.dtype(('f8', 1)))
         assert_dtype_equal(np.dtype((int, 2)), np.dtype((int, (2,))))
         assert_dtype_equal(np.dtype(('<f4', (3, 2))), np.dtype(('<f4', (3, 2))))
         d = ([('a', 'f4', (1, 2)), ('b', 'f8', (3, 1))], (3, 2))
@@ -1363,7 +1304,7 @@ class TestPickling:
             assert_equal(x[0], y[0])
 
     @pytest.mark.parametrize('t', [int, float, complex, np.int32, str, object,
-                                   bool])
+                                   np.compat.unicode, bool])
     def test_builtin(self, t):
         self.check_pickling(np.dtype(t))
 
@@ -1409,24 +1350,12 @@ class TestPickling:
 
     @pytest.mark.parametrize("DType",
         [type(np.dtype(t)) for t in np.typecodes['All']] +
-        [type(np.dtype(rational)), np.dtype])
-    def test_pickle_dtype_class(self, DType):
+        [np.dtype(rational), np.dtype])
+    def test_pickle_types(self, DType):
         # Check that DTypes (the classes/types) roundtrip when pickling
         for proto in range(pickle.HIGHEST_PROTOCOL + 1):
             roundtrip_DType = pickle.loads(pickle.dumps(DType, proto))
             assert roundtrip_DType is DType
-
-    @pytest.mark.parametrize("dt",
-        [np.dtype(t) for t in np.typecodes['All']] +
-        [np.dtype(rational)])
-    def test_pickle_dtype(self, dt):
-        # Check that dtype instances roundtrip when pickling and that pickling
-        # doesn't change the hash value
-        pre_pickle_hash = hash(dt)
-        for proto in range(pickle.HIGHEST_PROTOCOL + 1):
-            roundtrip_dt = pickle.loads(pickle.dumps(dt, proto))
-            assert roundtrip_dt == dt
-            assert hash(dt) == pre_pickle_hash
 
 
 class TestPromotion:
@@ -1471,7 +1400,7 @@ class TestPromotion:
         assert res == expected
 
     @pytest.mark.parametrize(["other", "expected"],
-                 [(np.bool, np.complex128),
+                 [(np.bool_, np.complex128),
                   (np.int64, np.complex128),
                   (np.float16, np.complex64),
                   (np.float32, np.complex64),
@@ -1502,12 +1431,13 @@ class TestPromotion:
 
     @pytest.mark.parametrize("val", [2, 2**32, 2**63, 2**64, 2*100])
     def test_python_integer_promotion(self, val):
-        # If we only pass scalars (mainly python ones!), NEP 50 means
-        # that we get the default integer
-        expected_dtype = np.dtype(int)  # the default integer
+        # If we only path scalars (mainly python ones!), the result must take
+        # into account that the integer may be considered int32, int64, uint64,
+        # or object depending on the input value.  So test those paths!
+        expected_dtype = np.result_type(np.array(val).dtype, np.array(0).dtype)
         assert np.result_type(val, 0) == expected_dtype
-        # With NEP 50, the NumPy scalar wins though:
-        assert np.result_type(val, np.int8(0)) == np.int8
+        # For completeness sake, also check with a NumPy scalar as second arg:
+        assert np.result_type(val, np.int8(0)) == expected_dtype
 
     @pytest.mark.parametrize(["other", "expected"],
             [(1, rational), (1., np.float64)])
@@ -1542,7 +1472,7 @@ class TestPromotion:
              ([1., 1., np.int64], np.float64),
              ([1., 1j, np.float64], np.complex128),
              ([1j, 1j, np.float64], np.complex128),
-             ([1, True, np.bool], np.int_),
+             ([1, True, np.bool_], np.int_),
             ])
     def test_permutations_do_not_influence_result(self, dtypes, expected):
         # Tests that most permutations do not influence the result.  In the
@@ -1578,6 +1508,11 @@ def test_invalid_dtype_string():
 def test_keyword_argument():
     # test for https://github.com/numpy/numpy/pull/16574#issuecomment-642660971
     assert np.dtype(dtype=np.float64) == np.dtype(np.float64)
+
+
+def test_ulong_dtype():
+    # test for gh-21063
+    assert np.dtype("ulong") == np.dtype(np.uint)
 
 
 class TestFromDTypeAttribute:
@@ -1703,9 +1638,8 @@ class TestFromCTypes:
     @staticmethod
     def check(ctype, dtype):
         dtype = np.dtype(dtype)
-        assert np.dtype(ctype) == dtype
-        assert np.dtype(ctype()) == dtype
-        assert ctypes.sizeof(ctype) == dtype.itemsize
+        assert_equal(np.dtype(ctype), dtype)
+        assert_equal(np.dtype(ctype()), dtype)
 
     def test_array(self):
         c8 = ctypes.c_uint8
@@ -1740,12 +1674,8 @@ class TestFromCTypes:
         p_uint8 = ctypes.POINTER(ctypes.c_uint8)
         assert_raises(TypeError, np.dtype, p_uint8)
 
-    def test_size_t(self):
-        assert np.dtype(np.uintp) is np.dtype("N")
-        self.check(ctypes.c_size_t, np.uintp)
-
     def test_void_pointer(self):
-        self.check(ctypes.c_void_p, "P")
+        self.check(ctypes.c_void_p, np.uintp)
 
     def test_union(self):
         class Union(ctypes.Union):
@@ -1917,13 +1847,6 @@ class TestUserDType:
         # mytype does not inherit from `np.generic`.  This seems like an
         # unnecessary restriction, but one that has been around forever:
         assert np.dtype(mytype) == np.dtype("O")
-
-        if HAS_REFCOUNT:
-            # Create an array and test that memory gets cleaned up (gh-25949)
-            o = object()
-            a = np.array([o], dtype=dt)
-            del a
-            assert sys.getrefcount(o) == 2
 
     def test_custom_structured_dtype_errors(self):
         class mytype:

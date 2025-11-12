@@ -2,24 +2,24 @@
 Test scalar buffer interface adheres to PEP 3118
 """
 import numpy as np
-from numpy._core._rational_tests import rational
-from numpy._core._multiarray_tests import get_buffer_info
+from numpy.core._rational_tests import rational
+from numpy.core._multiarray_tests import get_buffer_info
 import pytest
 
 from numpy.testing import assert_, assert_equal, assert_raises
 
 # PEP3118 format strings for native (standard alignment and byteorder) types
 scalars_and_codes = [
-    (np.bool, '?'),
+    (np.bool_, '?'),
     (np.byte, 'b'),
     (np.short, 'h'),
     (np.intc, 'i'),
-    (np.long, 'l'),
+    (np.int_, 'l'),
     (np.longlong, 'q'),
     (np.ubyte, 'B'),
     (np.ushort, 'H'),
     (np.uintc, 'I'),
-    (np.ulong, 'L'),
+    (np.uint, 'L'),
     (np.ulonglong, 'Q'),
     (np.half, 'e'),
     (np.single, 'f'),

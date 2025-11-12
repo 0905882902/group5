@@ -12,7 +12,7 @@ from typing import Any
 import pytest
 
 import numpy as np
-from numpy._core._multiarray_umath import _get_castingimpl as get_castingimpl
+from numpy.core._multiarray_umath import _get_castingimpl as get_castingimpl
 
 
 class TestResolveDescriptors:
@@ -65,9 +65,7 @@ class TestSimpleStridedCall:
 
 
 @pytest.mark.parametrize(
-    "cls", [
-        np.ndarray, np.recarray, np.char.chararray, np.matrix, np.memmap
-    ]
+    "cls", [np.ndarray, np.recarray, np.chararray, np.matrix, np.memmap]
 )
 class TestClassGetItem:
     def test_class_getitem(self, cls: type[np.ndarray]) -> None:

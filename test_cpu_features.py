@@ -1,5 +1,5 @@
 import sys, platform, re, pytest
-from numpy._core._multiarray_umath import (
+from numpy.core._multiarray_umath import (
     __cpu_features__,
     __cpu_baseline__,
     __cpu_dispatch__,
@@ -138,10 +138,7 @@ class TestEnvPrivation:
     BASELINE_FEAT = None if len(__cpu_baseline__) == 0 else __cpu_baseline__[0]
     SCRIPT = """
 def main():
-    from numpy._core._multiarray_umath import (
-        __cpu_features__, 
-        __cpu_dispatch__
-    )
+    from numpy.core._multiarray_umath import __cpu_features__, __cpu_dispatch__
 
     detected = [feat for feat in __cpu_dispatch__ if __cpu_features__[feat]]
     print(detected)
@@ -165,7 +162,7 @@ if __name__ == "__main__":
             **self.SUBPROCESS_ARGS,
             )
 
-    # Helper function mimicking pytest.raises for subprocess call
+    # Helper function mimicing pytest.raises for subprocess call
     def _expect_error(
         self,
         msg,
@@ -383,7 +380,7 @@ is_arm = re.match("^(arm|aarch64)", machine, re.IGNORECASE)
 @pytest.mark.skipif(not is_linux or not is_arm, reason="Only for Linux and ARM")
 class Test_ARM_Features(AbstractTest):
     features = [
-        "SVE", "NEON", "ASIMD", "FPHP", "ASIMDHP", "ASIMDDP", "ASIMDFHM"
+        "NEON", "ASIMD", "FPHP", "ASIMDHP", "ASIMDDP", "ASIMDFHM"
     ]
     features_groups = dict(
         NEON_FP16  = ["NEON", "HALF"],

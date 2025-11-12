@@ -6,10 +6,9 @@ import pickle
 
 import pytest
 import numpy as np
-from numpy.exceptions import AxisError
 
-_ArrayMemoryError = np._core._exceptions._ArrayMemoryError
-_UFuncNoLoopError = np._core._exceptions._UFuncNoLoopError
+_ArrayMemoryError = np.core._exceptions._ArrayMemoryError
+_UFuncNoLoopError = np.core._exceptions._UFuncNoLoopError
 
 class TestArrayMemoryError:
     def test_pickling(self):
@@ -68,7 +67,7 @@ class TestUFuncNoLoopError:
 class TestAxisError:
     def test_attr(self, args):
         """Validate attribute types."""
-        exc = AxisError(*args)
+        exc = np.AxisError(*args)
         if len(args) == 1:
             assert exc.axis is None
             assert exc.ndim is None
@@ -79,7 +78,7 @@ class TestAxisError:
 
     def test_pickling(self, args):
         """Test that `AxisError` can be pickled."""
-        exc = AxisError(*args)
+        exc = np.AxisError(*args)
         exc2 = pickle.loads(pickle.dumps(exc))
 
         assert type(exc) is type(exc2)

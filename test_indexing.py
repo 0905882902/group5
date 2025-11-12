@@ -6,9 +6,8 @@ import operator
 import pytest
 
 import numpy as np
-from numpy._core._multiarray_tests import array_indexing
+from numpy.core._multiarray_tests import array_indexing
 from itertools import product
-from numpy.exceptions import ComplexWarning, VisibleDeprecationWarning
 from numpy.testing import (
     assert_, assert_equal, assert_raises, assert_raises_regex,
     assert_array_equal, assert_warns, HAS_REFCOUNT, IS_WASM
@@ -132,28 +131,6 @@ class TestIndexing:
 
         b = np.array([])
         assert_raises(IndexError, a.__getitem__, b)
-
-    def test_gh_26542(self):
-        a = np.array([0, 1, 2])
-        idx = np.array([2, 1, 0])
-        a[idx] = a
-        expected = np.array([2, 1, 0])
-        assert_equal(a, expected)
-
-    def test_gh_26542_2d(self):
-        a = np.array([[0, 1, 2]])
-        idx_row = np.zeros(3, dtype=int)
-        idx_col = np.array([2, 1, 0])
-        a[idx_row, idx_col] = a
-        expected = np.array([[2, 1, 0]])
-        assert_equal(a, expected)
-
-    def test_gh_26542_index_overlap(self):
-        arr = np.arange(100)
-        expected_vals = np.copy(arr[:-10])
-        arr[10:] = arr[:-10]
-        actual_vals = arr[10:]
-        assert_equal(actual_vals, expected_vals)
 
     def test_ellipsis_index(self):
         a = np.array([[1, 2, 3],
@@ -319,14 +296,14 @@ class TestIndexing:
 
     def test_too_many_fancy_indices_special_case(self):
         # Just documents behaviour, this is a small limitation.
-        a = np.ones((1,) * 64)  # 64 is NPY_MAXDIMS
-        assert_raises(IndexError, a.__getitem__, (np.array([0]),) * 64)
+        a = np.ones((1,) * 32)  # 32 is NPY_MAXDIMS
+        assert_raises(IndexError, a.__getitem__, (np.array([0]),) * 32)
 
     def test_scalar_array_bool(self):
         # NumPy bools can be used as boolean index (python ones as of yet not)
         a = np.array(1)
-        assert_equal(a[np.bool(True)], a[np.array(True)])
-        assert_equal(a[np.bool(False)], a[np.array(False)])
+        assert_equal(a[np.bool_(True)], a[np.array(True)])
+        assert_equal(a[np.bool_(False)], a[np.array(False)])
 
         # After deprecating bools as integers:
         #a = np.array([0,1,2])
@@ -442,16 +419,16 @@ class TestIndexing:
 
         class ArrayLike:
             # Simple array, should behave like the array
-            def __array__(self, dtype=None, copy=None):
+            def __array__(self):
                 return np.array(0)
 
         a = np.zeros(())
-        assert_(isinstance(a[()], np.float64))
+        assert_(isinstance(a[()], np.float_))
         a = np.zeros(1)
-        assert_(isinstance(a[z], np.float64))
+        assert_(isinstance(a[z], np.float_))
         a = np.zeros((1, 1))
-        assert_(isinstance(a[z, np.array(0)], np.float64))
-        assert_(isinstance(a[z, ArrayLike()], np.float64))
+        assert_(isinstance(a[z, np.array(0)], np.float_))
+        assert_(isinstance(a[z, ArrayLike()], np.float_))
 
         # And object arrays do not call it too often:
         b = np.array(0)
@@ -574,8 +551,8 @@ class TestIndexing:
 
     @pytest.mark.parametrize("index",
             [True, False, np.array([0])])
-    @pytest.mark.parametrize("num", [64, 80])
-    @pytest.mark.parametrize("original_ndim", [1, 64])
+    @pytest.mark.parametrize("num", [32, 40])
+    @pytest.mark.parametrize("original_ndim", [1, 32])
     def test_too_many_advanced_indices(self, index, num, original_ndim):
         # These are limitations based on the number of arguments we can process.
         # For `num=32` (and all boolean cases), the result is actually define;
@@ -771,12 +748,12 @@ class TestFancyIndexingCast:
         assert_equal(zero_array[0, 1], 1)
 
         # Fancy indexing works, although we get a cast warning.
-        assert_warns(ComplexWarning,
+        assert_warns(np.ComplexWarning,
                      zero_array.__setitem__, ([0], [1]), np.array([2 + 1j]))
         assert_equal(zero_array[0, 1], 2)  # No complex part
 
         # Cast complex to float, throwing away the imaginary portion.
-        assert_warns(ComplexWarning,
+        assert_warns(np.ComplexWarning,
                      zero_array.__setitem__, bool_index, np.array([1j]))
         assert_equal(zero_array[0, 1], 0)
 
@@ -1222,7 +1199,7 @@ class TestMultiIndexingAutomated:
             # This is so that np.array(True) is not accepted in a full integer
             # index, when running the file separately.
             warnings.filterwarnings('error', '', DeprecationWarning)
-            warnings.filterwarnings('error', '', VisibleDeprecationWarning)
+            warnings.filterwarnings('error', '', np.VisibleDeprecationWarning)
 
             def isskip(idx):
                 return isinstance(idx, str) and idx == "skip"
@@ -1293,7 +1270,7 @@ class TestFloatNonIntegerArgument:
         def mult(a, b):
             return a * b
 
-        assert_raises(TypeError, mult, [1], np.float64(3))
+        assert_raises(TypeError, mult, [1], np.float_(3))
         # following should be OK
         mult([1], np.int_(3))
 
@@ -1311,7 +1288,7 @@ class TestBooleanIndexing:
         a = np.array([[[1]]])
 
         assert_raises(TypeError, np.reshape, a, (True, -1))
-        assert_raises(TypeError, np.reshape, a, (np.bool(True), -1))
+        assert_raises(TypeError, np.reshape, a, (np.bool_(True), -1))
         # Note that operator.index(np.array(True)) does not work, a boolean
         # array is thus also deprecated, but not with the same message:
         assert_raises(TypeError, operator.index, np.array(True))
@@ -1333,30 +1310,30 @@ class TestBooleanIndexing:
         # This used to incorrectly work (and give an array of shape (0,))
         idx1 = np.array([[False]*9])
         assert_raises_regex(IndexError,
-            "boolean index did not match indexed array along axis 0; "
-            "size of axis is 3 but size of corresponding boolean axis is 1",
+            "boolean index did not match indexed array along dimension 0; "
+            "dimension is 3 but corresponding boolean dimension is 1",
             lambda: a[idx1])
 
         # This used to incorrectly give a ValueError: operands could not be broadcast together
         idx2 = np.array([[False]*8 + [True]])
         assert_raises_regex(IndexError,
-            "boolean index did not match indexed array along axis 0; "
-            "size of axis is 3 but size of corresponding boolean axis is 1",
+            "boolean index did not match indexed array along dimension 0; "
+            "dimension is 3 but corresponding boolean dimension is 1",
             lambda: a[idx2])
 
         # This is the same as it used to be. The above two should work like this.
         idx3 = np.array([[False]*10])
         assert_raises_regex(IndexError,
-            "boolean index did not match indexed array along axis 0; "
-            "size of axis is 3 but size of corresponding boolean axis is 1",
+            "boolean index did not match indexed array along dimension 0; "
+            "dimension is 3 but corresponding boolean dimension is 1",
             lambda: a[idx3])
 
         # This used to give ValueError: non-broadcastable operand
         a = np.ones((1, 1, 2))
         idx = np.array([[[True], [False]]])
         assert_raises_regex(IndexError,
-            "boolean index did not match indexed array along axis 1; "
-            "size of axis is 1 but size of corresponding boolean axis is 2",
+            "boolean index did not match indexed array along dimension 1; "
+            "dimension is 1 but corresponding boolean dimension is 2",
             lambda: a[idx])
 
 

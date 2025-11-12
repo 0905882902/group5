@@ -4,16 +4,15 @@ import os
 import tempfile
 from io import StringIO
 from unittest import mock
-import pickle
-
-import pytest
 
 import numpy as np
 from numpy.testing import (
     assert_, assert_equal, assert_raises, assert_raises_regex)
-from numpy._core.overrides import (
+from numpy.core.overrides import (
     _get_implementing_args, array_function_dispatch,
     verify_matching_signatures)
+from numpy.compat import pickle
+import pytest
 
 
 def _return_not_implemented(self, *args, **kwargs):
@@ -134,11 +133,11 @@ class TestGetImplementingArgs:
 
     def test_too_many_duck_arrays(self):
         namespace = dict(__array_function__=_return_not_implemented)
-        types = [type('A' + str(i), (object,), namespace) for i in range(65)]
+        types = [type('A' + str(i), (object,), namespace) for i in range(33)]
         relevant_args = [t() for t in types]
 
-        actual = _get_implementing_args(relevant_args[:64])
-        assert_equal(actual, relevant_args[:64])
+        actual = _get_implementing_args(relevant_args[:32])
+        assert_equal(actual, relevant_args[:32])
 
         with assert_raises_regex(TypeError, 'distinct argument types'):
             _get_implementing_args(relevant_args)
@@ -448,7 +447,7 @@ class TestArrayFunctionImplementation:
     def test_too_many_args(self):
         # Mainly a unit-test to increase coverage
         objs = []
-        for i in range(80):
+        for i in range(40):
             class MyArr:
                 def __array_function__(self, *args, **kwargs):
                     return NotImplemented
@@ -709,10 +708,10 @@ class TestArrayLike:
 
 def test_function_like():
     # We provide a `__get__` implementation, make sure it works
-    assert type(np.mean) is np._core._multiarray_umath._ArrayFunctionDispatcher 
+    assert type(np.mean) is np.core._multiarray_umath._ArrayFunctionDispatcher 
 
     class MyClass:
-        def __array__(self, dtype=None, copy=None):
+        def __array__(self):
             # valid argument to mean:
             return np.arange(3)
 
@@ -737,3 +736,24 @@ def test_function_like():
     bound = np.mean.__get__(MyClass)  # classmethod
     with pytest.raises(TypeError, match="unsupported operand type"):
         bound()
+
+
+def test_scipy_trapz_support_shim():
+    # SciPy 1.10 and earlier "clone" trapz in this way, so we have a
+    # support shim in place: https://github.com/scipy/scipy/issues/17811
+    # That should be removed eventually.  This test copies what SciPy does.
+    # Hopefully removable 1 year after SciPy 1.11; shim added to NumPy 1.25.
+    import types
+    import functools
+
+    def _copy_func(f):
+        # Based on http://stackoverflow.com/a/6528148/190597 (Glenn Maynard)
+        g = types.FunctionType(f.__code__, f.__globals__, name=f.__name__,
+                            argdefs=f.__defaults__, closure=f.__closure__)
+        g = functools.update_wrapper(g, f)
+        g.__kwdefaults__ = f.__kwdefaults__
+        return g
+
+    trapezoid = _copy_func(np.trapz)
+
+    assert np.trapz([1, 2]) == trapezoid([1, 2])

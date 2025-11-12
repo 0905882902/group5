@@ -16,7 +16,7 @@ import numpy as np
 from numpy.lib.stride_tricks import as_strided
 
 from numpy.testing import assert_array_equal
-from numpy._core._multiarray_umath import _get_castingimpl as get_castingimpl
+from numpy.core._multiarray_umath import _get_castingimpl as get_castingimpl
 
 
 # Simple skips object, parametric and long double (unsupported by struct)
@@ -39,7 +39,7 @@ def simple_dtype_instances():
 def get_expected_stringlength(dtype):
     """Returns the string length when casting the basic dtypes to strings.
     """
-    if dtype == np.bool:
+    if dtype == np.bool_:
         return 5
     if dtype.kind in "iu":
         if dtype.itemsize == 1:
@@ -287,7 +287,8 @@ class TestCasting:
                         assert(from_dt is from_res)
                         assert(to_dt is to_res)
 
-    @pytest.mark.filterwarnings("ignore::numpy.exceptions.ComplexWarning")
+
+    @pytest.mark.filterwarnings("ignore::numpy.ComplexWarning")
     @pytest.mark.parametrize("from_dt", simple_dtype_instances())
     def test_simple_direct_casts(self, from_dt):
         """

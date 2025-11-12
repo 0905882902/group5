@@ -11,7 +11,6 @@ from hypothesis.strategies import sampled_from
 from hypothesis.extra import numpy as hynp
 
 import numpy as np
-from numpy.exceptions import ComplexWarning
 from numpy.testing import (
     assert_, assert_equal, assert_raises, assert_almost_equal,
     assert_array_equal, IS_PYPY, suppress_warnings, _gen_alignment_data,
@@ -24,7 +23,7 @@ try:
 except TypeError:
     USING_CLANG_CL = False
 
-types = [np.bool, np.byte, np.ubyte, np.short, np.ushort, np.intc, np.uintc,
+types = [np.bool_, np.byte, np.ubyte, np.short, np.ushort, np.intc, np.uintc,
          np.int_, np.uint, np.longlong, np.ulonglong,
          np.single, np.double, np.longdouble, np.csingle,
          np.cdouble, np.clongdouble]
@@ -485,8 +484,10 @@ class TestConversion:
 
     def test_iinfo_long_values(self):
         for code in 'bBhH':
-            with pytest.raises(OverflowError):
-                np.array(np.iinfo(code).max + 1, dtype=code)
+            with pytest.warns(DeprecationWarning):
+                res = np.array(np.iinfo(code).max + 1, dtype=code)
+            tgt = np.iinfo(code).min
+            assert_(res == tgt)
 
         for code in np.typecodes['AllInteger']:
             res = np.array(np.iinfo(code).max, dtype=code)
@@ -510,7 +511,7 @@ class TestConversion:
         x = np.longdouble(np.inf)
         assert_raises(OverflowError, int, x)
         with suppress_warnings() as sup:
-            sup.record(ComplexWarning)
+            sup.record(np.ComplexWarning)
             x = np.clongdouble(np.inf)
             assert_raises(OverflowError, int, x)
             assert_equal(len(sup.log), 1)
@@ -520,7 +521,7 @@ class TestConversion:
         x = np.longdouble(np.inf)
         assert_raises(OverflowError, x.__int__)
         with suppress_warnings() as sup:
-            sup.record(ComplexWarning)
+            sup.record(np.ComplexWarning)
             x = np.clongdouble(np.inf)
             assert_raises(OverflowError, x.__int__)
             assert_equal(len(sup.log), 1)
@@ -703,8 +704,7 @@ class TestMultiply:
         class ArrayLike:
             def __init__(self, arr):
                 self.arr = arr
-
-            def __array__(self, dtype=None, copy=None):
+            def __array__(self):
                 return self.arr
 
         # Test for simple ArrayLike above and memoryviews (original report)
@@ -717,7 +717,7 @@ class TestMultiply:
 
 class TestNegative:
     def test_exceptions(self):
-        a = np.ones((), dtype=np.bool)[()]
+        a = np.ones((), dtype=np.bool_)[()]
         assert_raises(TypeError, operator.neg, a)
 
     def test_result(self):
@@ -735,7 +735,7 @@ class TestNegative:
 
 class TestSubtract:
     def test_exceptions(self):
-        a = np.ones((), dtype=np.bool)[()]
+        a = np.ones((), dtype=np.bool_)[()]
         assert_raises(TypeError, operator.sub, a, a)
 
     def test_result(self):
@@ -908,43 +908,31 @@ def test_operator_scalars(op, type1, type2):
 
 
 @pytest.mark.parametrize("op", reasonable_operators_for_scalars)
-@pytest.mark.parametrize("sctype", [np.longdouble, np.clongdouble])
-def test_longdouble_operators_with_obj(sctype, op):
-    # This is/used to be tricky, because NumPy generally falls back to
-    # using the ufunc via `np.asarray()`, this effectively might do:
-    # longdouble + None
-    #   -> asarray(longdouble) + np.array(None, dtype=object)
-    #   -> asarray(longdouble).astype(object) + np.array(None, dtype=object)
-    # And after getting the scalars in the inner loop:
-    #   -> longdouble + None
-    #
-    # That would recurse infinitely.  Other scalars return the python object
-    # on cast, so this type of things works OK.
+@pytest.mark.parametrize("val", [None, 2**64])
+def test_longdouble_inf_loop(op, val):
+    # Note: The 2**64 value will pass once NEP 50 is adopted.
     try:
-        op(sctype(3), None)
+        op(np.longdouble(3), val)
     except TypeError:
         pass
     try:
-        op(None, sctype(3))
+        op(val, np.longdouble(3))
     except TypeError:
         pass
 
 
 @pytest.mark.parametrize("op", reasonable_operators_for_scalars)
-@pytest.mark.parametrize("sctype", [np.longdouble, np.clongdouble])
-@np.errstate(all="ignore")
-def test_longdouble_operators_with_large_int(sctype, op):
-    # (See `test_longdouble_operators_with_obj` for why longdouble is special)
-    # NEP 50 means that the result is clearly a (c)longdouble here:
-    if sctype == np.clongdouble and op in [operator.mod, operator.floordiv]:
-        # The above operators are not support for complex though...
-        with pytest.raises(TypeError):
-            op(sctype(3), 2**64)
-        with pytest.raises(TypeError):
-            op(sctype(3), 2**64)
-    else:
-        assert op(sctype(3), -2**64) == op(sctype(3), sctype(-2**64))
-        assert op(2**64, sctype(3)) == op(sctype(2**64), sctype(3))
+@pytest.mark.parametrize("val", [None, 2**64])
+def test_clongdouble_inf_loop(op, val):
+    # Note: The 2**64 value will pass once NEP 50 is adopted.
+    try:
+        op(np.clongdouble(3), val)
+    except TypeError:
+        pass
+    try:
+        op(val, np.longdouble(3))
+    except TypeError:
+        pass
 
 
 @pytest.mark.parametrize("dtype", np.typecodes["AllInteger"])
@@ -1048,7 +1036,7 @@ def test_subclass_deferral(sctype, __op__, __rop__, op, cmp):
 
     # inheritance has to override, or this is correctly lost:
     res = op(myf_simple1(1), myf_simple2(2))
-    assert type(res) == sctype or type(res) == np.bool
+    assert type(res) == sctype or type(res) == np.bool_
     assert op(myf_simple1(1), myf_simple2(2)) == op(1, 2)  # inherited
 
     # Two independent subclasses do not really define an order.  This could
@@ -1110,46 +1098,3 @@ def test_pyscalar_subclasses(subtype, __op__, __rop__, op, cmp):
     res = op(np.float32(2), myt(1))
     expected = op(np.longdouble(2), subtype(1))
     assert res == expected
-
-
-def test_truediv_int():
-    # This should work, as the result is float:
-    assert np.uint8(3) / 123454 == np.float64(3) / 123454
-
-
-@pytest.mark.slow
-@pytest.mark.parametrize("op",
-    # TODO: Power is a bit special, but here mostly bools seem to behave oddly
-    [op for op in reasonable_operators_for_scalars if op is not operator.pow])
-@pytest.mark.parametrize("sctype", types)
-@pytest.mark.parametrize("other_type", [float, int, complex])
-@pytest.mark.parametrize("rop", [True, False])
-def test_scalar_matches_array_op_with_pyscalar(op, sctype, other_type, rop):
-    # Check that the ufunc path matches by coercing to an array explicitly
-    val1 = sctype(2)
-    val2 = other_type(2)
-
-    if rop:
-        _op = op
-        op = lambda x, y: _op(y, x)
-
-    try:
-        res = op(val1, val2)
-    except TypeError:
-        try:
-            expected = op(np.asarray(val1), val2)
-            raise AssertionError("ufunc didn't raise.")
-        except TypeError:
-            return
-    else:
-        expected = op(np.asarray(val1), val2)
-
-    # Note that we only check dtype equivalency, as ufuncs may pick the lower
-    # dtype if they are equivalent.
-    assert res == expected
-    if isinstance(val1, float) and other_type is complex and rop:
-        # Python complex accepts float subclasses, so we don't get a chance
-        # and the result may be a Python complelx (thus, the `np.array()``)
-        assert np.array(res).dtype == expected.dtype
-    else:
-        assert res.dtype == expected.dtype

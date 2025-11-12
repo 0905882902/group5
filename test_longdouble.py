@@ -7,7 +7,7 @@ from numpy.testing import (
     assert_, assert_equal, assert_raises, assert_warns, assert_array_equal,
     temppath, IS_MUSL
     )
-from numpy._core.tests._locales import CommaDecimalPointLocale
+from numpy.core.tests._locales import CommaDecimalPointLocale
 
 
 LD_INFO = np.finfo(np.longdouble)
@@ -15,7 +15,7 @@ longdouble_longer_than_double = (LD_INFO.eps < np.finfo(np.double).eps)
 
 
 _o = 1 + LD_INFO.eps
-string_to_longdouble_inaccurate = (_o != np.longdouble(str(_o)))
+string_to_longdouble_inaccurate = (_o != np.longdouble(repr(_o)))
 del _o
 
 
@@ -37,16 +37,16 @@ repr_precision = len(repr(np.longdouble(0.1)))
                     reason="test flaky on musllinux")
 @pytest.mark.skipif(LD_INFO.precision + 2 >= repr_precision,
                     reason="repr precision not enough to show eps")
-def test_str_roundtrip():
+def test_repr_roundtrip():
     # We will only see eps in repr if within printing precision.
     o = 1 + LD_INFO.eps
-    assert_equal(np.longdouble(str(o)), o, "str was %s" % str(o))
+    assert_equal(np.longdouble(repr(o)), o, "repr was %s" % repr(o))
 
 
 @pytest.mark.skipif(string_to_longdouble_inaccurate, reason="Need strtold_l")
-def test_str_roundtrip_bytes():
+def test_repr_roundtrip_bytes():
     o = 1 + LD_INFO.eps
-    assert_equal(np.longdouble(str(o).encode("ascii")), o)
+    assert_equal(np.longdouble(repr(o).encode("ascii")), o)
 
 
 @pytest.mark.skipif(string_to_longdouble_inaccurate, reason="Need strtold_l")
@@ -59,9 +59,9 @@ def test_array_and_stringlike_roundtrip(strtype):
     o = 1 + LD_INFO.eps
 
     if strtype in (np.bytes_, bytes):
-        o_str = strtype(str(o).encode("ascii"))
+        o_str = strtype(repr(o).encode("ascii"))
     else:
-        o_str = strtype(str(o))
+        o_str = strtype(repr(o))
 
     # Test that `o` is correctly coerced from the string-like
     assert o == np.longdouble(o_str)
@@ -83,14 +83,14 @@ def test_bogus_string():
 @pytest.mark.skipif(string_to_longdouble_inaccurate, reason="Need strtold_l")
 def test_fromstring():
     o = 1 + LD_INFO.eps
-    s = (" " + str(o))*5
+    s = (" " + repr(o))*5
     a = np.array([o]*5)
     assert_equal(np.fromstring(s, sep=" ", dtype=np.longdouble), a,
                  err_msg="reading '%s'" % s)
 
 
 def test_fromstring_complex():
-    for ctype in ["complex", "cdouble"]:
+    for ctype in ["complex", "cdouble", "cfloat"]:
         # Check spacing between separator
         assert_equal(np.fromstring("1, 2 ,  3  ,4", sep=",", dtype=ctype),
                      np.array([1., 2., 3., 4.]))
@@ -143,7 +143,7 @@ class TestFileBased:
 
     ldbl = 1 + LD_INFO.eps
     tgt = np.array([ldbl]*5)
-    out = ''.join([str(t) + '\n' for t in tgt])
+    out = ''.join([repr(t) + '\n' for t in tgt])
 
     def test_fromfile_bogus(self):
         with temppath() as path:
@@ -155,7 +155,7 @@ class TestFileBased:
         assert_equal(res, np.array([1., 2., 3.]))
 
     def test_fromfile_complex(self):
-        for ctype in ["complex", "cdouble"]:
+        for ctype in ["complex", "cdouble", "cfloat"]:
             # Check spacing between separator and only real component specified
             with temppath() as path:
                 with open(path, 'w') as f:
@@ -275,9 +275,9 @@ class TestFileBased:
 # Conversions long double -> string
 
 
-def test_str_exact():
+def test_repr_exact():
     o = 1 + LD_INFO.eps
-    assert_(str(o) != '1')
+    assert_(repr(o) != '1')
 
 
 @pytest.mark.skipif(longdouble_longer_than_double, reason="BUG #2376")
@@ -314,9 +314,9 @@ def test_array_repr():
 
 class TestCommaDecimalPointLocale(CommaDecimalPointLocale):
 
-    def test_str_roundtrip_foreign(self):
+    def test_repr_roundtrip_foreign(self):
         o = 1.5
-        assert_equal(o, np.longdouble(str(o)))
+        assert_equal(o, np.longdouble(repr(o)))
 
     def test_fromstring_foreign_repr(self):
         f = 1.234
@@ -383,13 +383,13 @@ def test_musllinux_x86_64_signature():
     # this test may fail if you're emulating musllinux_x86_64 on a different
     # architecture, but should pass natively.
     known_sigs = [b'\xcd\xcc\xcc\xcc\xcc\xcc\xcc\xcc\xfb\xbf']
-    sig = (np.longdouble(-1.0) / np.longdouble(10.0))
-    sig = sig.view(sig.dtype.newbyteorder('<')).tobytes()[:10]
+    sig = (np.longdouble(-1.0) / np.longdouble(10.0)
+           ).newbyteorder('<').tobytes()[:10]
     assert sig in known_sigs
 
 
 def test_eps_positive():
     # np.finfo('g').eps should be positive on all platforms. If this isn't true
     # then something may have gone wrong with the MachArLike, e.g. if
-    # np._core.getlimits._discovered_machar didn't work properly
+    # np.core.getlimits._discovered_machar didn't work properly
     assert np.finfo(np.longdouble).eps > 0.

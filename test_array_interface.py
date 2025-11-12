@@ -1,7 +1,7 @@
 import sys
 import pytest
 import numpy as np
-from numpy.testing import extbuild, IS_WASM
+from numpy.testing import extbuild
 
 
 @pytest.fixture
@@ -12,8 +12,6 @@ def get_module(tmp_path):
 
     if not sys.platform.startswith('linux'):
         pytest.skip('link fails on cygwin')
-    if IS_WASM:
-        pytest.skip("Can't build module inside Wasm")
 
     prologue = '''
         #include <Python.h>
@@ -130,6 +128,9 @@ def get_module(tmp_path):
                                                more_init=more_init)
 
 
+# FIXME: numpy.testing.extbuild uses `numpy.distutils`, so this won't work on
+# Python 3.12 and up.
+@pytest.mark.skipif(sys.version_info >= (3, 12), reason="no numpy.distutils")
 @pytest.mark.slow
 def test_cstruct(get_module):
 
