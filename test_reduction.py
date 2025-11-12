@@ -2,61 +2,122 @@ import numpy as np
 import pytest
 
 import pandas as pd
-
-
-@pytest.fixture
-def data():
-    """Fixture returning boolean array, with valid and missing values."""
-    return pd.array(
-        [True, False] * 4 + [np.nan] + [True, False] * 44 + [np.nan] + [True, False],
-        dtype="boolean",
-    )
+from pandas import (
+    DataFrame,
+    Series,
+    array,
+)
+import pandas._testing as tm
 
 
 @pytest.mark.parametrize(
-    "values, exp_any, exp_all, exp_any_noskip, exp_all_noskip",
+    "op, expected",
     [
-        ([True, pd.NA], True, True, True, pd.NA),
-        ([False, pd.NA], False, False, pd.NA, False),
-        ([pd.NA], False, True, pd.NA, pd.NA),
-        ([], False, True, False, True),
-        # GH-33253: all True / all False values buggy with skipna=False
-        ([True, True], True, True, True, True),
-        ([False, False], False, False, False, False),
+        ["sum", np.int64(3)],
+        ["prod", np.int64(2)],
+        ["min", np.int64(1)],
+        ["max", np.int64(2)],
+        ["mean", np.float64(1.5)],
+        ["median", np.float64(1.5)],
+        ["var", np.float64(0.5)],
+        ["std", np.float64(0.5**0.5)],
+        ["skew", pd.NA],
+        ["kurt", pd.NA],
+        ["any", True],
+        ["all", True],
     ],
 )
-def test_any_all(values, exp_any, exp_all, exp_any_noskip, exp_all_noskip):
-    # the methods return numpy scalars
-    exp_any = pd.NA if exp_any is pd.NA else np.bool_(exp_any)
-    exp_all = pd.NA if exp_all is pd.NA else np.bool_(exp_all)
-    exp_any_noskip = pd.NA if exp_any_noskip is pd.NA else np.bool_(exp_any_noskip)
-    exp_all_noskip = pd.NA if exp_all_noskip is pd.NA else np.bool_(exp_all_noskip)
-
-    for con in [pd.array, pd.Series]:
-        a = con(values, dtype="boolean")
-        assert a.any() is exp_any
-        assert a.all() is exp_all
-        assert a.any(skipna=False) is exp_any_noskip
-        assert a.all(skipna=False) is exp_all_noskip
-
-        assert np.any(a.any()) is exp_any
-        assert np.all(a.all()) is exp_all
+def test_series_reductions(op, expected):
+    ser = Series([1, 2], dtype="Int64")
+    result = getattr(ser, op)()
+    tm.assert_equal(result, expected)
 
 
-@pytest.mark.parametrize("dropna", [True, False])
-def test_reductions_return_types(dropna, data, all_numeric_reductions):
-    op = all_numeric_reductions
-    s = pd.Series(data)
-    if dropna:
-        s = s.dropna()
+@pytest.mark.parametrize(
+    "op, expected",
+    [
+        ["sum", Series([3], index=["a"], dtype="Int64")],
+        ["prod", Series([2], index=["a"], dtype="Int64")],
+        ["min", Series([1], index=["a"], dtype="Int64")],
+        ["max", Series([2], index=["a"], dtype="Int64")],
+        ["mean", Series([1.5], index=["a"], dtype="Float64")],
+        ["median", Series([1.5], index=["a"], dtype="Float64")],
+        ["var", Series([0.5], index=["a"], dtype="Float64")],
+        ["std", Series([0.5**0.5], index=["a"], dtype="Float64")],
+        ["skew", Series([pd.NA], index=["a"], dtype="Float64")],
+        ["kurt", Series([pd.NA], index=["a"], dtype="Float64")],
+        ["any", Series([True], index=["a"], dtype="boolean")],
+        ["all", Series([True], index=["a"], dtype="boolean")],
+    ],
+)
+def test_dataframe_reductions(op, expected):
+    df = DataFrame({"a": array([1, 2], dtype="Int64")})
+    result = getattr(df, op)()
+    tm.assert_series_equal(result, expected)
 
-    if op in ("sum", "prod"):
-        assert isinstance(getattr(s, op)(), np.int_)
-    elif op == "count":
-        # Oddly on the 32 bit build (but not Windows), this is intc (!= intp)
-        assert isinstance(getattr(s, op)(), np.integer)
-    elif op in ("min", "max"):
-        assert isinstance(getattr(s, op)(), np.bool_)
+
+@pytest.mark.parametrize(
+    "op, expected",
+    [
+        ["sum", array([1, 3], dtype="Int64")],
+        ["prod", array([1, 3], dtype="Int64")],
+        ["min", array([1, 3], dtype="Int64")],
+        ["max", array([1, 3], dtype="Int64")],
+        ["mean", array([1, 3], dtype="Float64")],
+        ["median", array([1, 3], dtype="Float64")],
+        ["var", array([pd.NA], dtype="Float64")],
+        ["std", array([pd.NA], dtype="Float64")],
+        ["skew", array([pd.NA], dtype="Float64")],
+        ["any", array([True, True], dtype="boolean")],
+        ["all", array([True, True], dtype="boolean")],
+    ],
+)
+def test_groupby_reductions(op, expected):
+    df = DataFrame(
+        {
+            "A": ["a", "b", "b"],
+            "B": array([1, None, 3], dtype="Int64"),
+        }
+    )
+    result = getattr(df.groupby("A"), op)()
+    expected = DataFrame(expected, index=pd.Index(["a", "b"], name="A"), columns=["B"])
+
+    tm.assert_frame_equal(result, expected)
+
+
+@pytest.mark.parametrize(
+    "op, expected",
+    [
+        ["sum", Series([4, 4], index=["B", "C"], dtype="Float64")],
+        ["prod", Series([3, 3], index=["B", "C"], dtype="Float64")],
+        ["min", Series([1, 1], index=["B", "C"], dtype="Float64")],
+        ["max", Series([3, 3], index=["B", "C"], dtype="Float64")],
+        ["mean", Series([2, 2], index=["B", "C"], dtype="Float64")],
+        ["median", Series([2, 2], index=["B", "C"], dtype="Float64")],
+        ["var", Series([2, 2], index=["B", "C"], dtype="Float64")],
+        ["std", Series([2**0.5, 2**0.5], index=["B", "C"], dtype="Float64")],
+        ["skew", Series([pd.NA, pd.NA], index=["B", "C"], dtype="Float64")],
+        ["kurt", Series([pd.NA, pd.NA], index=["B", "C"], dtype="Float64")],
+        ["any", Series([True, True, True], index=["A", "B", "C"], dtype="boolean")],
+        ["all", Series([True, True, True], index=["A", "B", "C"], dtype="boolean")],
+    ],
+)
+def test_mixed_reductions(op, expected):
+    df = DataFrame(
+        {
+            "A": ["a", "b", "b"],
+            "B": [1, None, 3],
+            "C": array([1, None, 3], dtype="Int64"),
+        }
+    )
+
+    # series
+    result = getattr(df.C, op)()
+    tm.assert_equal(result, expected["C"])
+
+    # frame
+    if op in ["any", "all"]:
+        result = getattr(df, op)()
     else:
-        # "mean", "std", "var", "median", "kurt", "skew"
-        assert isinstance(getattr(s, op)(), np.float64)
+        result = getattr(df, op)(numeric_only=True)
+    tm.assert_series_equal(result, expected)

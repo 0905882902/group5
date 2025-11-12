@@ -1,132 +1,68 @@
+import numpy as np
 import pytest
 
-from pandas import Series
-from pandas.core.strings.accessor import StringMethods
-
-_any_string_method = [
-    ("cat", (), {"sep": ","}),
-    ("cat", (Series(list("zyx")),), {"sep": ",", "join": "left"}),
-    ("center", (10,), {}),
-    ("contains", ("a",), {}),
-    ("count", ("a",), {}),
-    ("decode", ("UTF-8",), {}),
-    ("encode", ("UTF-8",), {}),
-    ("endswith", ("a",), {}),
-    ("endswith", ((),), {}),
-    ("endswith", (("a",),), {}),
-    ("endswith", (("a", "b"),), {}),
-    ("endswith", (("a", "MISSING"),), {}),
-    ("endswith", ("a",), {"na": True}),
-    ("endswith", ("a",), {"na": False}),
-    ("extract", ("([a-z]*)",), {"expand": False}),
-    ("extract", ("([a-z]*)",), {"expand": True}),
-    ("extractall", ("([a-z]*)",), {}),
-    ("find", ("a",), {}),
-    ("findall", ("a",), {}),
-    ("get", (0,), {}),
-    # because "index" (and "rindex") fail intentionally
-    # if the string is not found, search only for empty string
-    ("index", ("",), {}),
-    ("join", (",",), {}),
-    ("ljust", (10,), {}),
-    ("match", ("a",), {}),
-    ("fullmatch", ("a",), {}),
-    ("normalize", ("NFC",), {}),
-    ("pad", (10,), {}),
-    ("partition", (" ",), {"expand": False}),
-    ("partition", (" ",), {"expand": True}),
-    ("repeat", (3,), {}),
-    ("replace", ("a", "z"), {}),
-    ("rfind", ("a",), {}),
-    ("rindex", ("",), {}),
-    ("rjust", (10,), {}),
-    ("rpartition", (" ",), {"expand": False}),
-    ("rpartition", (" ",), {"expand": True}),
-    ("slice", (0, 1), {}),
-    ("slice_replace", (0, 1, "z"), {}),
-    ("split", (" ",), {"expand": False}),
-    ("split", (" ",), {"expand": True}),
-    ("startswith", ("a",), {}),
-    ("startswith", (("a",),), {}),
-    ("startswith", (("a", "b"),), {}),
-    ("startswith", (("a", "MISSING"),), {}),
-    ("startswith", ((),), {}),
-    ("startswith", ("a",), {"na": True}),
-    ("startswith", ("a",), {"na": False}),
-    ("removeprefix", ("a",), {}),
-    ("removesuffix", ("a",), {}),
-    # translating unicode points of "a" to "d"
-    ("translate", ({97: 100},), {}),
-    ("wrap", (2,), {}),
-    ("zfill", (10,), {}),
-] + list(
-    zip(
-        [
-            # methods without positional arguments: zip with empty tuple and empty dict
-            "capitalize",
-            "cat",
-            "get_dummies",
-            "isalnum",
-            "isalpha",
-            "isdecimal",
-            "isdigit",
-            "islower",
-            "isnumeric",
-            "isspace",
-            "istitle",
-            "isupper",
-            "len",
-            "lower",
-            "lstrip",
-            "partition",
-            "rpartition",
-            "rsplit",
-            "rstrip",
-            "slice",
-            "slice_replace",
-            "split",
-            "strip",
-            "swapcase",
-            "title",
-            "upper",
-            "casefold",
-        ],
-        [()] * 100,
-        [{}] * 100,
-    )
+import pandas as pd
+from pandas.core.arrays.integer import (
+    Int8Dtype,
+    Int16Dtype,
+    Int32Dtype,
+    Int64Dtype,
+    UInt8Dtype,
+    UInt16Dtype,
+    UInt32Dtype,
+    UInt64Dtype,
 )
-ids, _, _ = zip(*_any_string_method)  # use method name as fixture-id
-missing_methods = {f for f in dir(StringMethods) if not f.startswith("_")} - set(ids)
-
-# test that the above list captures all methods of StringMethods
-assert not missing_methods
 
 
-@pytest.fixture(params=_any_string_method, ids=ids)
-def any_string_method(request):
+@pytest.fixture(
+    params=[
+        Int8Dtype,
+        Int16Dtype,
+        Int32Dtype,
+        Int64Dtype,
+        UInt8Dtype,
+        UInt16Dtype,
+        UInt32Dtype,
+        UInt64Dtype,
+    ]
+)
+def dtype(request):
+    """Parametrized fixture returning integer 'dtype'"""
+    return request.param()
+
+
+@pytest.fixture
+def data(dtype):
     """
-    Fixture for all public methods of `StringMethods`
+    Fixture returning 'data' array with valid and missing values according to
+    parametrized integer 'dtype'.
 
-    This fixture returns a tuple of the method name and sample arguments
-    necessary to call the method.
-
-    Returns
-    -------
-    method_name : str
-        The name of the method in `StringMethods`
-    args : tuple
-        Sample values for the positional arguments
-    kwargs : dict
-        Sample values for the keyword arguments
-
-    Examples
-    --------
-    >>> def test_something(any_string_method):
-    ...     s = Series(['a', 'b', np.nan, 'd'])
-    ...
-    ...     method_name, args, kwargs = any_string_method
-    ...     method = getattr(s.str, method_name)
-    ...     # will not raise
-    ...     method(*args, **kwargs)
+    Used to test dtype conversion with and without missing values.
     """
-    return request.param
+    return pd.array(
+        list(range(8)) + [np.nan] + list(range(10, 98)) + [np.nan] + [99, 100],
+        dtype=dtype,
+    )
+
+
+@pytest.fixture
+def data_missing(dtype):
+    """
+    Fixture returning array with exactly one NaN and one valid integer,
+    according to parametrized integer 'dtype'.
+
+    Used to test dtype conversion with and without missing values.
+    """
+    return pd.array([np.nan, 1], dtype=dtype)
+
+
+@pytest.fixture(params=["data", "data_missing"])
+def all_data(request, data, data_missing):
+    """Parametrized fixture returning 'data' or 'data_missing' integer arrays.
+
+    Used to test dtype conversion with and without missing values.
+    """
+    if request.param == "data":
+        return data
+    elif request.param == "data_missing":
+        return data_missing

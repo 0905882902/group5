@@ -3,95 +3,122 @@ import pytest
 
 import pandas as pd
 import pandas._testing as tm
-from pandas.arrays import BooleanArray
-from pandas.core.arrays.boolean import coerce_to_array
+from pandas.api.types import is_integer
+from pandas.core.arrays import IntegerArray
+from pandas.core.arrays.integer import (
+    Int8Dtype,
+    Int32Dtype,
+    Int64Dtype,
+)
 
 
-def test_boolean_array_constructor():
-    values = np.array([True, False, True, False], dtype="bool")
+@pytest.fixture(params=[pd.array, IntegerArray._from_sequence])
+def constructor(request):
+    """Fixture returning parametrized IntegerArray from given sequence.
+
+    Used to test dtype conversions.
+    """
+    return request.param
+
+
+def test_uses_pandas_na():
+    a = pd.array([1, None], dtype=Int64Dtype())
+    assert a[1] is pd.NA
+
+
+def test_from_dtype_from_float(data):
+    # construct from our dtype & string dtype
+    dtype = data.dtype
+
+    # from float
+    expected = pd.Series(data)
+    result = pd.Series(data.to_numpy(na_value=np.nan, dtype="float"), dtype=str(dtype))
+    tm.assert_series_equal(result, expected)
+
+    # from int / list
+    expected = pd.Series(data)
+    result = pd.Series(np.array(data).tolist(), dtype=str(dtype))
+    tm.assert_series_equal(result, expected)
+
+    # from int / array
+    expected = pd.Series(data).dropna().reset_index(drop=True)
+    dropped = np.array(data.dropna()).astype(np.dtype(dtype.type))
+    result = pd.Series(dropped, dtype=str(dtype))
+    tm.assert_series_equal(result, expected)
+
+
+def test_conversions(data_missing):
+    # astype to object series
+    df = pd.DataFrame({"A": data_missing})
+    result = df["A"].astype("object")
+    expected = pd.Series(np.array([pd.NA, 1], dtype=object), name="A")
+    tm.assert_series_equal(result, expected)
+
+    # convert to object ndarray
+    # we assert that we are exactly equal
+    # including type conversions of scalars
+    result = df["A"].astype("object").values
+    expected = np.array([pd.NA, 1], dtype=object)
+    tm.assert_numpy_array_equal(result, expected)
+
+    for r, e in zip(result, expected):
+        if pd.isnull(r):
+            assert pd.isnull(e)
+        elif is_integer(r):
+            assert r == e
+            assert is_integer(e)
+        else:
+            assert r == e
+            assert type(r) == type(e)
+
+
+def test_integer_array_constructor():
+    values = np.array([1, 2, 3, 4], dtype="int64")
     mask = np.array([False, False, False, True], dtype="bool")
 
-    result = BooleanArray(values, mask)
-    expected = pd.array([True, False, True, None], dtype="boolean")
+    result = IntegerArray(values, mask)
+    expected = pd.array([1, 2, 3, np.nan], dtype="Int64")
     tm.assert_extension_array_equal(result, expected)
 
-    with pytest.raises(TypeError, match="values should be boolean numpy array"):
-        BooleanArray(values.tolist(), mask)
+    msg = r".* should be .* numpy array. Use the 'pd.array' function instead"
+    with pytest.raises(TypeError, match=msg):
+        IntegerArray(values.tolist(), mask)
 
-    with pytest.raises(TypeError, match="mask should be boolean numpy array"):
-        BooleanArray(values, mask.tolist())
+    with pytest.raises(TypeError, match=msg):
+        IntegerArray(values, mask.tolist())
 
-    with pytest.raises(TypeError, match="values should be boolean numpy array"):
-        BooleanArray(values.astype(int), mask)
-
-    with pytest.raises(TypeError, match="mask should be boolean numpy array"):
-        BooleanArray(values, None)
-
-    with pytest.raises(ValueError, match="values.shape must match mask.shape"):
-        BooleanArray(values.reshape(1, -1), mask)
-
-    with pytest.raises(ValueError, match="values.shape must match mask.shape"):
-        BooleanArray(values, mask.reshape(1, -1))
+    with pytest.raises(TypeError, match=msg):
+        IntegerArray(values.astype(float), mask)
+    msg = r"__init__\(\) missing 1 required positional argument: 'mask'"
+    with pytest.raises(TypeError, match=msg):
+        IntegerArray(values)
 
 
-def test_boolean_array_constructor_copy():
-    values = np.array([True, False, True, False], dtype="bool")
+def test_integer_array_constructor_copy():
+    values = np.array([1, 2, 3, 4], dtype="int64")
     mask = np.array([False, False, False, True], dtype="bool")
 
-    result = BooleanArray(values, mask)
+    result = IntegerArray(values, mask)
     assert result._data is values
     assert result._mask is mask
 
-    result = BooleanArray(values, mask, copy=True)
+    result = IntegerArray(values, mask, copy=True)
     assert result._data is not values
     assert result._mask is not mask
-
-
-def test_to_boolean_array():
-    expected = BooleanArray(
-        np.array([True, False, True]), np.array([False, False, False])
-    )
-
-    result = pd.array([True, False, True], dtype="boolean")
-    tm.assert_extension_array_equal(result, expected)
-    result = pd.array(np.array([True, False, True]), dtype="boolean")
-    tm.assert_extension_array_equal(result, expected)
-    result = pd.array(np.array([True, False, True], dtype=object), dtype="boolean")
-    tm.assert_extension_array_equal(result, expected)
-
-    # with missing values
-    expected = BooleanArray(
-        np.array([True, False, True]), np.array([False, False, True])
-    )
-
-    result = pd.array([True, False, None], dtype="boolean")
-    tm.assert_extension_array_equal(result, expected)
-    result = pd.array(np.array([True, False, None], dtype=object), dtype="boolean")
-    tm.assert_extension_array_equal(result, expected)
-
-
-def test_to_boolean_array_all_none():
-    expected = BooleanArray(np.array([True, True, True]), np.array([True, True, True]))
-
-    result = pd.array([None, None, None], dtype="boolean")
-    tm.assert_extension_array_equal(result, expected)
-    result = pd.array(np.array([None, None, None], dtype=object), dtype="boolean")
-    tm.assert_extension_array_equal(result, expected)
 
 
 @pytest.mark.parametrize(
     "a, b",
     [
-        ([True, False, None, np.nan, pd.NA], [True, False, None, None, None]),
-        ([True, np.nan], [True, None]),
-        ([True, pd.NA], [True, None]),
-        ([np.nan, np.nan], [None, None]),
-        (np.array([np.nan, np.nan], dtype=float), [None, None]),
+        ([1, None], [1, np.nan]),
+        ([None], [np.nan]),
+        ([None, np.nan], [np.nan, np.nan]),
+        ([np.nan, np.nan], [np.nan, np.nan]),
     ],
 )
-def test_to_boolean_array_missing_indicators(a, b):
-    result = pd.array(a, dtype="boolean")
-    expected = pd.array(b, dtype="boolean")
+def test_to_integer_array_none_is_nan(a, b):
+    result = pd.array(a, dtype="Int64")
+    expected = pd.array(b, dtype="Int64")
     tm.assert_extension_array_equal(result, expected)
 
 
@@ -99,227 +126,120 @@ def test_to_boolean_array_missing_indicators(a, b):
     "values",
     [
         ["foo", "bar"],
-        ["1", "2"],
-        # "foo",
-        [1, 2],
-        [1.0, 2.0],
+        "foo",
+        1,
+        1.0,
         pd.date_range("20130101", periods=2),
         np.array(["foo"]),
-        np.array([1, 2]),
-        np.array([1.0, 2.0]),
+        [[1, 2], [3, 4]],
         [np.nan, {"a": 1}],
     ],
 )
-def test_to_boolean_array_error(values):
-    # error in converting existing arrays to BooleanArray
-    msg = "Need to pass bool-like value"
-    with pytest.raises(TypeError, match=msg):
-        pd.array(values, dtype="boolean")
-
-
-def test_to_boolean_array_from_integer_array():
-    result = pd.array(np.array([1, 0, 1, 0]), dtype="boolean")
-    expected = pd.array([True, False, True, False], dtype="boolean")
-    tm.assert_extension_array_equal(result, expected)
-
-    # with missing values
-    result = pd.array(np.array([1, 0, 1, None]), dtype="boolean")
-    expected = pd.array([True, False, True, None], dtype="boolean")
-    tm.assert_extension_array_equal(result, expected)
-
-
-def test_to_boolean_array_from_float_array():
-    result = pd.array(np.array([1.0, 0.0, 1.0, 0.0]), dtype="boolean")
-    expected = pd.array([True, False, True, False], dtype="boolean")
-    tm.assert_extension_array_equal(result, expected)
-
-    # with missing values
-    result = pd.array(np.array([1.0, 0.0, 1.0, np.nan]), dtype="boolean")
-    expected = pd.array([True, False, True, None], dtype="boolean")
-    tm.assert_extension_array_equal(result, expected)
-
-
-def test_to_boolean_array_integer_like():
-    # integers of 0's and 1's
-    result = pd.array([1, 0, 1, 0], dtype="boolean")
-    expected = pd.array([True, False, True, False], dtype="boolean")
-    tm.assert_extension_array_equal(result, expected)
-
-    # with missing values
-    result = pd.array([1, 0, 1, None], dtype="boolean")
-    expected = pd.array([True, False, True, None], dtype="boolean")
-    tm.assert_extension_array_equal(result, expected)
-
-
-def test_coerce_to_array():
-    # TODO this is currently not public API
-    values = np.array([True, False, True, False], dtype="bool")
-    mask = np.array([False, False, False, True], dtype="bool")
-    result = BooleanArray(*coerce_to_array(values, mask=mask))
-    expected = BooleanArray(values, mask)
-    tm.assert_extension_array_equal(result, expected)
-    assert result._data is values
-    assert result._mask is mask
-    result = BooleanArray(*coerce_to_array(values, mask=mask, copy=True))
-    expected = BooleanArray(values, mask)
-    tm.assert_extension_array_equal(result, expected)
-    assert result._data is not values
-    assert result._mask is not mask
-
-    # mixed missing from values and mask
-    values = [True, False, None, False]
-    mask = np.array([False, False, False, True], dtype="bool")
-    result = BooleanArray(*coerce_to_array(values, mask=mask))
-    expected = BooleanArray(
-        np.array([True, False, True, True]), np.array([False, False, True, True])
+def test_to_integer_array_error(values):
+    # error in converting existing arrays to IntegerArrays
+    msg = "|".join(
+        [
+            r"cannot be converted to IntegerDtype",
+            r"invalid literal for int\(\) with base 10:",
+            r"values must be a 1D list-like",
+            r"Cannot pass scalar",
+            r"int\(\) argument must be a string",
+        ]
     )
+    with pytest.raises((ValueError, TypeError), match=msg):
+        pd.array(values, dtype="Int64")
+
+    with pytest.raises((ValueError, TypeError), match=msg):
+        IntegerArray._from_sequence(values)
+
+
+def test_to_integer_array_inferred_dtype(constructor):
+    # if values has dtype -> respect it
+    result = constructor(np.array([1, 2], dtype="int8"))
+    assert result.dtype == Int8Dtype()
+    result = constructor(np.array([1, 2], dtype="int32"))
+    assert result.dtype == Int32Dtype()
+
+    # if values have no dtype -> always int64
+    result = constructor([1, 2])
+    assert result.dtype == Int64Dtype()
+
+
+def test_to_integer_array_dtype_keyword(constructor):
+    result = constructor([1, 2], dtype="Int8")
+    assert result.dtype == Int8Dtype()
+
+    # if values has dtype -> override it
+    result = constructor(np.array([1, 2], dtype="int8"), dtype="Int32")
+    assert result.dtype == Int32Dtype()
+
+
+def test_to_integer_array_float():
+    result = IntegerArray._from_sequence([1.0, 2.0], dtype="Int64")
+    expected = pd.array([1, 2], dtype="Int64")
     tm.assert_extension_array_equal(result, expected)
-    result = BooleanArray(*coerce_to_array(np.array(values, dtype=object), mask=mask))
+
+    with pytest.raises(TypeError, match="cannot safely cast non-equivalent"):
+        IntegerArray._from_sequence([1.5, 2.0], dtype="Int64")
+
+    # for float dtypes, the itemsize is not preserved
+    result = IntegerArray._from_sequence(
+        np.array([1.0, 2.0], dtype="float32"), dtype="Int64"
+    )
+    assert result.dtype == Int64Dtype()
+
+
+def test_to_integer_array_str():
+    result = IntegerArray._from_sequence(["1", "2", None], dtype="Int64")
+    expected = pd.array([1, 2, np.nan], dtype="Int64")
     tm.assert_extension_array_equal(result, expected)
-    result = BooleanArray(*coerce_to_array(values, mask=mask.tolist()))
-    tm.assert_extension_array_equal(result, expected)
 
-    # raise errors for wrong dimension
-    values = np.array([True, False, True, False], dtype="bool")
-    mask = np.array([False, False, False, True], dtype="bool")
+    with pytest.raises(
+        ValueError, match=r"invalid literal for int\(\) with base 10: .*"
+    ):
+        IntegerArray._from_sequence(["1", "2", ""], dtype="Int64")
 
-    # passing 2D values is OK as long as no mask
-    coerce_to_array(values.reshape(1, -1))
-
-    with pytest.raises(ValueError, match="values.shape and mask.shape must match"):
-        coerce_to_array(values.reshape(1, -1), mask=mask)
-
-    with pytest.raises(ValueError, match="values.shape and mask.shape must match"):
-        coerce_to_array(values, mask=mask.reshape(1, -1))
+    with pytest.raises(
+        ValueError, match=r"invalid literal for int\(\) with base 10: .*"
+    ):
+        IntegerArray._from_sequence(["1.5", "2.0"], dtype="Int64")
 
 
-def test_coerce_to_array_from_boolean_array():
-    # passing BooleanArray to coerce_to_array
-    values = np.array([True, False, True, False], dtype="bool")
-    mask = np.array([False, False, False, True], dtype="bool")
-    arr = BooleanArray(values, mask)
-    result = BooleanArray(*coerce_to_array(arr))
-    tm.assert_extension_array_equal(result, arr)
-    # no copy
-    assert result._data is arr._data
-    assert result._mask is arr._mask
-
-    result = BooleanArray(*coerce_to_array(arr), copy=True)
-    tm.assert_extension_array_equal(result, arr)
-    assert result._data is not arr._data
-    assert result._mask is not arr._mask
-
-    with pytest.raises(ValueError, match="cannot pass mask for BooleanArray input"):
-        coerce_to_array(arr, mask=mask)
-
-
-def test_coerce_to_numpy_array():
-    # with missing values -> object dtype
-    arr = pd.array([True, False, None], dtype="boolean")
-    result = np.array(arr)
-    expected = np.array([True, False, pd.NA], dtype="object")
-    tm.assert_numpy_array_equal(result, expected)
-
-    # also with no missing values -> object dtype
-    arr = pd.array([True, False, True], dtype="boolean")
-    result = np.array(arr)
-    expected = np.array([True, False, True], dtype="bool")
-    tm.assert_numpy_array_equal(result, expected)
-
-    # force bool dtype
-    result = np.array(arr, dtype="bool")
-    expected = np.array([True, False, True], dtype="bool")
-    tm.assert_numpy_array_equal(result, expected)
-    # with missing values will raise error
-    arr = pd.array([True, False, None], dtype="boolean")
-    msg = (
-        "cannot convert to 'bool'-dtype NumPy array with missing values. "
-        "Specify an appropriate 'na_value' for this dtype."
-    )
-    with pytest.raises(ValueError, match=msg):
-        np.array(arr, dtype="bool")
-
-
-def test_to_boolean_array_from_strings():
-    result = BooleanArray._from_sequence_of_strings(
-        np.array(["True", "False", "1", "1.0", "0", "0.0", np.nan], dtype=object),
-        dtype="boolean",
-    )
-    expected = BooleanArray(
-        np.array([True, False, True, True, False, False, False]),
-        np.array([False, False, False, False, False, False, True]),
-    )
-
+@pytest.mark.parametrize(
+    "bool_values, int_values, target_dtype, expected_dtype",
+    [
+        ([False, True], [0, 1], Int64Dtype(), Int64Dtype()),
+        ([False, True], [0, 1], "Int64", Int64Dtype()),
+        ([False, True, np.nan], [0, 1, np.nan], Int64Dtype(), Int64Dtype()),
+    ],
+)
+def test_to_integer_array_bool(
+    constructor, bool_values, int_values, target_dtype, expected_dtype
+):
+    result = constructor(bool_values, dtype=target_dtype)
+    assert result.dtype == expected_dtype
+    expected = pd.array(int_values, dtype=target_dtype)
     tm.assert_extension_array_equal(result, expected)
 
 
-def test_to_boolean_array_from_strings_invalid_string():
-    with pytest.raises(ValueError, match="cannot be cast"):
-        BooleanArray._from_sequence_of_strings(["donkey"], dtype="boolean")
+@pytest.mark.parametrize(
+    "values, to_dtype, result_dtype",
+    [
+        (np.array([1], dtype="int64"), None, Int64Dtype),
+        (np.array([1, np.nan]), None, Int64Dtype),
+        (np.array([1, np.nan]), "int8", Int8Dtype),
+    ],
+)
+def test_to_integer_array(values, to_dtype, result_dtype):
+    # convert existing arrays to IntegerArrays
+    result = IntegerArray._from_sequence(values, dtype=to_dtype)
+    assert result.dtype == result_dtype()
+    expected = pd.array(values, dtype=result_dtype())
+    tm.assert_extension_array_equal(result, expected)
 
 
-@pytest.mark.parametrize("box", [True, False], ids=["series", "array"])
-def test_to_numpy(box):
-    con = pd.Series if box else pd.array
-    # default (with or without missing values) -> object dtype
-    arr = con([True, False, True], dtype="boolean")
-    result = arr.to_numpy()
-    expected = np.array([True, False, True], dtype="bool")
-    tm.assert_numpy_array_equal(result, expected)
-
-    arr = con([True, False, None], dtype="boolean")
-    result = arr.to_numpy()
-    expected = np.array([True, False, pd.NA], dtype="object")
-    tm.assert_numpy_array_equal(result, expected)
-
-    arr = con([True, False, None], dtype="boolean")
-    result = arr.to_numpy(dtype="str")
-    expected = np.array([True, False, pd.NA], dtype=f"{tm.ENDIAN}U5")
-    tm.assert_numpy_array_equal(result, expected)
-
-    # no missing values -> can convert to bool, otherwise raises
-    arr = con([True, False, True], dtype="boolean")
-    result = arr.to_numpy(dtype="bool")
-    expected = np.array([True, False, True], dtype="bool")
-    tm.assert_numpy_array_equal(result, expected)
-
-    arr = con([True, False, None], dtype="boolean")
-    with pytest.raises(ValueError, match="cannot convert to 'bool'-dtype"):
-        result = arr.to_numpy(dtype="bool")
-
-    # specify dtype and na_value
-    arr = con([True, False, None], dtype="boolean")
-    result = arr.to_numpy(dtype=object, na_value=None)
-    expected = np.array([True, False, None], dtype="object")
-    tm.assert_numpy_array_equal(result, expected)
-
-    result = arr.to_numpy(dtype=bool, na_value=False)
-    expected = np.array([True, False, False], dtype="bool")
-    tm.assert_numpy_array_equal(result, expected)
-
-    result = arr.to_numpy(dtype="int64", na_value=-99)
-    expected = np.array([1, 0, -99], dtype="int64")
-    tm.assert_numpy_array_equal(result, expected)
-
-    result = arr.to_numpy(dtype="float64", na_value=np.nan)
-    expected = np.array([1, 0, np.nan], dtype="float64")
-    tm.assert_numpy_array_equal(result, expected)
-
-    # converting to int or float without specifying na_value raises
-    with pytest.raises(ValueError, match="cannot convert to 'int64'-dtype"):
-        arr.to_numpy(dtype="int64")
-
-
-def test_to_numpy_copy():
-    # to_numpy can be zero-copy if no missing values
-    arr = pd.array([True, False, True], dtype="boolean")
-    result = arr.to_numpy(dtype=bool)
-    result[0] = False
-    tm.assert_extension_array_equal(
-        arr, pd.array([False, False, True], dtype="boolean")
-    )
-
-    arr = pd.array([True, False, True], dtype="boolean")
-    result = arr.to_numpy(dtype=bool, copy=True)
-    result[0] = False
-    tm.assert_extension_array_equal(arr, pd.array([True, False, True], dtype="boolean"))
+def test_integer_array_from_boolean():
+    # GH31104
+    expected = pd.array(np.array([True, False]), dtype="Int64")
+    result = pd.array(np.array([True, False], dtype=object), dtype="Int64")
+    tm.assert_extension_array_equal(result, expected)

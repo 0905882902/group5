@@ -1,155 +1,133 @@
 import numpy as np
 import pytest
 
+from pandas._libs.sparse import IntIndex
+
 from pandas import (
-    Categorical,
-    CategoricalDtype,
-    CategoricalIndex,
-    DatetimeIndex,
-    Interval,
-    NaT,
-    Period,
+    SparseDtype,
     Timestamp,
-    array,
-    to_datetime,
 )
 import pandas._testing as tm
+from pandas.core.arrays.sparse import SparseArray
 
 
 class TestAstype:
-    @pytest.mark.parametrize("cls", [Categorical, CategoricalIndex])
-    @pytest.mark.parametrize("values", [[1, np.nan], [Timestamp("2000"), NaT]])
-    def test_astype_nan_to_int(self, cls, values):
-        # GH#28406
-        obj = cls(values)
+    def test_astype(self):
+        # float -> float
+        arr = SparseArray([None, None, 0, 2])
+        result = arr.astype("Sparse[float32]")
+        expected = SparseArray([None, None, 0, 2], dtype=np.dtype("float32"))
+        tm.assert_sp_array_equal(result, expected)
 
-        msg = "Cannot (cast|convert)"
-        with pytest.raises((ValueError, TypeError), match=msg):
-            obj.astype(int)
+        dtype = SparseDtype("float64", fill_value=0)
+        result = arr.astype(dtype)
+        expected = SparseArray._simple_new(
+            np.array([0.0, 2.0], dtype=dtype.subtype), IntIndex(4, [2, 3]), dtype
+        )
+        tm.assert_sp_array_equal(result, expected)
+
+        dtype = SparseDtype("int64", 0)
+        result = arr.astype(dtype)
+        expected = SparseArray._simple_new(
+            np.array([0, 2], dtype=np.int64), IntIndex(4, [2, 3]), dtype
+        )
+        tm.assert_sp_array_equal(result, expected)
+
+        arr = SparseArray([0, np.nan, 0, 1], fill_value=0)
+        with pytest.raises(ValueError, match="NA"):
+            arr.astype("Sparse[i8]")
+
+    def test_astype_bool(self):
+        a = SparseArray([1, 0, 0, 1], dtype=SparseDtype(int, 0))
+        result = a.astype(bool)
+        expected = np.array([1, 0, 0, 1], dtype=bool)
+        tm.assert_numpy_array_equal(result, expected)
+
+        # update fill value
+        result = a.astype(SparseDtype(bool, False))
+        expected = SparseArray(
+            [True, False, False, True], dtype=SparseDtype(bool, False)
+        )
+        tm.assert_sp_array_equal(result, expected)
+
+    def test_astype_all(self, any_real_numpy_dtype):
+        vals = np.array([1, 2, 3])
+        arr = SparseArray(vals, fill_value=1)
+        typ = np.dtype(any_real_numpy_dtype)
+        res = arr.astype(typ)
+        tm.assert_numpy_array_equal(res, vals.astype(any_real_numpy_dtype))
 
     @pytest.mark.parametrize(
-        "expected",
-        [
-            array(["2019", "2020"], dtype="datetime64[ns, UTC]"),
-            array([0, 0], dtype="timedelta64[ns]"),
-            array([Period("2019"), Period("2020")], dtype="period[Y-DEC]"),
-            array([Interval(0, 1), Interval(1, 2)], dtype="interval"),
-            array([1, np.nan], dtype="Int64"),
-        ],
-    )
-    def test_astype_category_to_extension_dtype(self, expected):
-        # GH#28668
-        result = expected.astype("category").astype(expected.dtype)
-
-        tm.assert_extension_array_equal(result, expected)
-
-    @pytest.mark.parametrize(
-        "dtype, expected",
+        "arr, dtype, expected",
         [
             (
+                SparseArray([0, 1]),
+                "float",
+                SparseArray([0.0, 1.0], dtype=SparseDtype(float, 0.0)),
+            ),
+            (SparseArray([0, 1]), bool, SparseArray([False, True])),
+            (
+                SparseArray([0, 1], fill_value=1),
+                bool,
+                SparseArray([False, True], dtype=SparseDtype(bool, True)),
+            ),
+            pytest.param(
+                SparseArray([0, 1]),
                 "datetime64[ns]",
-                np.array(["2015-01-01T00:00:00.000000000"], dtype="datetime64[ns]"),
+                SparseArray(
+                    np.array([0, 1], dtype="datetime64[ns]"),
+                    dtype=SparseDtype("datetime64[ns]", Timestamp("1970")),
+                ),
             ),
             (
-                "datetime64[ns, MET]",
-                DatetimeIndex([Timestamp("2015-01-01 00:00:00+0100", tz="MET")]).array,
+                SparseArray([0, 1, 10]),
+                np.str_,
+                SparseArray(["0", "1", "10"], dtype=SparseDtype(np.str_, "0")),
+            ),
+            (SparseArray(["10", "20"]), float, SparseArray([10.0, 20.0])),
+            (
+                SparseArray([0, 1, 0]),
+                object,
+                SparseArray([0, 1, 0], dtype=SparseDtype(object, 0)),
             ),
         ],
     )
-    def test_astype_to_datetime64(self, dtype, expected):
-        # GH#28448
-        result = Categorical(["2015-01-01"]).astype(dtype)
-        assert result == expected
+    def test_astype_more(self, arr, dtype, expected):
+        result = arr.astype(arr.dtype.update_dtype(dtype))
+        tm.assert_sp_array_equal(result, expected)
 
-    def test_astype_str_int_categories_to_nullable_int(self):
-        # GH#39616
-        dtype = CategoricalDtype([str(i) for i in range(5)])
-        codes = np.random.default_rng(2).integers(5, size=20)
-        arr = Categorical.from_codes(codes, dtype=dtype)
+    def test_astype_nan_raises(self):
+        arr = SparseArray([1.0, np.nan])
+        with pytest.raises(ValueError, match="Cannot convert non-finite"):
+            arr.astype(int)
 
-        res = arr.astype("Int64")
-        expected = array(codes, dtype="Int64")
-        tm.assert_extension_array_equal(res, expected)
+    def test_astype_copy_false(self):
+        # GH#34456 bug caused by using .view instead of .astype in astype_nansafe
+        arr = SparseArray([1, 2, 3])
 
-    def test_astype_str_int_categories_to_nullable_float(self):
-        # GH#39616
-        dtype = CategoricalDtype([str(i / 2) for i in range(5)])
-        codes = np.random.default_rng(2).integers(5, size=20)
-        arr = Categorical.from_codes(codes, dtype=dtype)
+        dtype = SparseDtype(float, 0)
 
-        res = arr.astype("Float64")
-        expected = array(codes, dtype="Float64") / 2
-        tm.assert_extension_array_equal(res, expected)
+        result = arr.astype(dtype, copy=False)
+        expected = SparseArray([1.0, 2.0, 3.0], fill_value=0.0)
+        tm.assert_sp_array_equal(result, expected)
 
-    @pytest.mark.parametrize("ordered", [True, False])
-    def test_astype(self, ordered):
-        # string
-        cat = Categorical(list("abbaaccc"), ordered=ordered)
-        result = cat.astype(object)
-        expected = np.array(cat)
+    def test_astype_dt64_to_int64(self):
+        # GH#49631 match non-sparse behavior
+        values = np.array(["NaT", "2016-01-02", "2016-01-03"], dtype="M8[ns]")
+
+        arr = SparseArray(values)
+        result = arr.astype("int64")
+        expected = values.astype("int64")
         tm.assert_numpy_array_equal(result, expected)
 
-        msg = r"Cannot cast object|str dtype to float64"
-        with pytest.raises(ValueError, match=msg):
-            cat.astype(float)
+        # we should also be able to cast to equivalent Sparse[int64]
+        dtype_int64 = SparseDtype("int64", np.iinfo(np.int64).min)
+        result2 = arr.astype(dtype_int64)
+        tm.assert_numpy_array_equal(result2.to_numpy(), expected)
 
-        # numeric
-        cat = Categorical([0, 1, 2, 2, 1, 0, 1, 0, 2], ordered=ordered)
-        result = cat.astype(object)
-        expected = np.array(cat, dtype=object)
-        tm.assert_numpy_array_equal(result, expected)
-
-        result = cat.astype(int)
-        expected = np.array(cat, dtype="int")
-        tm.assert_numpy_array_equal(result, expected)
-
-        result = cat.astype(float)
-        expected = np.array(cat, dtype=float)
-        tm.assert_numpy_array_equal(result, expected)
-
-    @pytest.mark.parametrize("dtype_ordered", [True, False])
-    @pytest.mark.parametrize("cat_ordered", [True, False])
-    def test_astype_category(self, dtype_ordered, cat_ordered):
-        # GH#10696/GH#18593
-        data = list("abcaacbab")
-        cat = Categorical(data, categories=list("bac"), ordered=cat_ordered)
-
-        # standard categories
-        dtype = CategoricalDtype(ordered=dtype_ordered)
-        result = cat.astype(dtype)
-        expected = Categorical(data, categories=cat.categories, ordered=dtype_ordered)
-        tm.assert_categorical_equal(result, expected)
-
-        # non-standard categories
-        dtype = CategoricalDtype(list("adc"), dtype_ordered)
-        result = cat.astype(dtype)
-        expected = Categorical(data, dtype=dtype)
-        tm.assert_categorical_equal(result, expected)
-
-        if dtype_ordered is False:
-            # dtype='category' can't specify ordered, so only test once
-            result = cat.astype("category")
-            expected = cat
-            tm.assert_categorical_equal(result, expected)
-
-    def test_astype_object_datetime_categories(self):
-        # GH#40754
-        cat = Categorical(to_datetime(["2021-03-27", NaT]))
-        result = cat.astype(object)
-        expected = np.array([Timestamp("2021-03-27 00:00:00"), NaT], dtype="object")
-        tm.assert_numpy_array_equal(result, expected)
-
-    def test_astype_object_timestamp_categories(self):
-        # GH#18024
-        cat = Categorical([Timestamp("2014-01-01")])
-        result = cat.astype(object)
-        expected = np.array([Timestamp("2014-01-01 00:00:00")], dtype="object")
-        tm.assert_numpy_array_equal(result, expected)
-
-    def test_astype_category_readonly_mask_values(self):
-        # GH#53658
-        arr = array([0, 1, 2], dtype="Int64")
-        arr._mask.flags["WRITEABLE"] = False
-        result = arr.astype("category")
-        expected = array([0, 1, 2], dtype="Int64").astype("category")
-        tm.assert_extension_array_equal(result, expected)
+        # GH#50087 we should match the non-sparse behavior regardless of
+        #  if we have a fill_value other than NaT
+        dtype = SparseDtype("datetime64[ns]", values[1])
+        arr3 = SparseArray(values, dtype=dtype)
+        result3 = arr3.astype("int64")
+        tm.assert_numpy_array_equal(result3, expected)

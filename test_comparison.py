@@ -1,60 +1,39 @@
-import numpy as np
 import pytest
 
 import pandas as pd
 import pandas._testing as tm
-from pandas.arrays import BooleanArray
-from pandas.tests.arrays.masked_shared import ComparisonOps
+from pandas.tests.arrays.masked_shared import (
+    ComparisonOps,
+    NumericOps,
+)
 
 
-@pytest.fixture
-def data():
-    """Fixture returning boolean array with valid and missing data"""
-    return pd.array(
-        [True, False] * 4 + [np.nan] + [True, False] * 44 + [np.nan] + [True, False],
-        dtype="boolean",
-    )
-
-
-@pytest.fixture
-def dtype():
-    """Fixture returning BooleanDtype"""
-    return pd.BooleanDtype()
-
-
-class TestComparisonOps(ComparisonOps):
-    def test_compare_scalar(self, data, comparison_op):
-        self._compare_other(data, comparison_op, True)
-
-    def test_compare_array(self, data, comparison_op):
-        other = pd.array([True] * len(data), dtype="boolean")
-        self._compare_other(data, comparison_op, other)
-        other = np.array([True] * len(data))
-        self._compare_other(data, comparison_op, other)
-        other = pd.Series([True] * len(data))
-        self._compare_other(data, comparison_op, other)
-
-    @pytest.mark.parametrize("other", [True, False, pd.NA])
+class TestComparisonOps(NumericOps, ComparisonOps):
+    @pytest.mark.parametrize("other", [True, False, pd.NA, -1, 0, 1])
     def test_scalar(self, other, comparison_op, dtype):
         ComparisonOps.test_scalar(self, other, comparison_op, dtype)
 
-    def test_array(self, comparison_op):
-        op = comparison_op
-        a = pd.array([True] * 3 + [False] * 3 + [None] * 3, dtype="boolean")
-        b = pd.array([True, False, None] * 3, dtype="boolean")
+    def test_compare_to_int(self, dtype, comparison_op):
+        # GH 28930
+        op_name = f"__{comparison_op.__name__}__"
+        s1 = pd.Series([1, None, 3], dtype=dtype)
+        s2 = pd.Series([1, None, 3], dtype="float")
 
-        result = op(a, b)
+        method = getattr(s1, op_name)
+        result = method(2)
 
-        values = op(a._data, b._data)
-        mask = a._mask | b._mask
-        expected = BooleanArray(values, mask)
-        tm.assert_extension_array_equal(result, expected)
+        method = getattr(s2, op_name)
+        expected = method(2).astype("boolean")
+        expected[s2.isna()] = pd.NA
 
-        # ensure we haven't mutated anything inplace
-        result[0] = None
-        tm.assert_extension_array_equal(
-            a, pd.array([True] * 3 + [False] * 3 + [None] * 3, dtype="boolean")
-        )
-        tm.assert_extension_array_equal(
-            b, pd.array([True, False, None] * 3, dtype="boolean")
-        )
+        tm.assert_series_equal(result, expected)
+
+
+def test_equals():
+    # GH-30652
+    # equals is generally tested in /tests/extension/base/methods, but this
+    # specifically tests that two arrays of the same class but different dtype
+    # do not evaluate equal
+    a1 = pd.array([1, 2, None], dtype="Int64")
+    a2 = pd.array([1, 2, None], dtype="Int32")
+    assert a1.equals(a2) is False

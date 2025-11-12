@@ -1,4 +1,6 @@
-import operator
+from __future__ import annotations
+
+from typing import Any
 
 import numpy as np
 import pytest
@@ -6,129 +8,241 @@ import pytest
 import pandas as pd
 import pandas._testing as tm
 
-
-@pytest.fixture
-def data():
-    """Fixture returning boolean array with valid and missing values."""
-    return pd.array(
-        [True, False] * 4 + [np.nan] + [True, False] * 44 + [np.nan] + [True, False],
-        dtype="boolean",
-    )
-
-
-@pytest.fixture
-def left_array():
-    """Fixture returning boolean array with valid and missing values."""
-    return pd.array([True] * 3 + [False] * 3 + [None] * 3, dtype="boolean")
+# integer dtypes
+arrays = [pd.array([1, 2, 3, None], dtype=dtype) for dtype in tm.ALL_INT_EA_DTYPES]
+scalars: list[Any] = [2] * len(arrays)
+# floating dtypes
+arrays += [pd.array([0.1, 0.2, 0.3, None], dtype=dtype) for dtype in tm.FLOAT_EA_DTYPES]
+scalars += [0.2, 0.2]
+# boolean
+arrays += [pd.array([True, False, True, None], dtype="boolean")]
+scalars += [False]
 
 
-@pytest.fixture
-def right_array():
-    """Fixture returning boolean array with valid and missing values."""
-    return pd.array([True, False, None] * 3, dtype="boolean")
+@pytest.fixture(params=zip(arrays, scalars), ids=[a.dtype.name for a in arrays])
+def data(request):
+    """Fixture returning parametrized (array, scalar) tuple.
+
+    Used to test equivalence of scalars, numpy arrays with array ops, and the
+    equivalence of DataFrame and Series ops.
+    """
+    return request.param
 
 
-# Basic test for the arithmetic array ops
+def check_skip(data, op_name):
+    if isinstance(data.dtype, pd.BooleanDtype) and "sub" in op_name:
+        pytest.skip("subtract not implemented for boolean")
+
+
+def is_bool_not_implemented(data, op_name):
+    # match non-masked behavior
+    return data.dtype.kind == "b" and op_name.strip("_").lstrip("r") in [
+        "pow",
+        "truediv",
+        "floordiv",
+    ]
+
+
+# Test equivalence of scalars, numpy arrays with array ops
 # -----------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "opname, exp",
-    [
-        ("add", [True, True, None, True, False, None, None, None, None]),
-        ("mul", [True, False, None, False, False, None, None, None, None]),
-    ],
-    ids=["add", "mul"],
-)
-def test_add_mul(left_array, right_array, opname, exp):
-    op = getattr(operator, opname)
-    result = op(left_array, right_array)
-    expected = pd.array(exp, dtype="boolean")
-    tm.assert_extension_array_equal(result, expected)
+def test_array_scalar_like_equivalence(data, all_arithmetic_operators):
+    data, scalar = data
+    op = tm.get_op_from_name(all_arithmetic_operators)
+    check_skip(data, all_arithmetic_operators)
+
+    scalar_array = pd.array([scalar] * len(data), dtype=data.dtype)
+
+    # TODO also add len-1 array (np.array([scalar], dtype=data.dtype.numpy_dtype))
+    for scalar in [scalar, data.dtype.type(scalar)]:
+        if is_bool_not_implemented(data, all_arithmetic_operators):
+            msg = "operator '.*' not implemented for bool dtypes"
+            with pytest.raises(NotImplementedError, match=msg):
+                op(data, scalar)
+            with pytest.raises(NotImplementedError, match=msg):
+                op(data, scalar_array)
+        else:
+            result = op(data, scalar)
+            expected = op(data, scalar_array)
+            tm.assert_extension_array_equal(result, expected)
 
 
-def test_sub(left_array, right_array):
-    msg = (
-        r"numpy boolean subtract, the `-` operator, is (?:deprecated|not supported), "
-        r"use the bitwise_xor, the `\^` operator, or the logical_xor function instead\."
-    )
-    with pytest.raises(TypeError, match=msg):
-        left_array - right_array
+def test_array_NA(data, all_arithmetic_operators):
+    data, _ = data
+    op = tm.get_op_from_name(all_arithmetic_operators)
+    check_skip(data, all_arithmetic_operators)
 
+    scalar = pd.NA
+    scalar_array = pd.array([pd.NA] * len(data), dtype=data.dtype)
 
-def test_div(left_array, right_array):
-    msg = "operator '.*' not implemented for bool dtypes"
-    with pytest.raises(NotImplementedError, match=msg):
-        # check that we are matching the non-masked Series behavior
-        pd.Series(left_array._data) / pd.Series(right_array._data)
+    mask = data._mask.copy()
 
-    with pytest.raises(NotImplementedError, match=msg):
-        left_array / right_array
-
-
-@pytest.mark.parametrize(
-    "opname",
-    [
-        "floordiv",
-        "mod",
-        "pow",
-    ],
-)
-def test_op_int8(left_array, right_array, opname):
-    op = getattr(operator, opname)
-    if opname != "mod":
+    if is_bool_not_implemented(data, all_arithmetic_operators):
         msg = "operator '.*' not implemented for bool dtypes"
         with pytest.raises(NotImplementedError, match=msg):
-            result = op(left_array, right_array)
+            op(data, scalar)
+        # GH#45421 check op doesn't alter data._mask inplace
+        tm.assert_numpy_array_equal(mask, data._mask)
         return
-    result = op(left_array, right_array)
-    expected = op(left_array.astype("Int8"), right_array.astype("Int8"))
+
+    result = op(data, scalar)
+    # GH#45421 check op doesn't alter data._mask inplace
+    tm.assert_numpy_array_equal(mask, data._mask)
+
+    expected = op(data, scalar_array)
+    tm.assert_numpy_array_equal(mask, data._mask)
+
     tm.assert_extension_array_equal(result, expected)
+
+
+def test_numpy_array_equivalence(data, all_arithmetic_operators):
+    data, scalar = data
+    op = tm.get_op_from_name(all_arithmetic_operators)
+    check_skip(data, all_arithmetic_operators)
+
+    numpy_array = np.array([scalar] * len(data), dtype=data.dtype.numpy_dtype)
+    pd_array = pd.array(numpy_array, dtype=data.dtype)
+
+    if is_bool_not_implemented(data, all_arithmetic_operators):
+        msg = "operator '.*' not implemented for bool dtypes"
+        with pytest.raises(NotImplementedError, match=msg):
+            op(data, numpy_array)
+        with pytest.raises(NotImplementedError, match=msg):
+            op(data, pd_array)
+        return
+
+    result = op(data, numpy_array)
+    expected = op(data, pd_array)
+    tm.assert_extension_array_equal(result, expected)
+
+
+# Test equivalence with Series and DataFrame ops
+# -----------------------------------------------------------------------------
+
+
+def test_frame(data, all_arithmetic_operators):
+    data, scalar = data
+    op = tm.get_op_from_name(all_arithmetic_operators)
+    check_skip(data, all_arithmetic_operators)
+
+    # DataFrame with scalar
+    df = pd.DataFrame({"A": data})
+
+    if is_bool_not_implemented(data, all_arithmetic_operators):
+        msg = "operator '.*' not implemented for bool dtypes"
+        with pytest.raises(NotImplementedError, match=msg):
+            op(df, scalar)
+        with pytest.raises(NotImplementedError, match=msg):
+            op(data, scalar)
+        return
+
+    result = op(df, scalar)
+    expected = pd.DataFrame({"A": op(data, scalar)})
+    tm.assert_frame_equal(result, expected)
+
+
+def test_series(data, all_arithmetic_operators):
+    data, scalar = data
+    op = tm.get_op_from_name(all_arithmetic_operators)
+    check_skip(data, all_arithmetic_operators)
+
+    ser = pd.Series(data)
+
+    others = [
+        scalar,
+        np.array([scalar] * len(data), dtype=data.dtype.numpy_dtype),
+        pd.array([scalar] * len(data), dtype=data.dtype),
+        pd.Series([scalar] * len(data), dtype=data.dtype),
+    ]
+
+    for other in others:
+        if is_bool_not_implemented(data, all_arithmetic_operators):
+            msg = "operator '.*' not implemented for bool dtypes"
+            with pytest.raises(NotImplementedError, match=msg):
+                op(ser, other)
+
+        else:
+            result = op(ser, other)
+            expected = pd.Series(op(data, other))
+            tm.assert_series_equal(result, expected)
 
 
 # Test generic characteristics / errors
 # -----------------------------------------------------------------------------
 
 
-def test_error_invalid_values(data, all_arithmetic_operators):
-    # invalid ops
-    op = all_arithmetic_operators
-    s = pd.Series(data)
-    ops = getattr(s, op)
+def test_error_invalid_object(data, all_arithmetic_operators):
+    data, _ = data
 
-    # invalid scalars
-    msg = (
-        "did not contain a loop with signature matching types|"
-        "BooleanArray cannot perform the operation|"
-        "not supported for the input types, and the inputs could not be safely coerced "
-        "to any supported types according to the casting rule ''safe''|"
-        "not supported for dtype"
-    )
-    with pytest.raises(TypeError, match=msg):
-        ops("foo")
+    op = all_arithmetic_operators
+    opa = getattr(data, op)
+
+    # 2d -> return NotImplemented
+    result = opa(pd.DataFrame({"A": data}))
+    assert result is NotImplemented
+
+    msg = r"can only perform ops with 1-d structures"
+    with pytest.raises(NotImplementedError, match=msg):
+        opa(np.arange(len(data)).reshape(-1, len(data)))
+
+
+def test_error_len_mismatch(data, all_arithmetic_operators):
+    # operating with a list-like with non-matching length raises
+    data, scalar = data
+    op = tm.get_op_from_name(all_arithmetic_operators)
+
+    other = [scalar] * (len(data) - 1)
+
+    err = ValueError
     msg = "|".join(
         [
-            r"unsupported operand type\(s\) for",
-            "Concatenation operation is not implemented for NumPy arrays",
-            "has no kernel",
-            "not supported for dtype",
+            r"operands could not be broadcast together with shapes \(3,\) \(4,\)",
+            r"operands could not be broadcast together with shapes \(4,\) \(3,\)",
         ]
     )
-    with pytest.raises(TypeError, match=msg):
-        ops(pd.Timestamp("20180101"))
-
-    # invalid array-likes
-    if op not in ("__mul__", "__rmul__"):
-        # TODO(extension) numpy's mul with object array sees booleans as numbers
-        msg = "|".join(
-            [
-                r"unsupported operand type\(s\) for",
-                "can only concatenate str",
-                "not all arguments converted during string formatting",
-                "has no kernel",
-                "not implemented",
-                "not supported for dtype",
-            ]
+    if data.dtype.kind == "b" and all_arithmetic_operators.strip("_") in [
+        "sub",
+        "rsub",
+    ]:
+        err = TypeError
+        msg = (
+            r"numpy boolean subtract, the `\-` operator, is not supported, use "
+            r"the bitwise_xor, the `\^` operator, or the logical_xor function instead"
         )
+    elif is_bool_not_implemented(data, all_arithmetic_operators):
+        msg = "operator '.*' not implemented for bool dtypes"
+        err = NotImplementedError
+
+    for other in [other, np.array(other)]:
+        with pytest.raises(err, match=msg):
+            op(data, other)
+
+        s = pd.Series(data)
+        with pytest.raises(err, match=msg):
+            op(s, other)
+
+
+@pytest.mark.parametrize("op", ["__neg__", "__abs__", "__invert__"])
+def test_unary_op_does_not_propagate_mask(data, op):
+    # https://github.com/pandas-dev/pandas/issues/39943
+    data, _ = data
+    ser = pd.Series(data)
+
+    if op == "__invert__" and data.dtype.kind == "f":
+        # we follow numpy in raising
+        msg = "ufunc 'invert' not supported for the input types"
         with pytest.raises(TypeError, match=msg):
-            ops(pd.Series("foo", index=s.index))
+            getattr(ser, op)()
+        with pytest.raises(TypeError, match=msg):
+            getattr(data, op)()
+        with pytest.raises(TypeError, match=msg):
+            # Check that this is still the numpy behavior
+            getattr(data._data, op)()
+
+        return
+
+    result = getattr(ser, op)()
+    expected = result.copy(deep=True)
+    ser[0] = None
+    tm.assert_series_equal(result, expected)
