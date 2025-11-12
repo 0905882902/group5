@@ -1,116 +1,804 @@
-import numpy as np
+"""
+This module gathers tree-based methods, including decision, regression and
+randomized trees. Single and multi-output problems are both handled.
+"""
+
+# Authors: Gilles Louppe <g.louppe@gmail.com>
+#          Peter Prettenhofer <peter.prettenhofer@gmail.com>
+#          Brian Holt <bdholt1@gmail.com>
+#          Noel Dawe <noel@dawe.me>
+#          Satrajit Gosh <satrajit.ghosh@gmail.com>
+#          Joly Arnaud <arnaud.v.joly@gmail.com>
+#          Fares Hedayati <fares.hedayati@gmail.com>
+#          Nelson Liu <nelson@nelsonliu.me>
+#
+# License: BSD 3 clause
+
+import numbers
 import warnings
+import copy
+from abc import ABCMeta
+from abc import abstractmethod
+from math import ceil
 
-from ._base import _fit_liblinear, BaseSVC, BaseLibSVM
-from ..base import BaseEstimator, RegressorMixin, OutlierMixin
-from ..linear_model._base import LinearClassifierMixin, SparseCoefMixin, LinearModel
-from ..utils.validation import _num_samples
+import numpy as np
+from scipy.sparse import issparse
+
+from ..base import BaseEstimator
+from ..base import ClassifierMixin
+from ..base import clone
+from ..base import RegressorMixin
+from ..base import is_classifier
+from ..base import MultiOutputMixin
+from ..utils import Bunch
+from ..utils import check_random_state
+from ..utils.deprecation import deprecated
+from ..utils.validation import _check_sample_weight
+from ..utils import compute_sample_weight
 from ..utils.multiclass import check_classification_targets
+from ..utils.validation import check_is_fitted
+
+from ._criterion import Criterion
+from ._splitter import Splitter
+from ._tree import DepthFirstTreeBuilder
+from ._tree import BestFirstTreeBuilder
+from ._tree import Tree
+from ._tree import _build_pruned_tree_ccp
+from ._tree import ccp_pruning_path
+from . import _tree, _splitter, _criterion
+
+__all__ = [
+    "DecisionTreeClassifier",
+    "DecisionTreeRegressor",
+    "ExtraTreeClassifier",
+    "ExtraTreeRegressor",
+]
 
 
-class LinearSVC(LinearClassifierMixin, SparseCoefMixin, BaseEstimator):
-    """Linear Support Vector Classification.
+# =============================================================================
+# Types and constants
+# =============================================================================
 
-    Similar to SVC with parameter kernel='linear', but implemented in terms of
-    liblinear rather than libsvm, so it has more flexibility in the choice of
-    penalties and loss functions and should scale better to large numbers of
-    samples.
+DTYPE = _tree.DTYPE
+DOUBLE = _tree.DOUBLE
 
-    This class supports both dense and sparse input and the multiclass support
-    is handled according to a one-vs-the-rest scheme.
+CRITERIA_CLF = {"gini": _criterion.Gini, "entropy": _criterion.Entropy}
+# TODO: Remove "mse" and "mae" in version 1.2.
+CRITERIA_REG = {
+    "squared_error": _criterion.MSE,
+    "mse": _criterion.MSE,
+    "friedman_mse": _criterion.FriedmanMSE,
+    "absolute_error": _criterion.MAE,
+    "mae": _criterion.MAE,
+    "poisson": _criterion.Poisson,
+}
 
-    Read more in the :ref:`User Guide <svm_classification>`.
+DENSE_SPLITTERS = {"best": _splitter.BestSplitter, "random": _splitter.RandomSplitter}
+
+SPARSE_SPLITTERS = {
+    "best": _splitter.BestSparseSplitter,
+    "random": _splitter.RandomSparseSplitter,
+}
+
+# =============================================================================
+# Base decision tree
+# =============================================================================
+
+
+class BaseDecisionTree(MultiOutputMixin, BaseEstimator, metaclass=ABCMeta):
+    """Base class for decision trees.
+
+    Warning: This class should not be used directly.
+    Use derived classes instead.
+    """
+
+    @abstractmethod
+    def __init__(
+        self,
+        *,
+        criterion,
+        splitter,
+        max_depth,
+        min_samples_split,
+        min_samples_leaf,
+        min_weight_fraction_leaf,
+        max_features,
+        max_leaf_nodes,
+        random_state,
+        min_impurity_decrease,
+        class_weight=None,
+        ccp_alpha=0.0,
+    ):
+        self.criterion = criterion
+        self.splitter = splitter
+        self.max_depth = max_depth
+        self.min_samples_split = min_samples_split
+        self.min_samples_leaf = min_samples_leaf
+        self.min_weight_fraction_leaf = min_weight_fraction_leaf
+        self.max_features = max_features
+        self.max_leaf_nodes = max_leaf_nodes
+        self.random_state = random_state
+        self.min_impurity_decrease = min_impurity_decrease
+        self.class_weight = class_weight
+        self.ccp_alpha = ccp_alpha
+
+    def get_depth(self):
+        """Return the depth of the decision tree.
+
+        The depth of a tree is the maximum distance between the root
+        and any leaf.
+
+        Returns
+        -------
+        self.tree_.max_depth : int
+            The maximum depth of the tree.
+        """
+        check_is_fitted(self)
+        return self.tree_.max_depth
+
+    def get_n_leaves(self):
+        """Return the number of leaves of the decision tree.
+
+        Returns
+        -------
+        self.tree_.n_leaves : int
+            Number of leaves.
+        """
+        check_is_fitted(self)
+        return self.tree_.n_leaves
+
+    def fit(
+        self, X, y, sample_weight=None, check_input=True, X_idx_sorted="deprecated"
+    ):
+
+        random_state = check_random_state(self.random_state)
+
+        if self.ccp_alpha < 0.0:
+            raise ValueError("ccp_alpha must be greater than or equal to 0")
+
+        if check_input:
+            # Need to validate separately here.
+            # We can't pass multi_ouput=True because that would allow y to be
+            # csr.
+            check_X_params = dict(dtype=DTYPE, accept_sparse="csc")
+            check_y_params = dict(ensure_2d=False, dtype=None)
+            X, y = self._validate_data(
+                X, y, validate_separately=(check_X_params, check_y_params)
+            )
+            if issparse(X):
+                X.sort_indices()
+
+                if X.indices.dtype != np.intc or X.indptr.dtype != np.intc:
+                    raise ValueError(
+                        "No support for np.int64 index based sparse matrices"
+                    )
+
+            if self.criterion == "poisson":
+                if np.any(y < 0):
+                    raise ValueError(
+                        "Some value(s) of y are negative which is"
+                        " not allowed for Poisson regression."
+                    )
+                if np.sum(y) <= 0:
+                    raise ValueError(
+                        "Sum of y is not positive which is "
+                        "necessary for Poisson regression."
+                    )
+
+        # Determine output settings
+        n_samples, self.n_features_in_ = X.shape
+        is_classification = is_classifier(self)
+
+        y = np.atleast_1d(y)
+        expanded_class_weight = None
+
+        if y.ndim == 1:
+            # reshape is necessary to preserve the data contiguity against vs
+            # [:, np.newaxis] that does not.
+            y = np.reshape(y, (-1, 1))
+
+        self.n_outputs_ = y.shape[1]
+
+        if is_classification:
+            check_classification_targets(y)
+            y = np.copy(y)
+
+            self.classes_ = []
+            self.n_classes_ = []
+
+            if self.class_weight is not None:
+                y_original = np.copy(y)
+
+            y_encoded = np.zeros(y.shape, dtype=int)
+            for k in range(self.n_outputs_):
+                classes_k, y_encoded[:, k] = np.unique(y[:, k], return_inverse=True)
+                self.classes_.append(classes_k)
+                self.n_classes_.append(classes_k.shape[0])
+            y = y_encoded
+
+            if self.class_weight is not None:
+                expanded_class_weight = compute_sample_weight(
+                    self.class_weight, y_original
+                )
+
+            self.n_classes_ = np.array(self.n_classes_, dtype=np.intp)
+
+        if getattr(y, "dtype", None) != DOUBLE or not y.flags.contiguous:
+            y = np.ascontiguousarray(y, dtype=DOUBLE)
+
+        # Check parameters
+        max_depth = np.iinfo(np.int32).max if self.max_depth is None else self.max_depth
+        max_leaf_nodes = -1 if self.max_leaf_nodes is None else self.max_leaf_nodes
+
+        if isinstance(self.min_samples_leaf, numbers.Integral):
+            if not 1 <= self.min_samples_leaf:
+                raise ValueError(
+                    "min_samples_leaf must be at least 1 or in (0, 0.5], got %s"
+                    % self.min_samples_leaf
+                )
+            min_samples_leaf = self.min_samples_leaf
+        else:  # float
+            if not 0.0 < self.min_samples_leaf <= 0.5:
+                raise ValueError(
+                    "min_samples_leaf must be at least 1 or in (0, 0.5], got %s"
+                    % self.min_samples_leaf
+                )
+            min_samples_leaf = int(ceil(self.min_samples_leaf * n_samples))
+
+        if isinstance(self.min_samples_split, numbers.Integral):
+            if not 2 <= self.min_samples_split:
+                raise ValueError(
+                    "min_samples_split must be an integer "
+                    "greater than 1 or a float in (0.0, 1.0]; "
+                    "got the integer %s"
+                    % self.min_samples_split
+                )
+            min_samples_split = self.min_samples_split
+        else:  # float
+            if not 0.0 < self.min_samples_split <= 1.0:
+                raise ValueError(
+                    "min_samples_split must be an integer "
+                    "greater than 1 or a float in (0.0, 1.0]; "
+                    "got the float %s"
+                    % self.min_samples_split
+                )
+            min_samples_split = int(ceil(self.min_samples_split * n_samples))
+            min_samples_split = max(2, min_samples_split)
+
+        min_samples_split = max(min_samples_split, 2 * min_samples_leaf)
+
+        if isinstance(self.max_features, str):
+            if self.max_features == "auto":
+                if is_classification:
+                    max_features = max(1, int(np.sqrt(self.n_features_in_)))
+                else:
+                    max_features = self.n_features_in_
+            elif self.max_features == "sqrt":
+                max_features = max(1, int(np.sqrt(self.n_features_in_)))
+            elif self.max_features == "log2":
+                max_features = max(1, int(np.log2(self.n_features_in_)))
+            else:
+                raise ValueError(
+                    "Invalid value for max_features. "
+                    "Allowed string values are 'auto', "
+                    "'sqrt' or 'log2'."
+                )
+        elif self.max_features is None:
+            max_features = self.n_features_in_
+        elif isinstance(self.max_features, numbers.Integral):
+            max_features = self.max_features
+        else:  # float
+            if self.max_features > 0.0:
+                max_features = max(1, int(self.max_features * self.n_features_in_))
+            else:
+                max_features = 0
+
+        self.max_features_ = max_features
+
+        if len(y) != n_samples:
+            raise ValueError(
+                "Number of labels=%d does not match number of samples=%d"
+                % (len(y), n_samples)
+            )
+        if not 0 <= self.min_weight_fraction_leaf <= 0.5:
+            raise ValueError("min_weight_fraction_leaf must in [0, 0.5]")
+        if max_depth <= 0:
+            raise ValueError("max_depth must be greater than zero. ")
+        if not (0 < max_features <= self.n_features_in_):
+            raise ValueError("max_features must be in (0, n_features]")
+        if not isinstance(max_leaf_nodes, numbers.Integral):
+            raise ValueError(
+                "max_leaf_nodes must be integral number but was %r" % max_leaf_nodes
+            )
+        if -1 < max_leaf_nodes < 2:
+            raise ValueError(
+                ("max_leaf_nodes {0} must be either None or larger than 1").format(
+                    max_leaf_nodes
+                )
+            )
+
+        if sample_weight is not None:
+            sample_weight = _check_sample_weight(sample_weight, X, DOUBLE)
+
+        if expanded_class_weight is not None:
+            if sample_weight is not None:
+                sample_weight = sample_weight * expanded_class_weight
+            else:
+                sample_weight = expanded_class_weight
+
+        # Set min_weight_leaf from min_weight_fraction_leaf
+        if sample_weight is None:
+            min_weight_leaf = self.min_weight_fraction_leaf * n_samples
+        else:
+            min_weight_leaf = self.min_weight_fraction_leaf * np.sum(sample_weight)
+
+        if self.min_impurity_decrease < 0.0:
+            raise ValueError("min_impurity_decrease must be greater than or equal to 0")
+
+        # TODO: Remove in 1.1
+        if X_idx_sorted != "deprecated":
+            warnings.warn(
+                "The parameter 'X_idx_sorted' is deprecated and has no "
+                "effect. It will be removed in 1.1 (renaming of 0.26). You "
+                "can suppress this warning by not passing any value to the "
+                "'X_idx_sorted' parameter.",
+                FutureWarning,
+            )
+
+        # Build tree
+        criterion = self.criterion
+        if not isinstance(criterion, Criterion):
+            if is_classification:
+                criterion = CRITERIA_CLF[self.criterion](
+                    self.n_outputs_, self.n_classes_
+                )
+            else:
+                criterion = CRITERIA_REG[self.criterion](self.n_outputs_, n_samples)
+            # TODO: Remove in v1.2
+            if self.criterion == "mse":
+                warnings.warn(
+                    "Criterion 'mse' was deprecated in v1.0 and will be "
+                    "removed in version 1.2. Use `criterion='squared_error'` "
+                    "which is equivalent.",
+                    FutureWarning,
+                )
+            elif self.criterion == "mae":
+                warnings.warn(
+                    "Criterion 'mae' was deprecated in v1.0 and will be "
+                    "removed in version 1.2. Use `criterion='absolute_error'` "
+                    "which is equivalent.",
+                    FutureWarning,
+                )
+        else:
+            # Make a deepcopy in case the criterion has mutable attributes that
+            # might be shared and modified concurrently during parallel fitting
+            criterion = copy.deepcopy(criterion)
+
+        SPLITTERS = SPARSE_SPLITTERS if issparse(X) else DENSE_SPLITTERS
+
+        splitter = self.splitter
+        if not isinstance(self.splitter, Splitter):
+            splitter = SPLITTERS[self.splitter](
+                criterion,
+                self.max_features_,
+                min_samples_leaf,
+                min_weight_leaf,
+                random_state,
+            )
+
+        if is_classifier(self):
+            self.tree_ = Tree(self.n_features_in_, self.n_classes_, self.n_outputs_)
+        else:
+            self.tree_ = Tree(
+                self.n_features_in_,
+                # TODO: tree shouldn't need this in this case
+                np.array([1] * self.n_outputs_, dtype=np.intp),
+                self.n_outputs_,
+            )
+
+        # Use BestFirst if max_leaf_nodes given; use DepthFirst otherwise
+        if max_leaf_nodes < 0:
+            builder = DepthFirstTreeBuilder(
+                splitter,
+                min_samples_split,
+                min_samples_leaf,
+                min_weight_leaf,
+                max_depth,
+                self.min_impurity_decrease,
+            )
+        else:
+            builder = BestFirstTreeBuilder(
+                splitter,
+                min_samples_split,
+                min_samples_leaf,
+                min_weight_leaf,
+                max_depth,
+                max_leaf_nodes,
+                self.min_impurity_decrease,
+            )
+
+        builder.build(self.tree_, X, y, sample_weight)
+
+        if self.n_outputs_ == 1 and is_classifier(self):
+            self.n_classes_ = self.n_classes_[0]
+            self.classes_ = self.classes_[0]
+
+        self._prune_tree()
+
+        return self
+
+    def _validate_X_predict(self, X, check_input):
+        """Validate the training data on predict (probabilities)."""
+        if check_input:
+            X = self._validate_data(X, dtype=DTYPE, accept_sparse="csr", reset=False)
+            if issparse(X) and (
+                X.indices.dtype != np.intc or X.indptr.dtype != np.intc
+            ):
+                raise ValueError("No support for np.int64 index based sparse matrices")
+        else:
+            # The number of features is checked regardless of `check_input`
+            self._check_n_features(X, reset=False)
+        return X
+
+    def predict(self, X, check_input=True):
+        """Predict class or regression value for X.
+
+        For a classification model, the predicted class for each sample in X is
+        returned. For a regression model, the predicted value based on X is
+        returned.
+
+        Parameters
+        ----------
+        X : {array-like, sparse matrix} of shape (n_samples, n_features)
+            The input samples. Internally, it will be converted to
+            ``dtype=np.float32`` and if a sparse matrix is provided
+            to a sparse ``csr_matrix``.
+
+        check_input : bool, default=True
+            Allow to bypass several input checking.
+            Don't use this parameter unless you know what you do.
+
+        Returns
+        -------
+        y : array-like of shape (n_samples,) or (n_samples, n_outputs)
+            The predicted classes, or the predict values.
+        """
+        check_is_fitted(self)
+        X = self._validate_X_predict(X, check_input)
+        proba = self.tree_.predict(X)
+        n_samples = X.shape[0]
+
+        # Classification
+        if is_classifier(self):
+            if self.n_outputs_ == 1:
+                return self.classes_.take(np.argmax(proba, axis=1), axis=0)
+
+            else:
+                class_type = self.classes_[0].dtype
+                predictions = np.zeros((n_samples, self.n_outputs_), dtype=class_type)
+                for k in range(self.n_outputs_):
+                    predictions[:, k] = self.classes_[k].take(
+                        np.argmax(proba[:, k], axis=1), axis=0
+                    )
+
+                return predictions
+
+        # Regression
+        else:
+            if self.n_outputs_ == 1:
+                return proba[:, 0]
+
+            else:
+                return proba[:, :, 0]
+
+    def apply(self, X, check_input=True):
+        """Return the index of the leaf that each sample is predicted as.
+
+        .. versionadded:: 0.17
+
+        Parameters
+        ----------
+        X : {array-like, sparse matrix} of shape (n_samples, n_features)
+            The input samples. Internally, it will be converted to
+            ``dtype=np.float32`` and if a sparse matrix is provided
+            to a sparse ``csr_matrix``.
+
+        check_input : bool, default=True
+            Allow to bypass several input checking.
+            Don't use this parameter unless you know what you do.
+
+        Returns
+        -------
+        X_leaves : array-like of shape (n_samples,)
+            For each datapoint x in X, return the index of the leaf x
+            ends up in. Leaves are numbered within
+            ``[0; self.tree_.node_count)``, possibly with gaps in the
+            numbering.
+        """
+        check_is_fitted(self)
+        X = self._validate_X_predict(X, check_input)
+        return self.tree_.apply(X)
+
+    def decision_path(self, X, check_input=True):
+        """Return the decision path in the tree.
+
+        .. versionadded:: 0.18
+
+        Parameters
+        ----------
+        X : {array-like, sparse matrix} of shape (n_samples, n_features)
+            The input samples. Internally, it will be converted to
+            ``dtype=np.float32`` and if a sparse matrix is provided
+            to a sparse ``csr_matrix``.
+
+        check_input : bool, default=True
+            Allow to bypass several input checking.
+            Don't use this parameter unless you know what you do.
+
+        Returns
+        -------
+        indicator : sparse matrix of shape (n_samples, n_nodes)
+            Return a node indicator CSR matrix where non zero elements
+            indicates that the samples goes through the nodes.
+        """
+        X = self._validate_X_predict(X, check_input)
+        return self.tree_.decision_path(X)
+
+    def _prune_tree(self):
+        """Prune tree using Minimal Cost-Complexity Pruning."""
+        check_is_fitted(self)
+
+        if self.ccp_alpha < 0.0:
+            raise ValueError("ccp_alpha must be greater than or equal to 0")
+
+        if self.ccp_alpha == 0.0:
+            return
+
+        # build pruned tree
+        if is_classifier(self):
+            n_classes = np.atleast_1d(self.n_classes_)
+            pruned_tree = Tree(self.n_features_in_, n_classes, self.n_outputs_)
+        else:
+            pruned_tree = Tree(
+                self.n_features_in_,
+                # TODO: the tree shouldn't need this param
+                np.array([1] * self.n_outputs_, dtype=np.intp),
+                self.n_outputs_,
+            )
+        _build_pruned_tree_ccp(pruned_tree, self.tree_, self.ccp_alpha)
+
+        self.tree_ = pruned_tree
+
+    def cost_complexity_pruning_path(self, X, y, sample_weight=None):
+        """Compute the pruning path during Minimal Cost-Complexity Pruning.
+
+        See :ref:`minimal_cost_complexity_pruning` for details on the pruning
+        process.
+
+        Parameters
+        ----------
+        X : {array-like, sparse matrix} of shape (n_samples, n_features)
+            The training input samples. Internally, it will be converted to
+            ``dtype=np.float32`` and if a sparse matrix is provided
+            to a sparse ``csc_matrix``.
+
+        y : array-like of shape (n_samples,) or (n_samples, n_outputs)
+            The target values (class labels) as integers or strings.
+
+        sample_weight : array-like of shape (n_samples,), default=None
+            Sample weights. If None, then samples are equally weighted. Splits
+            that would create child nodes with net zero or negative weight are
+            ignored while searching for a split in each node. Splits are also
+            ignored if they would result in any single class carrying a
+            negative weight in either child node.
+
+        Returns
+        -------
+        ccp_path : :class:`~sklearn.utils.Bunch`
+            Dictionary-like object, with the following attributes.
+
+            ccp_alphas : ndarray
+                Effective alphas of subtree during pruning.
+
+            impurities : ndarray
+                Sum of the impurities of the subtree leaves for the
+                corresponding alpha value in ``ccp_alphas``.
+        """
+        est = clone(self).set_params(ccp_alpha=0.0)
+        est.fit(X, y, sample_weight=sample_weight)
+        return Bunch(**ccp_pruning_path(est.tree_))
+
+    @property
+    def feature_importances_(self):
+        """Return the feature importances.
+
+        The importance of a feature is computed as the (normalized) total
+        reduction of the criterion brought by that feature.
+        It is also known as the Gini importance.
+
+        Warning: impurity-based feature importances can be misleading for
+        high cardinality features (many unique values). See
+        :func:`sklearn.inspection.permutation_importance` as an alternative.
+
+        Returns
+        -------
+        feature_importances_ : ndarray of shape (n_features,)
+            Normalized total reduction of criteria by feature
+            (Gini importance).
+        """
+        check_is_fitted(self)
+
+        return self.tree_.compute_feature_importances()
+
+
+# =============================================================================
+# Public estimators
+# =============================================================================
+
+
+class DecisionTreeClassifier(ClassifierMixin, BaseDecisionTree):
+    """A decision tree classifier.
+
+    Read more in the :ref:`User Guide <tree>`.
 
     Parameters
     ----------
-    penalty : {'l1', 'l2'}, default='l2'
-        Specifies the norm used in the penalization. The 'l2'
-        penalty is the standard used in SVC. The 'l1' leads to ``coef_``
-        vectors that are sparse.
+    criterion : {"gini", "entropy"}, default="gini"
+        The function to measure the quality of a split. Supported criteria are
+        "gini" for the Gini impurity and "entropy" for the information gain.
 
-    loss : {'hinge', 'squared_hinge'}, default='squared_hinge'
-        Specifies the loss function. 'hinge' is the standard SVM loss
-        (used e.g. by the SVC class) while 'squared_hinge' is the
-        square of the hinge loss. The combination of ``penalty='l1'``
-        and ``loss='hinge'`` is not supported.
+    splitter : {"best", "random"}, default="best"
+        The strategy used to choose the split at each node. Supported
+        strategies are "best" to choose the best split and "random" to choose
+        the best random split.
 
-    dual : bool, default=True
-        Select the algorithm to either solve the dual or primal
-        optimization problem. Prefer dual=False when n_samples > n_features.
+    max_depth : int, default=None
+        The maximum depth of the tree. If None, then nodes are expanded until
+        all leaves are pure or until all leaves contain less than
+        min_samples_split samples.
 
-    tol : float, default=1e-4
-        Tolerance for stopping criteria.
+    min_samples_split : int or float, default=2
+        The minimum number of samples required to split an internal node:
 
-    C : float, default=1.0
-        Regularization parameter. The strength of the regularization is
-        inversely proportional to C. Must be strictly positive.
+        - If int, then consider `min_samples_split` as the minimum number.
+        - If float, then `min_samples_split` is a fraction and
+          `ceil(min_samples_split * n_samples)` are the minimum
+          number of samples for each split.
 
-    multi_class : {'ovr', 'crammer_singer'}, default='ovr'
-        Determines the multi-class strategy if `y` contains more than
-        two classes.
-        ``"ovr"`` trains n_classes one-vs-rest classifiers, while
-        ``"crammer_singer"`` optimizes a joint objective over all classes.
-        While `crammer_singer` is interesting from a theoretical perspective
-        as it is consistent, it is seldom used in practice as it rarely leads
-        to better accuracy and is more expensive to compute.
-        If ``"crammer_singer"`` is chosen, the options loss, penalty and dual
-        will be ignored.
+        .. versionchanged:: 0.18
+           Added float values for fractions.
 
-    fit_intercept : bool, default=True
-        Whether to calculate the intercept for this model. If set
-        to false, no intercept will be used in calculations
-        (i.e. data is expected to be already centered).
+    min_samples_leaf : int or float, default=1
+        The minimum number of samples required to be at a leaf node.
+        A split point at any depth will only be considered if it leaves at
+        least ``min_samples_leaf`` training samples in each of the left and
+        right branches.  This may have the effect of smoothing the model,
+        especially in regression.
 
-    intercept_scaling : float, default=1
-        When self.fit_intercept is True, instance vector x becomes
-        ``[x, self.intercept_scaling]``,
-        i.e. a "synthetic" feature with constant value equals to
-        intercept_scaling is appended to the instance vector.
-        The intercept becomes intercept_scaling * synthetic feature weight
-        Note! the synthetic feature weight is subject to l1/l2 regularization
-        as all other features.
-        To lessen the effect of regularization on synthetic feature weight
-        (and therefore on the intercept) intercept_scaling has to be increased.
+        - If int, then consider `min_samples_leaf` as the minimum number.
+        - If float, then `min_samples_leaf` is a fraction and
+          `ceil(min_samples_leaf * n_samples)` are the minimum
+          number of samples for each node.
 
-    class_weight : dict or 'balanced', default=None
-        Set the parameter C of class i to ``class_weight[i]*C`` for
-        SVC. If not given, all classes are supposed to have
-        weight one.
-        The "balanced" mode uses the values of y to automatically adjust
-        weights inversely proportional to class frequencies in the input data
-        as ``n_samples / (n_classes * np.bincount(y))``.
+        .. versionchanged:: 0.18
+           Added float values for fractions.
 
-    verbose : int, default=0
-        Enable verbose output. Note that this setting takes advantage of a
-        per-process runtime setting in liblinear that, if enabled, may not work
-        properly in a multithreaded context.
+    min_weight_fraction_leaf : float, default=0.0
+        The minimum weighted fraction of the sum total of weights (of all
+        the input samples) required to be at a leaf node. Samples have
+        equal weight when sample_weight is not provided.
+
+    max_features : int, float or {"auto", "sqrt", "log2"}, default=None
+        The number of features to consider when looking for the best split:
+
+            - If int, then consider `max_features` features at each split.
+            - If float, then `max_features` is a fraction and
+              `int(max_features * n_features)` features are considered at each
+              split.
+            - If "auto", then `max_features=sqrt(n_features)`.
+            - If "sqrt", then `max_features=sqrt(n_features)`.
+            - If "log2", then `max_features=log2(n_features)`.
+            - If None, then `max_features=n_features`.
+
+        Note: the search for a split does not stop until at least one
+        valid partition of the node samples is found, even if it requires to
+        effectively inspect more than ``max_features`` features.
 
     random_state : int, RandomState instance or None, default=None
-        Controls the pseudo random number generation for shuffling the data for
-        the dual coordinate descent (if ``dual=True``). When ``dual=False`` the
-        underlying implementation of :class:`LinearSVC` is not random and
-        ``random_state`` has no effect on the results.
-        Pass an int for reproducible output across multiple function calls.
-        See :term:`Glossary <random_state>`.
+        Controls the randomness of the estimator. The features are always
+        randomly permuted at each split, even if ``splitter`` is set to
+        ``"best"``. When ``max_features < n_features``, the algorithm will
+        select ``max_features`` at random at each split before finding the best
+        split among them. But the best found split may vary across different
+        runs, even if ``max_features=n_features``. That is the case, if the
+        improvement of the criterion is identical for several splits and one
+        split has to be selected at random. To obtain a deterministic behaviour
+        during fitting, ``random_state`` has to be fixed to an integer.
+        See :term:`Glossary <random_state>` for details.
 
-    max_iter : int, default=1000
-        The maximum number of iterations to be run.
+    max_leaf_nodes : int, default=None
+        Grow a tree with ``max_leaf_nodes`` in best-first fashion.
+        Best nodes are defined as relative reduction in impurity.
+        If None then unlimited number of leaf nodes.
+
+    min_impurity_decrease : float, default=0.0
+        A node will be split if this split induces a decrease of the impurity
+        greater than or equal to this value.
+
+        The weighted impurity decrease equation is the following::
+
+            N_t / N * (impurity - N_t_R / N_t * right_impurity
+                                - N_t_L / N_t * left_impurity)
+
+        where ``N`` is the total number of samples, ``N_t`` is the number of
+        samples at the current node, ``N_t_L`` is the number of samples in the
+        left child, and ``N_t_R`` is the number of samples in the right child.
+
+        ``N``, ``N_t``, ``N_t_R`` and ``N_t_L`` all refer to the weighted sum,
+        if ``sample_weight`` is passed.
+
+        .. versionadded:: 0.19
+
+    class_weight : dict, list of dict or "balanced", default=None
+        Weights associated with classes in the form ``{class_label: weight}``.
+        If None, all classes are supposed to have weight one. For
+        multi-output problems, a list of dicts can be provided in the same
+        order as the columns of y.
+
+        Note that for multioutput (including multilabel) weights should be
+        defined for each class of every column in its own dict. For example,
+        for four-class multilabel classification weights should be
+        [{0: 1, 1: 1}, {0: 1, 1: 5}, {0: 1, 1: 1}, {0: 1, 1: 1}] instead of
+        [{1:1}, {2:5}, {3:1}, {4:1}].
+
+        The "balanced" mode uses the values of y to automatically adjust
+        weights inversely proportional to class frequencies in the input data
+        as ``n_samples / (n_classes * np.bincount(y))``
+
+        For multi-output, the weights of each column of y will be multiplied.
+
+        Note that these weights will be multiplied with sample_weight (passed
+        through the fit method) if sample_weight is specified.
+
+    ccp_alpha : non-negative float, default=0.0
+        Complexity parameter used for Minimal Cost-Complexity Pruning. The
+        subtree with the largest cost complexity that is smaller than
+        ``ccp_alpha`` will be chosen. By default, no pruning is performed. See
+        :ref:`minimal_cost_complexity_pruning` for details.
+
+        .. versionadded:: 0.22
 
     Attributes
     ----------
-    coef_ : ndarray of shape (1, n_features) if n_classes == 2 \
-            else (n_classes, n_features)
-        Weights assigned to the features (coefficients in the primal
-        problem).
+    classes_ : ndarray of shape (n_classes,) or list of ndarray
+        The classes labels (single output problem),
+        or a list of arrays of class labels (multi-output problem).
 
-        ``coef_`` is a readonly property derived from ``raw_coef_`` that
-        follows the internal memory layout of liblinear.
+    feature_importances_ : ndarray of shape (n_features,)
+        The impurity-based feature importances.
+        The higher, the more important the feature.
+        The importance of a feature is computed as the (normalized)
+        total reduction of the criterion brought by that feature.  It is also
+        known as the Gini importance [4]_.
 
-    intercept_ : ndarray of shape (1,) if n_classes == 2 else (n_classes,)
-        Constants in decision function.
+        Warning: impurity-based feature importances can be misleading for
+        high cardinality features (many unique values). See
+        :func:`sklearn.inspection.permutation_importance` as an alternative.
 
-    classes_ : ndarray of shape (n_classes,)
-        The unique classes labels.
+    max_features_ : int
+        The inferred value of max_features.
+
+    n_classes_ : int or list of int
+        The number of classes (for single output problems),
+        or a list containing the number of classes for each
+        output (for multi-output problems).
+
+    n_features_ : int
+        The number of features when ``fit`` is performed.
+
+        .. deprecated:: 1.0
+           `n_features_` is deprecated in 1.0 and will be removed in
+           1.2. Use `n_features_in_` instead.
 
     n_features_in_ : int
         Number of features seen during :term:`fit`.
@@ -123,252 +811,380 @@ class LinearSVC(LinearClassifierMixin, SparseCoefMixin, BaseEstimator):
 
         .. versionadded:: 1.0
 
-    n_iter_ : int
-        Maximum number of iterations run across all classes.
+    n_outputs_ : int
+        The number of outputs when ``fit`` is performed.
+
+    tree_ : Tree instance
+        The underlying Tree object. Please refer to
+        ``help(sklearn.tree._tree.Tree)`` for attributes of Tree object and
+        :ref:`sphx_glr_auto_examples_tree_plot_unveil_tree_structure.py`
+        for basic usage of these attributes.
 
     See Also
     --------
-    SVC : Implementation of Support Vector Machine classifier using libsvm:
-        the kernel can be non-linear but its SMO algorithm does not
-        scale to large number of samples as LinearSVC does.
-
-        Furthermore SVC multi-class mode is implemented using one
-        vs one scheme while LinearSVC uses one vs the rest. It is
-        possible to implement one vs the rest with SVC by using the
-        :class:`~sklearn.multiclass.OneVsRestClassifier` wrapper.
-
-        Finally SVC can fit dense data without memory copy if the input
-        is C-contiguous. Sparse data will still incur memory copy though.
-
-    sklearn.linear_model.SGDClassifier : SGDClassifier can optimize the same
-        cost function as LinearSVC
-        by adjusting the penalty and loss parameters. In addition it requires
-        less memory, allows incremental (online) learning, and implements
-        various loss functions and regularization regimes.
+    DecisionTreeRegressor : A decision tree regressor.
 
     Notes
     -----
-    The underlying C implementation uses a random number generator to
-    select features when fitting the model. It is thus not uncommon
-    to have slightly different results for the same input data. If
-    that happens, try with a smaller ``tol`` parameter.
+    The default values for the parameters controlling the size of the trees
+    (e.g. ``max_depth``, ``min_samples_leaf``, etc.) lead to fully grown and
+    unpruned trees which can potentially be very large on some data sets. To
+    reduce memory consumption, the complexity and size of the trees should be
+    controlled by setting those parameter values.
 
-    The underlying implementation, liblinear, uses a sparse internal
-    representation for the data that will incur a memory copy.
-
-    Predict output may not match that of standalone liblinear in certain
-    cases. See :ref:`differences from liblinear <liblinear_differences>`
-    in the narrative documentation.
+    The :meth:`predict` method operates using the :func:`numpy.argmax`
+    function on the outputs of :meth:`predict_proba`. This means that in
+    case the highest predicted probabilities are tied, the classifier will
+    predict the tied class with the lowest index in :term:`classes_`.
 
     References
     ----------
-    `LIBLINEAR: A Library for Large Linear Classification
-    <https://www.csie.ntu.edu.tw/~cjlin/liblinear/>`__
+
+    .. [1] https://en.wikipedia.org/wiki/Decision_tree_learning
+
+    .. [2] L. Breiman, J. Friedman, R. Olshen, and C. Stone, "Classification
+           and Regression Trees", Wadsworth, Belmont, CA, 1984.
+
+    .. [3] T. Hastie, R. Tibshirani and J. Friedman. "Elements of Statistical
+           Learning", Springer, 2009.
+
+    .. [4] L. Breiman, and A. Cutler, "Random Forests",
+           https://www.stat.berkeley.edu/~breiman/RandomForests/cc_home.htm
 
     Examples
     --------
-    >>> from sklearn.svm import LinearSVC
-    >>> from sklearn.pipeline import make_pipeline
-    >>> from sklearn.preprocessing import StandardScaler
-    >>> from sklearn.datasets import make_classification
-    >>> X, y = make_classification(n_features=4, random_state=0)
-    >>> clf = make_pipeline(StandardScaler(),
-    ...                     LinearSVC(random_state=0, tol=1e-5))
-    >>> clf.fit(X, y)
-    Pipeline(steps=[('standardscaler', StandardScaler()),
-                    ('linearsvc', LinearSVC(random_state=0, tol=1e-05))])
-
-    >>> print(clf.named_steps['linearsvc'].coef_)
-    [[0.141...   0.526... 0.679... 0.493...]]
-
-    >>> print(clf.named_steps['linearsvc'].intercept_)
-    [0.1693...]
-    >>> print(clf.predict([[0, 0, 0, 0]]))
-    [1]
+    >>> from sklearn.datasets import load_iris
+    >>> from sklearn.model_selection import cross_val_score
+    >>> from sklearn.tree import DecisionTreeClassifier
+    >>> clf = DecisionTreeClassifier(random_state=0)
+    >>> iris = load_iris()
+    >>> cross_val_score(clf, iris.data, iris.target, cv=10)
+    ...                             # doctest: +SKIP
+    ...
+    array([ 1.     ,  0.93...,  0.86...,  0.93...,  0.93...,
+            0.93...,  0.93...,  1.     ,  0.93...,  1.      ])
     """
 
     def __init__(
         self,
-        penalty="l2",
-        loss="squared_hinge",
         *,
-        dual=True,
-        tol=1e-4,
-        C=1.0,
-        multi_class="ovr",
-        fit_intercept=True,
-        intercept_scaling=1,
-        class_weight=None,
-        verbose=0,
+        criterion="gini",
+        splitter="best",
+        max_depth=None,
+        min_samples_split=2,
+        min_samples_leaf=1,
+        min_weight_fraction_leaf=0.0,
+        max_features=None,
         random_state=None,
-        max_iter=1000,
+        max_leaf_nodes=None,
+        min_impurity_decrease=0.0,
+        class_weight=None,
+        ccp_alpha=0.0,
     ):
-        self.dual = dual
-        self.tol = tol
-        self.C = C
-        self.multi_class = multi_class
-        self.fit_intercept = fit_intercept
-        self.intercept_scaling = intercept_scaling
-        self.class_weight = class_weight
-        self.verbose = verbose
-        self.random_state = random_state
-        self.max_iter = max_iter
-        self.penalty = penalty
-        self.loss = loss
+        super().__init__(
+            criterion=criterion,
+            splitter=splitter,
+            max_depth=max_depth,
+            min_samples_split=min_samples_split,
+            min_samples_leaf=min_samples_leaf,
+            min_weight_fraction_leaf=min_weight_fraction_leaf,
+            max_features=max_features,
+            max_leaf_nodes=max_leaf_nodes,
+            class_weight=class_weight,
+            random_state=random_state,
+            min_impurity_decrease=min_impurity_decrease,
+            ccp_alpha=ccp_alpha,
+        )
 
-    def fit(self, X, y, sample_weight=None):
-        """Fit the model according to the given training data.
+    def fit(
+        self, X, y, sample_weight=None, check_input=True, X_idx_sorted="deprecated"
+    ):
+        """Build a decision tree classifier from the training set (X, y).
 
         Parameters
         ----------
         X : {array-like, sparse matrix} of shape (n_samples, n_features)
-            Training vector, where `n_samples` is the number of samples and
-            `n_features` is the number of features.
+            The training input samples. Internally, it will be converted to
+            ``dtype=np.float32`` and if a sparse matrix is provided
+            to a sparse ``csc_matrix``.
 
-        y : array-like of shape (n_samples,)
-            Target vector relative to X.
+        y : array-like of shape (n_samples,) or (n_samples, n_outputs)
+            The target values (class labels) as integers or strings.
 
         sample_weight : array-like of shape (n_samples,), default=None
-            Array of weights that are assigned to individual
-            samples. If not provided,
-            then each sample is given unit weight.
+            Sample weights. If None, then samples are equally weighted. Splits
+            that would create child nodes with net zero or negative weight are
+            ignored while searching for a split in each node. Splits are also
+            ignored if they would result in any single class carrying a
+            negative weight in either child node.
 
-            .. versionadded:: 0.18
+        check_input : bool, default=True
+            Allow to bypass several input checking.
+            Don't use this parameter unless you know what you do.
+
+        X_idx_sorted : deprecated, default="deprecated"
+            This parameter is deprecated and has no effect.
+            It will be removed in 1.1 (renaming of 0.26).
+
+            .. deprecated:: 0.24
 
         Returns
         -------
-        self : object
-            An instance of the estimator.
+        self : DecisionTreeClassifier
+            Fitted estimator.
         """
-        if self.C < 0:
-            raise ValueError("Penalty term must be positive; got (C=%r)" % self.C)
 
-        X, y = self._validate_data(
+        super().fit(
             X,
             y,
-            accept_sparse="csr",
-            dtype=np.float64,
-            order="C",
-            accept_large_sparse=False,
-        )
-        check_classification_targets(y)
-        self.classes_ = np.unique(y)
-
-        self.coef_, self.intercept_, self.n_iter_ = _fit_liblinear(
-            X,
-            y,
-            self.C,
-            self.fit_intercept,
-            self.intercept_scaling,
-            self.class_weight,
-            self.penalty,
-            self.dual,
-            self.verbose,
-            self.max_iter,
-            self.tol,
-            self.random_state,
-            self.multi_class,
-            self.loss,
             sample_weight=sample_weight,
+            check_input=check_input,
+            X_idx_sorted=X_idx_sorted,
         )
-
-        if self.multi_class == "crammer_singer" and len(self.classes_) == 2:
-            self.coef_ = (self.coef_[1] - self.coef_[0]).reshape(1, -1)
-            if self.fit_intercept:
-                intercept = self.intercept_[1] - self.intercept_[0]
-                self.intercept_ = np.array([intercept])
-
         return self
 
+    def predict_proba(self, X, check_input=True):
+        """Predict class probabilities of the input samples X.
+
+        The predicted class probability is the fraction of samples of the same
+        class in a leaf.
+
+        Parameters
+        ----------
+        X : {array-like, sparse matrix} of shape (n_samples, n_features)
+            The input samples. Internally, it will be converted to
+            ``dtype=np.float32`` and if a sparse matrix is provided
+            to a sparse ``csr_matrix``.
+
+        check_input : bool, default=True
+            Allow to bypass several input checking.
+            Don't use this parameter unless you know what you do.
+
+        Returns
+        -------
+        proba : ndarray of shape (n_samples, n_classes) or list of n_outputs \
+            such arrays if n_outputs > 1
+            The class probabilities of the input samples. The order of the
+            classes corresponds to that in the attribute :term:`classes_`.
+        """
+        check_is_fitted(self)
+        X = self._validate_X_predict(X, check_input)
+        proba = self.tree_.predict(X)
+
+        if self.n_outputs_ == 1:
+            proba = proba[:, : self.n_classes_]
+            normalizer = proba.sum(axis=1)[:, np.newaxis]
+            normalizer[normalizer == 0.0] = 1.0
+            proba /= normalizer
+
+            return proba
+
+        else:
+            all_proba = []
+
+            for k in range(self.n_outputs_):
+                proba_k = proba[:, k, : self.n_classes_[k]]
+                normalizer = proba_k.sum(axis=1)[:, np.newaxis]
+                normalizer[normalizer == 0.0] = 1.0
+                proba_k /= normalizer
+                all_proba.append(proba_k)
+
+            return all_proba
+
+    def predict_log_proba(self, X):
+        """Predict class log-probabilities of the input samples X.
+
+        Parameters
+        ----------
+        X : {array-like, sparse matrix} of shape (n_samples, n_features)
+            The input samples. Internally, it will be converted to
+            ``dtype=np.float32`` and if a sparse matrix is provided
+            to a sparse ``csr_matrix``.
+
+        Returns
+        -------
+        proba : ndarray of shape (n_samples, n_classes) or list of n_outputs \
+            such arrays if n_outputs > 1
+            The class log-probabilities of the input samples. The order of the
+            classes corresponds to that in the attribute :term:`classes_`.
+        """
+        proba = self.predict_proba(X)
+
+        if self.n_outputs_ == 1:
+            return np.log(proba)
+
+        else:
+            for k in range(self.n_outputs_):
+                proba[k] = np.log(proba[k])
+
+            return proba
+
+    @deprecated(  # type: ignore
+        "The attribute `n_features_` is deprecated in 1.0 and will be removed "
+        "in 1.2. Use `n_features_in_` instead."
+    )
+    @property
+    def n_features_(self):
+        return self.n_features_in_
+
     def _more_tags(self):
-        return {
-            "_xfail_checks": {
-                "check_sample_weights_invariance": (
-                    "zero sample_weight is not equivalent to removing samples"
-                ),
-            }
-        }
+        return {"multilabel": True}
 
 
-class LinearSVR(RegressorMixin, LinearModel):
-    """Linear Support Vector Regression.
+class DecisionTreeRegressor(RegressorMixin, BaseDecisionTree):
+    """A decision tree regressor.
 
-    Similar to SVR with parameter kernel='linear', but implemented in terms of
-    liblinear rather than libsvm, so it has more flexibility in the choice of
-    penalties and loss functions and should scale better to large numbers of
-    samples.
-
-    This class supports both dense and sparse input.
-
-    Read more in the :ref:`User Guide <svm_regression>`.
-
-    .. versionadded:: 0.16
+    Read more in the :ref:`User Guide <tree>`.
 
     Parameters
     ----------
-    epsilon : float, default=0.0
-        Epsilon parameter in the epsilon-insensitive loss function. Note
-        that the value of this parameter depends on the scale of the target
-        variable y. If unsure, set ``epsilon=0``.
+    criterion : {"squared_error", "friedman_mse", "absolute_error", \
+            "poisson"}, default="squared_error"
+        The function to measure the quality of a split. Supported criteria
+        are "squared_error" for the mean squared error, which is equal to
+        variance reduction as feature selection criterion and minimizes the L2
+        loss using the mean of each terminal node, "friedman_mse", which uses
+        mean squared error with Friedman's improvement score for potential
+        splits, "absolute_error" for the mean absolute error, which minimizes
+        the L1 loss using the median of each terminal node, and "poisson" which
+        uses reduction in Poisson deviance to find splits.
 
-    tol : float, default=1e-4
-        Tolerance for stopping criteria.
+        .. versionadded:: 0.18
+           Mean Absolute Error (MAE) criterion.
 
-    C : float, default=1.0
-        Regularization parameter. The strength of the regularization is
-        inversely proportional to C. Must be strictly positive.
+        .. versionadded:: 0.24
+            Poisson deviance criterion.
 
-    loss : {'epsilon_insensitive', 'squared_epsilon_insensitive'}, \
-            default='epsilon_insensitive'
-        Specifies the loss function. The epsilon-insensitive loss
-        (standard SVR) is the L1 loss, while the squared epsilon-insensitive
-        loss ('squared_epsilon_insensitive') is the L2 loss.
+        .. deprecated:: 1.0
+            Criterion "mse" was deprecated in v1.0 and will be removed in
+            version 1.2. Use `criterion="squared_error"` which is equivalent.
 
-    fit_intercept : bool, default=True
-        Whether to calculate the intercept for this model. If set
-        to false, no intercept will be used in calculations
-        (i.e. data is expected to be already centered).
+        .. deprecated:: 1.0
+            Criterion "mae" was deprecated in v1.0 and will be removed in
+            version 1.2. Use `criterion="absolute_error"` which is equivalent.
 
-    intercept_scaling : float, default=1.0
-        When self.fit_intercept is True, instance vector x becomes
-        [x, self.intercept_scaling],
-        i.e. a "synthetic" feature with constant value equals to
-        intercept_scaling is appended to the instance vector.
-        The intercept becomes intercept_scaling * synthetic feature weight
-        Note! the synthetic feature weight is subject to l1/l2 regularization
-        as all other features.
-        To lessen the effect of regularization on synthetic feature weight
-        (and therefore on the intercept) intercept_scaling has to be increased.
+    splitter : {"best", "random"}, default="best"
+        The strategy used to choose the split at each node. Supported
+        strategies are "best" to choose the best split and "random" to choose
+        the best random split.
 
-    dual : bool, default=True
-        Select the algorithm to either solve the dual or primal
-        optimization problem. Prefer dual=False when n_samples > n_features.
+    max_depth : int, default=None
+        The maximum depth of the tree. If None, then nodes are expanded until
+        all leaves are pure or until all leaves contain less than
+        min_samples_split samples.
 
-    verbose : int, default=0
-        Enable verbose output. Note that this setting takes advantage of a
-        per-process runtime setting in liblinear that, if enabled, may not work
-        properly in a multithreaded context.
+    min_samples_split : int or float, default=2
+        The minimum number of samples required to split an internal node:
+
+        - If int, then consider `min_samples_split` as the minimum number.
+        - If float, then `min_samples_split` is a fraction and
+          `ceil(min_samples_split * n_samples)` are the minimum
+          number of samples for each split.
+
+        .. versionchanged:: 0.18
+           Added float values for fractions.
+
+    min_samples_leaf : int or float, default=1
+        The minimum number of samples required to be at a leaf node.
+        A split point at any depth will only be considered if it leaves at
+        least ``min_samples_leaf`` training samples in each of the left and
+        right branches.  This may have the effect of smoothing the model,
+        especially in regression.
+
+        - If int, then consider `min_samples_leaf` as the minimum number.
+        - If float, then `min_samples_leaf` is a fraction and
+          `ceil(min_samples_leaf * n_samples)` are the minimum
+          number of samples for each node.
+
+        .. versionchanged:: 0.18
+           Added float values for fractions.
+
+    min_weight_fraction_leaf : float, default=0.0
+        The minimum weighted fraction of the sum total of weights (of all
+        the input samples) required to be at a leaf node. Samples have
+        equal weight when sample_weight is not provided.
+
+    max_features : int, float or {"auto", "sqrt", "log2"}, default=None
+        The number of features to consider when looking for the best split:
+
+        - If int, then consider `max_features` features at each split.
+        - If float, then `max_features` is a fraction and
+          `int(max_features * n_features)` features are considered at each
+          split.
+        - If "auto", then `max_features=n_features`.
+        - If "sqrt", then `max_features=sqrt(n_features)`.
+        - If "log2", then `max_features=log2(n_features)`.
+        - If None, then `max_features=n_features`.
+
+        Note: the search for a split does not stop until at least one
+        valid partition of the node samples is found, even if it requires to
+        effectively inspect more than ``max_features`` features.
 
     random_state : int, RandomState instance or None, default=None
-        Controls the pseudo random number generation for shuffling the data.
-        Pass an int for reproducible output across multiple function calls.
-        See :term:`Glossary <random_state>`.
+        Controls the randomness of the estimator. The features are always
+        randomly permuted at each split, even if ``splitter`` is set to
+        ``"best"``. When ``max_features < n_features``, the algorithm will
+        select ``max_features`` at random at each split before finding the best
+        split among them. But the best found split may vary across different
+        runs, even if ``max_features=n_features``. That is the case, if the
+        improvement of the criterion is identical for several splits and one
+        split has to be selected at random. To obtain a deterministic behaviour
+        during fitting, ``random_state`` has to be fixed to an integer.
+        See :term:`Glossary <random_state>` for details.
 
-    max_iter : int, default=1000
-        The maximum number of iterations to be run.
+    max_leaf_nodes : int, default=None
+        Grow a tree with ``max_leaf_nodes`` in best-first fashion.
+        Best nodes are defined as relative reduction in impurity.
+        If None then unlimited number of leaf nodes.
+
+    min_impurity_decrease : float, default=0.0
+        A node will be split if this split induces a decrease of the impurity
+        greater than or equal to this value.
+
+        The weighted impurity decrease equation is the following::
+
+            N_t / N * (impurity - N_t_R / N_t * right_impurity
+                                - N_t_L / N_t * left_impurity)
+
+        where ``N`` is the total number of samples, ``N_t`` is the number of
+        samples at the current node, ``N_t_L`` is the number of samples in the
+        left child, and ``N_t_R`` is the number of samples in the right child.
+
+        ``N``, ``N_t``, ``N_t_R`` and ``N_t_L`` all refer to the weighted sum,
+        if ``sample_weight`` is passed.
+
+        .. versionadded:: 0.19
+
+    ccp_alpha : non-negative float, default=0.0
+        Complexity parameter used for Minimal Cost-Complexity Pruning. The
+        subtree with the largest cost complexity that is smaller than
+        ``ccp_alpha`` will be chosen. By default, no pruning is performed. See
+        :ref:`minimal_cost_complexity_pruning` for details.
+
+        .. versionadded:: 0.22
 
     Attributes
     ----------
-    coef_ : ndarray of shape (n_features) if n_classes == 2 \
-            else (n_classes, n_features)
-        Weights assigned to the features (coefficients in the primal
-        problem).
+    feature_importances_ : ndarray of shape (n_features,)
+        The feature importances.
+        The higher, the more important the feature.
+        The importance of a feature is computed as the
+        (normalized) total reduction of the criterion brought
+        by that feature. It is also known as the Gini importance [4]_.
 
-        `coef_` is a readonly property derived from `raw_coef_` that
-        follows the internal memory layout of liblinear.
+        Warning: impurity-based feature importances can be misleading for
+        high cardinality features (many unique values). See
+        :func:`sklearn.inspection.permutation_importance` as an alternative.
 
-    intercept_ : ndarray of shape (1) if n_classes == 2 else (n_classes)
-        Constants in decision function.
+    max_features_ : int
+        The inferred value of max_features.
+
+    n_features_ : int
+        The number of features when ``fit`` is performed.
+
+        .. deprecated:: 1.0
+           `n_features_` is deprecated in 1.0 and will be removed in
+           1.2. Use `n_features_in_` instead.
 
     n_features_in_ : int
         Number of features seen during :term:`fit`.
@@ -381,282 +1197,330 @@ class LinearSVR(RegressorMixin, LinearModel):
 
         .. versionadded:: 1.0
 
-    n_iter_ : int
-        Maximum number of iterations run across all classes.
+    n_outputs_ : int
+        The number of outputs when ``fit`` is performed.
+
+    tree_ : Tree instance
+        The underlying Tree object. Please refer to
+        ``help(sklearn.tree._tree.Tree)`` for attributes of Tree object and
+        :ref:`sphx_glr_auto_examples_tree_plot_unveil_tree_structure.py`
+        for basic usage of these attributes.
 
     See Also
     --------
-    LinearSVC : Implementation of Support Vector Machine classifier using the
-        same library as this class (liblinear).
+    DecisionTreeClassifier : A decision tree classifier.
 
-    SVR : Implementation of Support Vector Machine regression using libsvm:
-        the kernel can be non-linear but its SMO algorithm does not
-        scale to large number of samples as LinearSVC does.
+    Notes
+    -----
+    The default values for the parameters controlling the size of the trees
+    (e.g. ``max_depth``, ``min_samples_leaf``, etc.) lead to fully grown and
+    unpruned trees which can potentially be very large on some data sets. To
+    reduce memory consumption, the complexity and size of the trees should be
+    controlled by setting those parameter values.
 
-    sklearn.linear_model.SGDRegressor : SGDRegressor can optimize the same cost
-        function as LinearSVR
-        by adjusting the penalty and loss parameters. In addition it requires
-        less memory, allows incremental (online) learning, and implements
-        various loss functions and regularization regimes.
+    References
+    ----------
+
+    .. [1] https://en.wikipedia.org/wiki/Decision_tree_learning
+
+    .. [2] L. Breiman, J. Friedman, R. Olshen, and C. Stone, "Classification
+           and Regression Trees", Wadsworth, Belmont, CA, 1984.
+
+    .. [3] T. Hastie, R. Tibshirani and J. Friedman. "Elements of Statistical
+           Learning", Springer, 2009.
+
+    .. [4] L. Breiman, and A. Cutler, "Random Forests",
+           https://www.stat.berkeley.edu/~breiman/RandomForests/cc_home.htm
 
     Examples
     --------
-    >>> from sklearn.svm import LinearSVR
-    >>> from sklearn.pipeline import make_pipeline
-    >>> from sklearn.preprocessing import StandardScaler
-    >>> from sklearn.datasets import make_regression
-    >>> X, y = make_regression(n_features=4, random_state=0)
-    >>> regr = make_pipeline(StandardScaler(),
-    ...                      LinearSVR(random_state=0, tol=1e-5))
-    >>> regr.fit(X, y)
-    Pipeline(steps=[('standardscaler', StandardScaler()),
-                    ('linearsvr', LinearSVR(random_state=0, tol=1e-05))])
-
-    >>> print(regr.named_steps['linearsvr'].coef_)
-    [18.582... 27.023... 44.357... 64.522...]
-    >>> print(regr.named_steps['linearsvr'].intercept_)
-    [-4...]
-    >>> print(regr.predict([[0, 0, 0, 0]]))
-    [-2.384...]
+    >>> from sklearn.datasets import load_diabetes
+    >>> from sklearn.model_selection import cross_val_score
+    >>> from sklearn.tree import DecisionTreeRegressor
+    >>> X, y = load_diabetes(return_X_y=True)
+    >>> regressor = DecisionTreeRegressor(random_state=0)
+    >>> cross_val_score(regressor, X, y, cv=10)
+    ...                    # doctest: +SKIP
+    ...
+    array([-0.39..., -0.46...,  0.02...,  0.06..., -0.50...,
+           0.16...,  0.11..., -0.73..., -0.30..., -0.00...])
     """
 
     def __init__(
         self,
         *,
-        epsilon=0.0,
-        tol=1e-4,
-        C=1.0,
-        loss="epsilon_insensitive",
-        fit_intercept=True,
-        intercept_scaling=1.0,
-        dual=True,
-        verbose=0,
+        criterion="squared_error",
+        splitter="best",
+        max_depth=None,
+        min_samples_split=2,
+        min_samples_leaf=1,
+        min_weight_fraction_leaf=0.0,
+        max_features=None,
         random_state=None,
-        max_iter=1000,
+        max_leaf_nodes=None,
+        min_impurity_decrease=0.0,
+        ccp_alpha=0.0,
     ):
-        self.tol = tol
-        self.C = C
-        self.epsilon = epsilon
-        self.fit_intercept = fit_intercept
-        self.intercept_scaling = intercept_scaling
-        self.verbose = verbose
-        self.random_state = random_state
-        self.max_iter = max_iter
-        self.dual = dual
-        self.loss = loss
+        super().__init__(
+            criterion=criterion,
+            splitter=splitter,
+            max_depth=max_depth,
+            min_samples_split=min_samples_split,
+            min_samples_leaf=min_samples_leaf,
+            min_weight_fraction_leaf=min_weight_fraction_leaf,
+            max_features=max_features,
+            max_leaf_nodes=max_leaf_nodes,
+            random_state=random_state,
+            min_impurity_decrease=min_impurity_decrease,
+            ccp_alpha=ccp_alpha,
+        )
 
-    def fit(self, X, y, sample_weight=None):
-        """Fit the model according to the given training data.
+    def fit(
+        self, X, y, sample_weight=None, check_input=True, X_idx_sorted="deprecated"
+    ):
+        """Build a decision tree regressor from the training set (X, y).
 
         Parameters
         ----------
         X : {array-like, sparse matrix} of shape (n_samples, n_features)
-            Training vector, where `n_samples` is the number of samples and
-            `n_features` is the number of features.
+            The training input samples. Internally, it will be converted to
+            ``dtype=np.float32`` and if a sparse matrix is provided
+            to a sparse ``csc_matrix``.
 
-        y : array-like of shape (n_samples,)
-            Target vector relative to X.
+        y : array-like of shape (n_samples,) or (n_samples, n_outputs)
+            The target values (real numbers). Use ``dtype=np.float64`` and
+            ``order='C'`` for maximum efficiency.
 
         sample_weight : array-like of shape (n_samples,), default=None
-            Array of weights that are assigned to individual
-            samples. If not provided,
-            then each sample is given unit weight.
+            Sample weights. If None, then samples are equally weighted. Splits
+            that would create child nodes with net zero or negative weight are
+            ignored while searching for a split in each node.
 
-            .. versionadded:: 0.18
+        check_input : bool, default=True
+            Allow to bypass several input checking.
+            Don't use this parameter unless you know what you do.
+
+        X_idx_sorted : deprecated, default="deprecated"
+            This parameter is deprecated and has no effect.
+            It will be removed in 1.1 (renaming of 0.26).
+
+            .. deprecated:: 0.24
 
         Returns
         -------
-        self : object
-            An instance of the estimator.
+        self : DecisionTreeRegressor
+            Fitted estimator.
         """
-        if self.C < 0:
-            raise ValueError("Penalty term must be positive; got (C=%r)" % self.C)
 
-        X, y = self._validate_data(
+        super().fit(
             X,
             y,
-            accept_sparse="csr",
-            dtype=np.float64,
-            order="C",
-            accept_large_sparse=False,
-        )
-        penalty = "l2"  # SVR only accepts l2 penalty
-        self.coef_, self.intercept_, self.n_iter_ = _fit_liblinear(
-            X,
-            y,
-            self.C,
-            self.fit_intercept,
-            self.intercept_scaling,
-            None,
-            penalty,
-            self.dual,
-            self.verbose,
-            self.max_iter,
-            self.tol,
-            self.random_state,
-            loss=self.loss,
-            epsilon=self.epsilon,
             sample_weight=sample_weight,
+            check_input=check_input,
+            X_idx_sorted=X_idx_sorted,
         )
-        self.coef_ = self.coef_.ravel()
-
         return self
 
-    def _more_tags(self):
-        return {
-            "_xfail_checks": {
-                "check_sample_weights_invariance": (
-                    "zero sample_weight is not equivalent to removing samples"
-                ),
-            }
-        }
+    def _compute_partial_dependence_recursion(self, grid, target_features):
+        """Fast partial dependence computation.
+
+        Parameters
+        ----------
+        grid : ndarray of shape (n_samples, n_target_features)
+            The grid points on which the partial dependence should be
+            evaluated.
+        target_features : ndarray of shape (n_target_features)
+            The set of target features for which the partial dependence
+            should be evaluated.
+
+        Returns
+        -------
+        averaged_predictions : ndarray of shape (n_samples,)
+            The value of the partial dependence function on each grid point.
+        """
+        grid = np.asarray(grid, dtype=DTYPE, order="C")
+        averaged_predictions = np.zeros(
+            shape=grid.shape[0], dtype=np.float64, order="C"
+        )
+
+        self.tree_.compute_partial_dependence(
+            grid, target_features, averaged_predictions
+        )
+        return averaged_predictions
+
+    @deprecated(  # type: ignore
+        "The attribute `n_features_` is deprecated in 1.0 and will be removed "
+        "in 1.2. Use `n_features_in_` instead."
+    )
+    @property
+    def n_features_(self):
+        return self.n_features_in_
 
 
-class SVC(BaseSVC):
-    """C-Support Vector Classification.
+class ExtraTreeClassifier(DecisionTreeClassifier):
+    """An extremely randomized tree classifier.
 
-    The implementation is based on libsvm. The fit time scales at least
-    quadratically with the number of samples and may be impractical
-    beyond tens of thousands of samples. For large datasets
-    consider using :class:`~sklearn.svm.LinearSVC` or
-    :class:`~sklearn.linear_model.SGDClassifier` instead, possibly after a
-    :class:`~sklearn.kernel_approximation.Nystroem` transformer.
+    Extra-trees differ from classic decision trees in the way they are built.
+    When looking for the best split to separate the samples of a node into two
+    groups, random splits are drawn for each of the `max_features` randomly
+    selected features and the best split among those is chosen. When
+    `max_features` is set 1, this amounts to building a totally random
+    decision tree.
 
-    The multiclass support is handled according to a one-vs-one scheme.
+    Warning: Extra-trees should only be used within ensemble methods.
 
-    For details on the precise mathematical formulation of the provided
-    kernel functions and how `gamma`, `coef0` and `degree` affect each
-    other, see the corresponding section in the narrative documentation:
-    :ref:`svm_kernels`.
-
-    Read more in the :ref:`User Guide <svm_classification>`.
+    Read more in the :ref:`User Guide <tree>`.
 
     Parameters
     ----------
-    C : float, default=1.0
-        Regularization parameter. The strength of the regularization is
-        inversely proportional to C. Must be strictly positive. The penalty
-        is a squared l2 penalty.
+    criterion : {"gini", "entropy"}, default="gini"
+        The function to measure the quality of a split. Supported criteria are
+        "gini" for the Gini impurity and "entropy" for the information gain.
 
-    kernel : {'linear', 'poly', 'rbf', 'sigmoid', 'precomputed'} or callable,  \
-        default='rbf'
-        Specifies the kernel type to be used in the algorithm.
-        If none is given, 'rbf' will be used. If a callable is given it is
-        used to pre-compute the kernel matrix from data matrices; that matrix
-        should be an array of shape ``(n_samples, n_samples)``.
+    splitter : {"random", "best"}, default="random"
+        The strategy used to choose the split at each node. Supported
+        strategies are "best" to choose the best split and "random" to choose
+        the best random split.
 
-    degree : int, default=3
-        Degree of the polynomial kernel function ('poly').
-        Ignored by all other kernels.
+    max_depth : int, default=None
+        The maximum depth of the tree. If None, then nodes are expanded until
+        all leaves are pure or until all leaves contain less than
+        min_samples_split samples.
 
-    gamma : {'scale', 'auto'} or float, default='scale'
-        Kernel coefficient for 'rbf', 'poly' and 'sigmoid'.
+    min_samples_split : int or float, default=2
+        The minimum number of samples required to split an internal node:
 
-        - if ``gamma='scale'`` (default) is passed then it uses
-          1 / (n_features * X.var()) as value of gamma,
-        - if 'auto', uses 1 / n_features.
+        - If int, then consider `min_samples_split` as the minimum number.
+        - If float, then `min_samples_split` is a fraction and
+          `ceil(min_samples_split * n_samples)` are the minimum
+          number of samples for each split.
 
-        .. versionchanged:: 0.22
-           The default value of ``gamma`` changed from 'auto' to 'scale'.
+        .. versionchanged:: 0.18
+           Added float values for fractions.
 
-    coef0 : float, default=0.0
-        Independent term in kernel function.
-        It is only significant in 'poly' and 'sigmoid'.
+    min_samples_leaf : int or float, default=1
+        The minimum number of samples required to be at a leaf node.
+        A split point at any depth will only be considered if it leaves at
+        least ``min_samples_leaf`` training samples in each of the left and
+        right branches.  This may have the effect of smoothing the model,
+        especially in regression.
 
-    shrinking : bool, default=True
-        Whether to use the shrinking heuristic.
-        See the :ref:`User Guide <shrinking_svm>`.
+        - If int, then consider `min_samples_leaf` as the minimum number.
+        - If float, then `min_samples_leaf` is a fraction and
+          `ceil(min_samples_leaf * n_samples)` are the minimum
+          number of samples for each node.
 
-    probability : bool, default=False
-        Whether to enable probability estimates. This must be enabled prior
-        to calling `fit`, will slow down that method as it internally uses
-        5-fold cross-validation, and `predict_proba` may be inconsistent with
-        `predict`. Read more in the :ref:`User Guide <scores_probabilities>`.
+        .. versionchanged:: 0.18
+           Added float values for fractions.
 
-    tol : float, default=1e-3
-        Tolerance for stopping criterion.
+    min_weight_fraction_leaf : float, default=0.0
+        The minimum weighted fraction of the sum total of weights (of all
+        the input samples) required to be at a leaf node. Samples have
+        equal weight when sample_weight is not provided.
 
-    cache_size : float, default=200
-        Specify the size of the kernel cache (in MB).
+    max_features : int, float, {"auto", "sqrt", "log2"} or None, default="auto"
+        The number of features to consider when looking for the best split:
 
-    class_weight : dict or 'balanced', default=None
-        Set the parameter C of class i to class_weight[i]*C for
-        SVC. If not given, all classes are supposed to have
-        weight one.
+            - If int, then consider `max_features` features at each split.
+            - If float, then `max_features` is a fraction and
+              `int(max_features * n_features)` features are considered at each
+              split.
+            - If "auto", then `max_features=sqrt(n_features)`.
+            - If "sqrt", then `max_features=sqrt(n_features)`.
+            - If "log2", then `max_features=log2(n_features)`.
+            - If None, then `max_features=n_features`.
+
+        Note: the search for a split does not stop until at least one
+        valid partition of the node samples is found, even if it requires to
+        effectively inspect more than ``max_features`` features.
+
+    random_state : int, RandomState instance or None, default=None
+        Used to pick randomly the `max_features` used at each split.
+        See :term:`Glossary <random_state>` for details.
+
+    max_leaf_nodes : int, default=None
+        Grow a tree with ``max_leaf_nodes`` in best-first fashion.
+        Best nodes are defined as relative reduction in impurity.
+        If None then unlimited number of leaf nodes.
+
+    min_impurity_decrease : float, default=0.0
+        A node will be split if this split induces a decrease of the impurity
+        greater than or equal to this value.
+
+        The weighted impurity decrease equation is the following::
+
+            N_t / N * (impurity - N_t_R / N_t * right_impurity
+                                - N_t_L / N_t * left_impurity)
+
+        where ``N`` is the total number of samples, ``N_t`` is the number of
+        samples at the current node, ``N_t_L`` is the number of samples in the
+        left child, and ``N_t_R`` is the number of samples in the right child.
+
+        ``N``, ``N_t``, ``N_t_R`` and ``N_t_L`` all refer to the weighted sum,
+        if ``sample_weight`` is passed.
+
+        .. versionadded:: 0.19
+
+    class_weight : dict, list of dict or "balanced", default=None
+        Weights associated with classes in the form ``{class_label: weight}``.
+        If None, all classes are supposed to have weight one. For
+        multi-output problems, a list of dicts can be provided in the same
+        order as the columns of y.
+
+        Note that for multioutput (including multilabel) weights should be
+        defined for each class of every column in its own dict. For example,
+        for four-class multilabel classification weights should be
+        [{0: 1, 1: 1}, {0: 1, 1: 5}, {0: 1, 1: 1}, {0: 1, 1: 1}] instead of
+        [{1:1}, {2:5}, {3:1}, {4:1}].
+
         The "balanced" mode uses the values of y to automatically adjust
         weights inversely proportional to class frequencies in the input data
-        as ``n_samples / (n_classes * np.bincount(y))``.
+        as ``n_samples / (n_classes * np.bincount(y))``
 
-    verbose : bool, default=False
-        Enable verbose output. Note that this setting takes advantage of a
-        per-process runtime setting in libsvm that, if enabled, may not work
-        properly in a multithreaded context.
+        For multi-output, the weights of each column of y will be multiplied.
 
-    max_iter : int, default=-1
-        Hard limit on iterations within solver, or -1 for no limit.
+        Note that these weights will be multiplied with sample_weight (passed
+        through the fit method) if sample_weight is specified.
 
-    decision_function_shape : {'ovo', 'ovr'}, default='ovr'
-        Whether to return a one-vs-rest ('ovr') decision function of shape
-        (n_samples, n_classes) as all other classifiers, or the original
-        one-vs-one ('ovo') decision function of libsvm which has shape
-        (n_samples, n_classes * (n_classes - 1) / 2). However, one-vs-one
-        ('ovo') is always used as multi-class strategy. The parameter is
-        ignored for binary classification.
-
-        .. versionchanged:: 0.19
-            decision_function_shape is 'ovr' by default.
-
-        .. versionadded:: 0.17
-           *decision_function_shape='ovr'* is recommended.
-
-        .. versionchanged:: 0.17
-           Deprecated *decision_function_shape='ovo' and None*.
-
-    break_ties : bool, default=False
-        If true, ``decision_function_shape='ovr'``, and number of classes > 2,
-        :term:`predict` will break ties according to the confidence values of
-        :term:`decision_function`; otherwise the first class among the tied
-        classes is returned. Please note that breaking ties comes at a
-        relatively high computational cost compared to a simple predict.
+    ccp_alpha : non-negative float, default=0.0
+        Complexity parameter used for Minimal Cost-Complexity Pruning. The
+        subtree with the largest cost complexity that is smaller than
+        ``ccp_alpha`` will be chosen. By default, no pruning is performed. See
+        :ref:`minimal_cost_complexity_pruning` for details.
 
         .. versionadded:: 0.22
 
-    random_state : int, RandomState instance or None, default=None
-        Controls the pseudo random number generation for shuffling the data for
-        probability estimates. Ignored when `probability` is False.
-        Pass an int for reproducible output across multiple function calls.
-        See :term:`Glossary <random_state>`.
-
     Attributes
     ----------
-    class_weight_ : ndarray of shape (n_classes,)
-        Multipliers of parameter C for each class.
-        Computed based on the ``class_weight`` parameter.
+    classes_ : ndarray of shape (n_classes,) or list of ndarray
+        The classes labels (single output problem),
+        or a list of arrays of class labels (multi-output problem).
 
-    classes_ : ndarray of shape (n_classes,)
-        The classes labels.
+    max_features_ : int
+        The inferred value of max_features.
 
-    coef_ : ndarray of shape (n_classes * (n_classes - 1) / 2, n_features)
-        Weights assigned to the features (coefficients in the primal
-        problem). This is only available in the case of a linear kernel.
+    n_classes_ : int or list of int
+        The number of classes (for single output problems),
+        or a list containing the number of classes for each
+        output (for multi-output problems).
 
-        `coef_` is a readonly property derived from `dual_coef_` and
-        `support_vectors_`.
+    feature_importances_ : ndarray of shape (n_features,)
+        The impurity-based feature importances.
+        The higher, the more important the feature.
+        The importance of a feature is computed as the (normalized)
+        total reduction of the criterion brought by that feature.  It is also
+        known as the Gini importance.
 
-    dual_coef_ : ndarray of shape (n_classes -1, n_SV)
-        Dual coefficients of the support vector in the decision
-        function (see :ref:`sgd_mathematical_formulation`), multiplied by
-        their targets.
-        For multiclass, coefficient for all 1-vs-1 classifiers.
-        The layout of the coefficients in the multiclass case is somewhat
-        non-trivial. See the :ref:`multi-class section of the User Guide
-        <svm_multi_class>` for details.
+        Warning: impurity-based feature importances can be misleading for
+        high cardinality features (many unique values). See
+        :func:`sklearn.inspection.permutation_importance` as an alternative.
 
-    fit_status_ : int
-        0 if correctly fitted, 1 otherwise (will raise warning)
+    n_features_ : int
+        The number of features when ``fit`` is performed.
 
-    intercept_ : ndarray of shape (n_classes * (n_classes - 1) / 2,)
-        Constants in decision function.
+        .. deprecated:: 1.0
+           `n_features_` is deprecated in 1.0 and will be removed in
+           1.2. Use `n_features_in_` instead.
 
     n_features_in_ : int
         Number of features seen during :term:`fit`.
@@ -669,248 +1533,226 @@ class SVC(BaseSVC):
 
         .. versionadded:: 1.0
 
-    support_ : ndarray of shape (n_SV)
-        Indices of support vectors.
+    n_outputs_ : int
+        The number of outputs when ``fit`` is performed.
 
-    support_vectors_ : ndarray of shape (n_SV, n_features)
-        Support vectors.
-
-    n_support_ : ndarray of shape (n_classes,), dtype=int32
-        Number of support vectors for each class.
-
-    probA_ : ndarray of shape (n_classes * (n_classes - 1) / 2)
-    probB_ : ndarray of shape (n_classes * (n_classes - 1) / 2)
-        If `probability=True`, it corresponds to the parameters learned in
-        Platt scaling to produce probability estimates from decision values.
-        If `probability=False`, it's an empty array. Platt scaling uses the
-        logistic function
-        ``1 / (1 + exp(decision_value * probA_ + probB_))``
-        where ``probA_`` and ``probB_`` are learned from the dataset [2]_. For
-        more information on the multiclass case and training procedure see
-        section 8 of [1]_.
-
-    shape_fit_ : tuple of int of shape (n_dimensions_of_X,)
-        Array dimensions of training vector ``X``.
+    tree_ : Tree instance
+        The underlying Tree object. Please refer to
+        ``help(sklearn.tree._tree.Tree)`` for attributes of Tree object and
+        :ref:`sphx_glr_auto_examples_tree_plot_unveil_tree_structure.py`
+        for basic usage of these attributes.
 
     See Also
     --------
-    SVR : Support Vector Machine for Regression implemented using libsvm.
+    ExtraTreeRegressor : An extremely randomized tree regressor.
+    sklearn.ensemble.ExtraTreesClassifier : An extra-trees classifier.
+    sklearn.ensemble.ExtraTreesRegressor : An extra-trees regressor.
+    sklearn.ensemble.RandomForestClassifier : A random forest classifier.
+    sklearn.ensemble.RandomForestRegressor : A random forest regressor.
+    sklearn.ensemble.RandomTreesEmbedding : An ensemble of
+        totally random trees.
 
-    LinearSVC : Scalable Linear Support Vector Machine for classification
-        implemented using liblinear. Check the See Also section of
-        LinearSVC for more comparison element.
+    Notes
+    -----
+    The default values for the parameters controlling the size of the trees
+    (e.g. ``max_depth``, ``min_samples_leaf``, etc.) lead to fully grown and
+    unpruned trees which can potentially be very large on some data sets. To
+    reduce memory consumption, the complexity and size of the trees should be
+    controlled by setting those parameter values.
 
     References
     ----------
-    .. [1] `LIBSVM: A Library for Support Vector Machines
-        <http://www.csie.ntu.edu.tw/~cjlin/papers/libsvm.pdf>`_
 
-    .. [2] `Platt, John (1999). "Probabilistic outputs for support vector
-        machines and comparison to regularizedlikelihood methods."
-        <http://citeseer.ist.psu.edu/viewdoc/summary?doi=10.1.1.41.1639>`_
+    .. [1] P. Geurts, D. Ernst., and L. Wehenkel, "Extremely randomized trees",
+           Machine Learning, 63(1), 3-42, 2006.
 
     Examples
     --------
-    >>> import numpy as np
-    >>> from sklearn.pipeline import make_pipeline
-    >>> from sklearn.preprocessing import StandardScaler
-    >>> X = np.array([[-1, -1], [-2, -1], [1, 1], [2, 1]])
-    >>> y = np.array([1, 1, 2, 2])
-    >>> from sklearn.svm import SVC
-    >>> clf = make_pipeline(StandardScaler(), SVC(gamma='auto'))
-    >>> clf.fit(X, y)
-    Pipeline(steps=[('standardscaler', StandardScaler()),
-                    ('svc', SVC(gamma='auto'))])
-
-    >>> print(clf.predict([[-0.8, -1]]))
-    [1]
+    >>> from sklearn.datasets import load_iris
+    >>> from sklearn.model_selection import train_test_split
+    >>> from sklearn.ensemble import BaggingClassifier
+    >>> from sklearn.tree import ExtraTreeClassifier
+    >>> X, y = load_iris(return_X_y=True)
+    >>> X_train, X_test, y_train, y_test = train_test_split(
+    ...    X, y, random_state=0)
+    >>> extra_tree = ExtraTreeClassifier(random_state=0)
+    >>> cls = BaggingClassifier(extra_tree, random_state=0).fit(
+    ...    X_train, y_train)
+    >>> cls.score(X_test, y_test)
+    0.8947...
     """
-
-    _impl = "c_svc"
 
     def __init__(
         self,
         *,
-        C=1.0,
-        kernel="rbf",
-        degree=3,
-        gamma="scale",
-        coef0=0.0,
-        shrinking=True,
-        probability=False,
-        tol=1e-3,
-        cache_size=200,
-        class_weight=None,
-        verbose=False,
-        max_iter=-1,
-        decision_function_shape="ovr",
-        break_ties=False,
+        criterion="gini",
+        splitter="random",
+        max_depth=None,
+        min_samples_split=2,
+        min_samples_leaf=1,
+        min_weight_fraction_leaf=0.0,
+        max_features="auto",
         random_state=None,
+        max_leaf_nodes=None,
+        min_impurity_decrease=0.0,
+        class_weight=None,
+        ccp_alpha=0.0,
     ):
-
         super().__init__(
-            kernel=kernel,
-            degree=degree,
-            gamma=gamma,
-            coef0=coef0,
-            tol=tol,
-            C=C,
-            nu=0.0,
-            shrinking=shrinking,
-            probability=probability,
-            cache_size=cache_size,
+            criterion=criterion,
+            splitter=splitter,
+            max_depth=max_depth,
+            min_samples_split=min_samples_split,
+            min_samples_leaf=min_samples_leaf,
+            min_weight_fraction_leaf=min_weight_fraction_leaf,
+            max_features=max_features,
+            max_leaf_nodes=max_leaf_nodes,
             class_weight=class_weight,
-            verbose=verbose,
-            max_iter=max_iter,
-            decision_function_shape=decision_function_shape,
-            break_ties=break_ties,
+            min_impurity_decrease=min_impurity_decrease,
             random_state=random_state,
+            ccp_alpha=ccp_alpha,
         )
 
-    def _more_tags(self):
-        return {
-            "_xfail_checks": {
-                "check_sample_weights_invariance": (
-                    "zero sample_weight is not equivalent to removing samples"
-                ),
-            }
-        }
 
+class ExtraTreeRegressor(DecisionTreeRegressor):
+    """An extremely randomized tree regressor.
 
-class NuSVC(BaseSVC):
-    """Nu-Support Vector Classification.
+    Extra-trees differ from classic decision trees in the way they are built.
+    When looking for the best split to separate the samples of a node into two
+    groups, random splits are drawn for each of the `max_features` randomly
+    selected features and the best split among those is chosen. When
+    `max_features` is set 1, this amounts to building a totally random
+    decision tree.
 
-    Similar to SVC but uses a parameter to control the number of support
-    vectors.
+    Warning: Extra-trees should only be used within ensemble methods.
 
-    The implementation is based on libsvm.
-
-    Read more in the :ref:`User Guide <svm_classification>`.
+    Read more in the :ref:`User Guide <tree>`.
 
     Parameters
     ----------
-    nu : float, default=0.5
-        An upper bound on the fraction of margin errors (see :ref:`User Guide
-        <nu_svc>`) and a lower bound of the fraction of support vectors.
-        Should be in the interval (0, 1].
+    criterion : {"squared_error", "friedman_mse"}, default="squared_error"
+        The function to measure the quality of a split. Supported criteria
+        are "squared_error" for the mean squared error, which is equal to
+        variance reduction as feature selection criterion and "mae" for the
+        mean absolute error.
 
-    kernel : {'linear', 'poly', 'rbf', 'sigmoid', 'precomputed'} or callable,  \
-        default='rbf'
-         Specifies the kernel type to be used in the algorithm.
-         If none is given, 'rbf' will be used. If a callable is given it is
-         used to precompute the kernel matrix.
+        .. versionadded:: 0.18
+           Mean Absolute Error (MAE) criterion.
 
-    degree : int, default=3
-        Degree of the polynomial kernel function ('poly').
-        Ignored by all other kernels.
+        .. versionadded:: 0.24
+            Poisson deviance criterion.
 
-    gamma : {'scale', 'auto'} or float, default='scale'
-        Kernel coefficient for 'rbf', 'poly' and 'sigmoid'.
+        .. deprecated:: 1.0
+            Criterion "mse" was deprecated in v1.0 and will be removed in
+            version 1.2. Use `criterion="squared_error"` which is equivalent.
 
-        - if ``gamma='scale'`` (default) is passed then it uses
-          1 / (n_features * X.var()) as value of gamma,
-        - if 'auto', uses 1 / n_features.
+        .. deprecated:: 1.0
+            Criterion "mae" was deprecated in v1.0 and will be removed in
+            version 1.2. Use `criterion="absolute_error"` which is equivalent.
 
-        .. versionchanged:: 0.22
-           The default value of ``gamma`` changed from 'auto' to 'scale'.
+    splitter : {"random", "best"}, default="random"
+        The strategy used to choose the split at each node. Supported
+        strategies are "best" to choose the best split and "random" to choose
+        the best random split.
 
-    coef0 : float, default=0.0
-        Independent term in kernel function.
-        It is only significant in 'poly' and 'sigmoid'.
+    max_depth : int, default=None
+        The maximum depth of the tree. If None, then nodes are expanded until
+        all leaves are pure or until all leaves contain less than
+        min_samples_split samples.
 
-    shrinking : bool, default=True
-        Whether to use the shrinking heuristic.
-        See the :ref:`User Guide <shrinking_svm>`.
+    min_samples_split : int or float, default=2
+        The minimum number of samples required to split an internal node:
 
-    probability : bool, default=False
-        Whether to enable probability estimates. This must be enabled prior
-        to calling `fit`, will slow down that method as it internally uses
-        5-fold cross-validation, and `predict_proba` may be inconsistent with
-        `predict`. Read more in the :ref:`User Guide <scores_probabilities>`.
+        - If int, then consider `min_samples_split` as the minimum number.
+        - If float, then `min_samples_split` is a fraction and
+          `ceil(min_samples_split * n_samples)` are the minimum
+          number of samples for each split.
 
-    tol : float, default=1e-3
-        Tolerance for stopping criterion.
+        .. versionchanged:: 0.18
+           Added float values for fractions.
 
-    cache_size : float, default=200
-        Specify the size of the kernel cache (in MB).
+    min_samples_leaf : int or float, default=1
+        The minimum number of samples required to be at a leaf node.
+        A split point at any depth will only be considered if it leaves at
+        least ``min_samples_leaf`` training samples in each of the left and
+        right branches.  This may have the effect of smoothing the model,
+        especially in regression.
 
-    class_weight : {dict, 'balanced'}, default=None
-        Set the parameter C of class i to class_weight[i]*C for
-        SVC. If not given, all classes are supposed to have
-        weight one. The "balanced" mode uses the values of y to automatically
-        adjust weights inversely proportional to class frequencies as
-        ``n_samples / (n_classes * np.bincount(y))``.
+        - If int, then consider `min_samples_leaf` as the minimum number.
+        - If float, then `min_samples_leaf` is a fraction and
+          `ceil(min_samples_leaf * n_samples)` are the minimum
+          number of samples for each node.
 
-    verbose : bool, default=False
-        Enable verbose output. Note that this setting takes advantage of a
-        per-process runtime setting in libsvm that, if enabled, may not work
-        properly in a multithreaded context.
+        .. versionchanged:: 0.18
+           Added float values for fractions.
 
-    max_iter : int, default=-1
-        Hard limit on iterations within solver, or -1 for no limit.
+    min_weight_fraction_leaf : float, default=0.0
+        The minimum weighted fraction of the sum total of weights (of all
+        the input samples) required to be at a leaf node. Samples have
+        equal weight when sample_weight is not provided.
 
-    decision_function_shape : {'ovo', 'ovr'}, default='ovr'
-        Whether to return a one-vs-rest ('ovr') decision function of shape
-        (n_samples, n_classes) as all other classifiers, or the original
-        one-vs-one ('ovo') decision function of libsvm which has shape
-        (n_samples, n_classes * (n_classes - 1) / 2). However, one-vs-one
-        ('ovo') is always used as multi-class strategy. The parameter is
-        ignored for binary classification.
+    max_features : int, float, {"auto", "sqrt", "log2"} or None, default="auto"
+        The number of features to consider when looking for the best split:
 
-        .. versionchanged:: 0.19
-            decision_function_shape is 'ovr' by default.
+        - If int, then consider `max_features` features at each split.
+        - If float, then `max_features` is a fraction and
+          `int(max_features * n_features)` features are considered at each
+          split.
+        - If "auto", then `max_features=n_features`.
+        - If "sqrt", then `max_features=sqrt(n_features)`.
+        - If "log2", then `max_features=log2(n_features)`.
+        - If None, then `max_features=n_features`.
 
-        .. versionadded:: 0.17
-           *decision_function_shape='ovr'* is recommended.
+        Note: the search for a split does not stop until at least one
+        valid partition of the node samples is found, even if it requires to
+        effectively inspect more than ``max_features`` features.
 
-        .. versionchanged:: 0.17
-           Deprecated *decision_function_shape='ovo' and None*.
+    random_state : int, RandomState instance or None, default=None
+        Used to pick randomly the `max_features` used at each split.
+        See :term:`Glossary <random_state>` for details.
 
-    break_ties : bool, default=False
-        If true, ``decision_function_shape='ovr'``, and number of classes > 2,
-        :term:`predict` will break ties according to the confidence values of
-        :term:`decision_function`; otherwise the first class among the tied
-        classes is returned. Please note that breaking ties comes at a
-        relatively high computational cost compared to a simple predict.
+    min_impurity_decrease : float, default=0.0
+        A node will be split if this split induces a decrease of the impurity
+        greater than or equal to this value.
+
+        The weighted impurity decrease equation is the following::
+
+            N_t / N * (impurity - N_t_R / N_t * right_impurity
+                                - N_t_L / N_t * left_impurity)
+
+        where ``N`` is the total number of samples, ``N_t`` is the number of
+        samples at the current node, ``N_t_L`` is the number of samples in the
+        left child, and ``N_t_R`` is the number of samples in the right child.
+
+        ``N``, ``N_t``, ``N_t_R`` and ``N_t_L`` all refer to the weighted sum,
+        if ``sample_weight`` is passed.
+
+        .. versionadded:: 0.19
+
+    max_leaf_nodes : int, default=None
+        Grow a tree with ``max_leaf_nodes`` in best-first fashion.
+        Best nodes are defined as relative reduction in impurity.
+        If None then unlimited number of leaf nodes.
+
+    ccp_alpha : non-negative float, default=0.0
+        Complexity parameter used for Minimal Cost-Complexity Pruning. The
+        subtree with the largest cost complexity that is smaller than
+        ``ccp_alpha`` will be chosen. By default, no pruning is performed. See
+        :ref:`minimal_cost_complexity_pruning` for details.
 
         .. versionadded:: 0.22
 
-    random_state : int, RandomState instance or None, default=None
-        Controls the pseudo random number generation for shuffling the data for
-        probability estimates. Ignored when `probability` is False.
-        Pass an int for reproducible output across multiple function calls.
-        See :term:`Glossary <random_state>`.
-
     Attributes
     ----------
-    class_weight_ : ndarray of shape (n_classes,)
-        Multipliers of parameter C of each class.
-        Computed based on the ``class_weight`` parameter.
+    max_features_ : int
+        The inferred value of max_features.
 
-    classes_ : ndarray of shape (n_classes,)
-        The unique classes labels.
+    n_features_ : int
+        The number of features when ``fit`` is performed.
 
-    coef_ : ndarray of shape (n_classes * (n_classes -1) / 2, n_features)
-        Weights assigned to the features (coefficients in the primal
-        problem). This is only available in the case of a linear kernel.
-
-        `coef_` is readonly property derived from `dual_coef_` and
-        `support_vectors_`.
-
-    dual_coef_ : ndarray of shape (n_classes - 1, n_SV)
-        Dual coefficients of the support vector in the decision
-        function (see :ref:`sgd_mathematical_formulation`), multiplied by
-        their targets.
-        For multiclass, coefficient for all 1-vs-1 classifiers.
-        The layout of the coefficients in the multiclass case is somewhat
-        non-trivial. See the :ref:`multi-class section of the User Guide
-        <svm_multi_class>` for details.
-
-    fit_status_ : int
-        0 if correctly fitted, 1 if the algorithm did not converge.
-
-    intercept_ : ndarray of shape (n_classes * (n_classes - 1) / 2,)
-        Constants in decision function.
+        .. deprecated:: 1.0
+           `n_features_` is deprecated in 1.0 and will be removed in
+           1.2. Use `n_features_in_` instead.
 
     n_features_in_ : int
         Number of features seen during :term:`fit`.
@@ -923,768 +1765,84 @@ class NuSVC(BaseSVC):
 
         .. versionadded:: 1.0
 
-    support_ : ndarray of shape (n_SV,)
-        Indices of support vectors.
+    feature_importances_ : ndarray of shape (n_features,)
+        Return impurity-based feature importances (the higher, the more
+        important the feature).
 
-    support_vectors_ : ndarray of shape (n_SV, n_features)
-        Support vectors.
+        Warning: impurity-based feature importances can be misleading for
+        high cardinality features (many unique values). See
+        :func:`sklearn.inspection.permutation_importance` as an alternative.
 
-    n_support_ : ndarray of shape (n_classes,), dtype=int32
-        Number of support vectors for each class.
+    n_outputs_ : int
+        The number of outputs when ``fit`` is performed.
 
-    fit_status_ : int
-        0 if correctly fitted, 1 if the algorithm did not converge.
-
-    probA_ : ndarray of shape (n_classes * (n_classes - 1) / 2,)
-    probB_ : ndarray of shape (n_classes * (n_classes - 1) / 2,)
-        If `probability=True`, it corresponds to the parameters learned in
-        Platt scaling to produce probability estimates from decision values.
-        If `probability=False`, it's an empty array. Platt scaling uses the
-        logistic function
-        ``1 / (1 + exp(decision_value * probA_ + probB_))``
-        where ``probA_`` and ``probB_`` are learned from the dataset [2]_. For
-        more information on the multiclass case and training procedure see
-        section 8 of [1]_.
-
-    shape_fit_ : tuple of int of shape (n_dimensions_of_X,)
-        Array dimensions of training vector ``X``.
+    tree_ : Tree instance
+        The underlying Tree object. Please refer to
+        ``help(sklearn.tree._tree.Tree)`` for attributes of Tree object and
+        :ref:`sphx_glr_auto_examples_tree_plot_unveil_tree_structure.py`
+        for basic usage of these attributes.
 
     See Also
     --------
-    SVC : Support Vector Machine for classification using libsvm.
+    ExtraTreeClassifier : An extremely randomized tree classifier.
+    sklearn.ensemble.ExtraTreesClassifier : An extra-trees classifier.
+    sklearn.ensemble.ExtraTreesRegressor : An extra-trees regressor.
 
-    LinearSVC : Scalable linear Support Vector Machine for classification using
-        liblinear.
+    Notes
+    -----
+    The default values for the parameters controlling the size of the trees
+    (e.g. ``max_depth``, ``min_samples_leaf``, etc.) lead to fully grown and
+    unpruned trees which can potentially be very large on some data sets. To
+    reduce memory consumption, the complexity and size of the trees should be
+    controlled by setting those parameter values.
 
     References
     ----------
-    .. [1] `LIBSVM: A Library for Support Vector Machines
-        <http://www.csie.ntu.edu.tw/~cjlin/papers/libsvm.pdf>`_
 
-    .. [2] `Platt, John (1999). "Probabilistic outputs for support vector
-        machines and comparison to regularizedlikelihood methods."
-        <http://citeseer.ist.psu.edu/viewdoc/summary?doi=10.1.1.41.1639>`_
+    .. [1] P. Geurts, D. Ernst., and L. Wehenkel, "Extremely randomized trees",
+           Machine Learning, 63(1), 3-42, 2006.
 
     Examples
     --------
-    >>> import numpy as np
-    >>> X = np.array([[-1, -1], [-2, -1], [1, 1], [2, 1]])
-    >>> y = np.array([1, 1, 2, 2])
-    >>> from sklearn.pipeline import make_pipeline
-    >>> from sklearn.preprocessing import StandardScaler
-    >>> from sklearn.svm import NuSVC
-    >>> clf = make_pipeline(StandardScaler(), NuSVC())
-    >>> clf.fit(X, y)
-    Pipeline(steps=[('standardscaler', StandardScaler()), ('nusvc', NuSVC())])
-    >>> print(clf.predict([[-0.8, -1]]))
-    [1]
+    >>> from sklearn.datasets import load_diabetes
+    >>> from sklearn.model_selection import train_test_split
+    >>> from sklearn.ensemble import BaggingRegressor
+    >>> from sklearn.tree import ExtraTreeRegressor
+    >>> X, y = load_diabetes(return_X_y=True)
+    >>> X_train, X_test, y_train, y_test = train_test_split(
+    ...     X, y, random_state=0)
+    >>> extra_tree = ExtraTreeRegressor(random_state=0)
+    >>> reg = BaggingRegressor(extra_tree, random_state=0).fit(
+    ...     X_train, y_train)
+    >>> reg.score(X_test, y_test)
+    0.33...
     """
-
-    _impl = "nu_svc"
 
     def __init__(
         self,
         *,
-        nu=0.5,
-        kernel="rbf",
-        degree=3,
-        gamma="scale",
-        coef0=0.0,
-        shrinking=True,
-        probability=False,
-        tol=1e-3,
-        cache_size=200,
-        class_weight=None,
-        verbose=False,
-        max_iter=-1,
-        decision_function_shape="ovr",
-        break_ties=False,
+        criterion="squared_error",
+        splitter="random",
+        max_depth=None,
+        min_samples_split=2,
+        min_samples_leaf=1,
+        min_weight_fraction_leaf=0.0,
+        max_features="auto",
         random_state=None,
+        min_impurity_decrease=0.0,
+        max_leaf_nodes=None,
+        ccp_alpha=0.0,
     ):
-
         super().__init__(
-            kernel=kernel,
-            degree=degree,
-            gamma=gamma,
-            coef0=coef0,
-            tol=tol,
-            C=0.0,
-            nu=nu,
-            shrinking=shrinking,
-            probability=probability,
-            cache_size=cache_size,
-            class_weight=class_weight,
-            verbose=verbose,
-            max_iter=max_iter,
-            decision_function_shape=decision_function_shape,
-            break_ties=break_ties,
+            criterion=criterion,
+            splitter=splitter,
+            max_depth=max_depth,
+            min_samples_split=min_samples_split,
+            min_samples_leaf=min_samples_leaf,
+            min_weight_fraction_leaf=min_weight_fraction_leaf,
+            max_features=max_features,
+            max_leaf_nodes=max_leaf_nodes,
+            min_impurity_decrease=min_impurity_decrease,
             random_state=random_state,
+            ccp_alpha=ccp_alpha,
         )
-
-    def _more_tags(self):
-        return {
-            "_xfail_checks": {
-                "check_methods_subset_invariance": (
-                    "fails for the decision_function method"
-                ),
-                "check_class_weight_classifiers": "class_weight is ignored.",
-                "check_sample_weights_invariance": (
-                    "zero sample_weight is not equivalent to removing samples"
-                ),
-            }
-        }
-
-
-class SVR(RegressorMixin, BaseLibSVM):
-    """Epsilon-Support Vector Regression.
-
-    The free parameters in the model are C and epsilon.
-
-    The implementation is based on libsvm. The fit time complexity
-    is more than quadratic with the number of samples which makes it hard
-    to scale to datasets with more than a couple of 10000 samples. For large
-    datasets consider using :class:`~sklearn.svm.LinearSVR` or
-    :class:`~sklearn.linear_model.SGDRegressor` instead, possibly after a
-    :class:`~sklearn.kernel_approximation.Nystroem` transformer.
-
-    Read more in the :ref:`User Guide <svm_regression>`.
-
-    Parameters
-    ----------
-    kernel : {'linear', 'poly', 'rbf', 'sigmoid', 'precomputed'} or callable,  \
-        default='rbf'
-         Specifies the kernel type to be used in the algorithm.
-         If none is given, 'rbf' will be used. If a callable is given it is
-         used to precompute the kernel matrix.
-
-    degree : int, default=3
-        Degree of the polynomial kernel function ('poly').
-        Ignored by all other kernels.
-
-    gamma : {'scale', 'auto'} or float, default='scale'
-        Kernel coefficient for 'rbf', 'poly' and 'sigmoid'.
-
-        - if ``gamma='scale'`` (default) is passed then it uses
-          1 / (n_features * X.var()) as value of gamma,
-        - if 'auto', uses 1 / n_features.
-
-        .. versionchanged:: 0.22
-           The default value of ``gamma`` changed from 'auto' to 'scale'.
-
-    coef0 : float, default=0.0
-        Independent term in kernel function.
-        It is only significant in 'poly' and 'sigmoid'.
-
-    tol : float, default=1e-3
-        Tolerance for stopping criterion.
-
-    C : float, default=1.0
-        Regularization parameter. The strength of the regularization is
-        inversely proportional to C. Must be strictly positive.
-        The penalty is a squared l2 penalty.
-
-    epsilon : float, default=0.1
-         Epsilon in the epsilon-SVR model. It specifies the epsilon-tube
-         within which no penalty is associated in the training loss function
-         with points predicted within a distance epsilon from the actual
-         value.
-
-    shrinking : bool, default=True
-        Whether to use the shrinking heuristic.
-        See the :ref:`User Guide <shrinking_svm>`.
-
-    cache_size : float, default=200
-        Specify the size of the kernel cache (in MB).
-
-    verbose : bool, default=False
-        Enable verbose output. Note that this setting takes advantage of a
-        per-process runtime setting in libsvm that, if enabled, may not work
-        properly in a multithreaded context.
-
-    max_iter : int, default=-1
-        Hard limit on iterations within solver, or -1 for no limit.
-
-    Attributes
-    ----------
-    class_weight_ : ndarray of shape (n_classes,)
-        Multipliers of parameter C for each class.
-        Computed based on the ``class_weight`` parameter.
-
-    coef_ : ndarray of shape (1, n_features)
-        Weights assigned to the features (coefficients in the primal
-        problem). This is only available in the case of a linear kernel.
-
-        `coef_` is readonly property derived from `dual_coef_` and
-        `support_vectors_`.
-
-    dual_coef_ : ndarray of shape (1, n_SV)
-        Coefficients of the support vector in the decision function.
-
-    fit_status_ : int
-        0 if correctly fitted, 1 otherwise (will raise warning)
-
-    intercept_ : ndarray of shape (1,)
-        Constants in decision function.
-
-    n_features_in_ : int
-        Number of features seen during :term:`fit`.
-
-        .. versionadded:: 0.24
-
-    feature_names_in_ : ndarray of shape (`n_features_in_`,)
-        Names of features seen during :term:`fit`. Defined only when `X`
-        has feature names that are all strings.
-
-        .. versionadded:: 1.0
-
-    n_support_ : ndarray of shape (n_classes,), dtype=int32
-        Number of support vectors for each class.
-
-    shape_fit_ : tuple of int of shape (n_dimensions_of_X,)
-        Array dimensions of training vector ``X``.
-
-    support_ : ndarray of shape (n_SV,)
-        Indices of support vectors.
-
-    support_vectors_ : ndarray of shape (n_SV, n_features)
-        Support vectors.
-
-    See Also
-    --------
-    NuSVR : Support Vector Machine for regression implemented using libsvm
-        using a parameter to control the number of support vectors.
-
-    LinearSVR : Scalable Linear Support Vector Machine for regression
-        implemented using liblinear.
-
-    References
-    ----------
-    .. [1] `LIBSVM: A Library for Support Vector Machines
-        <http://www.csie.ntu.edu.tw/~cjlin/papers/libsvm.pdf>`_
-
-    .. [2] `Platt, John (1999). "Probabilistic outputs for support vector
-        machines and comparison to regularizedlikelihood methods."
-        <http://citeseer.ist.psu.edu/viewdoc/summary?doi=10.1.1.41.1639>`_
-
-    Examples
-    --------
-    >>> from sklearn.svm import SVR
-    >>> from sklearn.pipeline import make_pipeline
-    >>> from sklearn.preprocessing import StandardScaler
-    >>> import numpy as np
-    >>> n_samples, n_features = 10, 5
-    >>> rng = np.random.RandomState(0)
-    >>> y = rng.randn(n_samples)
-    >>> X = rng.randn(n_samples, n_features)
-    >>> regr = make_pipeline(StandardScaler(), SVR(C=1.0, epsilon=0.2))
-    >>> regr.fit(X, y)
-    Pipeline(steps=[('standardscaler', StandardScaler()),
-                    ('svr', SVR(epsilon=0.2))])
-    """
-
-    _impl = "epsilon_svr"
-
-    def __init__(
-        self,
-        *,
-        kernel="rbf",
-        degree=3,
-        gamma="scale",
-        coef0=0.0,
-        tol=1e-3,
-        C=1.0,
-        epsilon=0.1,
-        shrinking=True,
-        cache_size=200,
-        verbose=False,
-        max_iter=-1,
-    ):
-
-        super().__init__(
-            kernel=kernel,
-            degree=degree,
-            gamma=gamma,
-            coef0=coef0,
-            tol=tol,
-            C=C,
-            nu=0.0,
-            epsilon=epsilon,
-            verbose=verbose,
-            shrinking=shrinking,
-            probability=False,
-            cache_size=cache_size,
-            class_weight=None,
-            max_iter=max_iter,
-            random_state=None,
-        )
-
-    def _more_tags(self):
-        return {
-            "_xfail_checks": {
-                "check_sample_weights_invariance": (
-                    "zero sample_weight is not equivalent to removing samples"
-                ),
-            }
-        }
-
-
-class NuSVR(RegressorMixin, BaseLibSVM):
-    """Nu Support Vector Regression.
-
-    Similar to NuSVC, for regression, uses a parameter nu to control
-    the number of support vectors. However, unlike NuSVC, where nu
-    replaces C, here nu replaces the parameter epsilon of epsilon-SVR.
-
-    The implementation is based on libsvm.
-
-    Read more in the :ref:`User Guide <svm_regression>`.
-
-    Parameters
-    ----------
-    nu : float, default=0.5
-        An upper bound on the fraction of training errors and a lower bound of
-        the fraction of support vectors. Should be in the interval (0, 1].  By
-        default 0.5 will be taken.
-
-    C : float, default=1.0
-        Penalty parameter C of the error term.
-
-    kernel : {'linear', 'poly', 'rbf', 'sigmoid', 'precomputed'} or callable,  \
-        default='rbf'
-         Specifies the kernel type to be used in the algorithm.
-         If none is given, 'rbf' will be used. If a callable is given it is
-         used to precompute the kernel matrix.
-
-    degree : int, default=3
-        Degree of the polynomial kernel function ('poly').
-        Ignored by all other kernels.
-
-    gamma : {'scale', 'auto'} or float, default='scale'
-        Kernel coefficient for 'rbf', 'poly' and 'sigmoid'.
-
-        - if ``gamma='scale'`` (default) is passed then it uses
-          1 / (n_features * X.var()) as value of gamma,
-        - if 'auto', uses 1 / n_features.
-
-        .. versionchanged:: 0.22
-           The default value of ``gamma`` changed from 'auto' to 'scale'.
-
-    coef0 : float, default=0.0
-        Independent term in kernel function.
-        It is only significant in 'poly' and 'sigmoid'.
-
-    shrinking : bool, default=True
-        Whether to use the shrinking heuristic.
-        See the :ref:`User Guide <shrinking_svm>`.
-
-    tol : float, default=1e-3
-        Tolerance for stopping criterion.
-
-    cache_size : float, default=200
-        Specify the size of the kernel cache (in MB).
-
-    verbose : bool, default=False
-        Enable verbose output. Note that this setting takes advantage of a
-        per-process runtime setting in libsvm that, if enabled, may not work
-        properly in a multithreaded context.
-
-    max_iter : int, default=-1
-        Hard limit on iterations within solver, or -1 for no limit.
-
-    Attributes
-    ----------
-    class_weight_ : ndarray of shape (n_classes,)
-        Multipliers of parameter C for each class.
-        Computed based on the ``class_weight`` parameter.
-
-    coef_ : ndarray of shape (1, n_features)
-        Weights assigned to the features (coefficients in the primal
-        problem). This is only available in the case of a linear kernel.
-
-        `coef_` is readonly property derived from `dual_coef_` and
-        `support_vectors_`.
-
-    dual_coef_ : ndarray of shape (1, n_SV)
-        Coefficients of the support vector in the decision function.
-
-    fit_status_ : int
-        0 if correctly fitted, 1 otherwise (will raise warning)
-
-    intercept_ : ndarray of shape (1,)
-        Constants in decision function.
-
-    n_features_in_ : int
-        Number of features seen during :term:`fit`.
-
-        .. versionadded:: 0.24
-
-    feature_names_in_ : ndarray of shape (`n_features_in_`,)
-        Names of features seen during :term:`fit`. Defined only when `X`
-        has feature names that are all strings.
-
-        .. versionadded:: 1.0
-
-    n_support_ : ndarray of shape (n_classes,), dtype=int32
-        Number of support vectors for each class.
-
-    shape_fit_ : tuple of int of shape (n_dimensions_of_X,)
-        Array dimensions of training vector ``X``.
-
-    support_ : ndarray of shape (n_SV,)
-        Indices of support vectors.
-
-    support_vectors_ : ndarray of shape (n_SV, n_features)
-        Support vectors.
-
-    See Also
-    --------
-    NuSVC : Support Vector Machine for classification implemented with libsvm
-        with a parameter to control the number of support vectors.
-
-    SVR : Epsilon Support Vector Machine for regression implemented with
-        libsvm.
-
-    References
-    ----------
-    .. [1] `LIBSVM: A Library for Support Vector Machines
-        <http://www.csie.ntu.edu.tw/~cjlin/papers/libsvm.pdf>`_
-
-    .. [2] `Platt, John (1999). "Probabilistic outputs for support vector
-        machines and comparison to regularizedlikelihood methods."
-        <http://citeseer.ist.psu.edu/viewdoc/summary?doi=10.1.1.41.1639>`_
-
-    Examples
-    --------
-    >>> from sklearn.svm import NuSVR
-    >>> from sklearn.pipeline import make_pipeline
-    >>> from sklearn.preprocessing import StandardScaler
-    >>> import numpy as np
-    >>> n_samples, n_features = 10, 5
-    >>> np.random.seed(0)
-    >>> y = np.random.randn(n_samples)
-    >>> X = np.random.randn(n_samples, n_features)
-    >>> regr = make_pipeline(StandardScaler(), NuSVR(C=1.0, nu=0.1))
-    >>> regr.fit(X, y)
-    Pipeline(steps=[('standardscaler', StandardScaler()),
-                    ('nusvr', NuSVR(nu=0.1))])
-    """
-
-    _impl = "nu_svr"
-
-    def __init__(
-        self,
-        *,
-        nu=0.5,
-        C=1.0,
-        kernel="rbf",
-        degree=3,
-        gamma="scale",
-        coef0=0.0,
-        shrinking=True,
-        tol=1e-3,
-        cache_size=200,
-        verbose=False,
-        max_iter=-1,
-    ):
-
-        super().__init__(
-            kernel=kernel,
-            degree=degree,
-            gamma=gamma,
-            coef0=coef0,
-            tol=tol,
-            C=C,
-            nu=nu,
-            epsilon=0.0,
-            shrinking=shrinking,
-            probability=False,
-            cache_size=cache_size,
-            class_weight=None,
-            verbose=verbose,
-            max_iter=max_iter,
-            random_state=None,
-        )
-
-    def _more_tags(self):
-        return {
-            "_xfail_checks": {
-                "check_sample_weights_invariance": (
-                    "zero sample_weight is not equivalent to removing samples"
-                ),
-            }
-        }
-
-
-class OneClassSVM(OutlierMixin, BaseLibSVM):
-    """Unsupervised Outlier Detection.
-
-    Estimate the support of a high-dimensional distribution.
-
-    The implementation is based on libsvm.
-
-    Read more in the :ref:`User Guide <outlier_detection>`.
-
-    Parameters
-    ----------
-    kernel : {'linear', 'poly', 'rbf', 'sigmoid', 'precomputed'} or callable,  \
-        default='rbf'
-         Specifies the kernel type to be used in the algorithm.
-         If none is given, 'rbf' will be used. If a callable is given it is
-         used to precompute the kernel matrix.
-
-    degree : int, default=3
-        Degree of the polynomial kernel function ('poly').
-        Ignored by all other kernels.
-
-    gamma : {'scale', 'auto'} or float, default='scale'
-        Kernel coefficient for 'rbf', 'poly' and 'sigmoid'.
-
-        - if ``gamma='scale'`` (default) is passed then it uses
-          1 / (n_features * X.var()) as value of gamma,
-        - if 'auto', uses 1 / n_features.
-
-        .. versionchanged:: 0.22
-           The default value of ``gamma`` changed from 'auto' to 'scale'.
-
-    coef0 : float, default=0.0
-        Independent term in kernel function.
-        It is only significant in 'poly' and 'sigmoid'.
-
-    tol : float, default=1e-3
-        Tolerance for stopping criterion.
-
-    nu : float, default=0.5
-        An upper bound on the fraction of training
-        errors and a lower bound of the fraction of support
-        vectors. Should be in the interval (0, 1]. By default 0.5
-        will be taken.
-
-    shrinking : bool, default=True
-        Whether to use the shrinking heuristic.
-        See the :ref:`User Guide <shrinking_svm>`.
-
-    cache_size : float, default=200
-        Specify the size of the kernel cache (in MB).
-
-    verbose : bool, default=False
-        Enable verbose output. Note that this setting takes advantage of a
-        per-process runtime setting in libsvm that, if enabled, may not work
-        properly in a multithreaded context.
-
-    max_iter : int, default=-1
-        Hard limit on iterations within solver, or -1 for no limit.
-
-    Attributes
-    ----------
-    class_weight_ : ndarray of shape (n_classes,)
-        Multipliers of parameter C for each class.
-        Computed based on the ``class_weight`` parameter.
-
-    coef_ : ndarray of shape (1, n_features)
-        Weights assigned to the features (coefficients in the primal
-        problem). This is only available in the case of a linear kernel.
-
-        `coef_` is readonly property derived from `dual_coef_` and
-        `support_vectors_`.
-
-    dual_coef_ : ndarray of shape (1, n_SV)
-        Coefficients of the support vectors in the decision function.
-
-    fit_status_ : int
-        0 if correctly fitted, 1 otherwise (will raise warning)
-
-    intercept_ : ndarray of shape (1,)
-        Constant in the decision function.
-
-    n_features_in_ : int
-        Number of features seen during :term:`fit`.
-
-        .. versionadded:: 0.24
-
-    feature_names_in_ : ndarray of shape (`n_features_in_`,)
-        Names of features seen during :term:`fit`. Defined only when `X`
-        has feature names that are all strings.
-
-        .. versionadded:: 1.0
-
-    n_support_ : ndarray of shape (n_classes,), dtype=int32
-        Number of support vectors for each class.
-
-    offset_ : float
-        Offset used to define the decision function from the raw scores.
-        We have the relation: decision_function = score_samples - `offset_`.
-        The offset is the opposite of `intercept_` and is provided for
-        consistency with other outlier detection algorithms.
-
-        .. versionadded:: 0.20
-
-    shape_fit_ : tuple of int of shape (n_dimensions_of_X,)
-        Array dimensions of training vector ``X``.
-
-    support_ : ndarray of shape (n_SV,)
-        Indices of support vectors.
-
-    support_vectors_ : ndarray of shape (n_SV, n_features)
-        Support vectors.
-
-    See Also
-    --------
-    sklearn.linear_model.SGDOneClassSVM : Solves linear One-Class SVM using
-        Stochastic Gradient Descent.
-    sklearn.neighbors.LocalOutlierFactor : Unsupervised Outlier Detection using
-        Local Outlier Factor (LOF).
-    sklearn.ensemble.IsolationForest : Isolation Forest Algorithm.
-
-    Examples
-    --------
-    >>> from sklearn.svm import OneClassSVM
-    >>> X = [[0], [0.44], [0.45], [0.46], [1]]
-    >>> clf = OneClassSVM(gamma='auto').fit(X)
-    >>> clf.predict(X)
-    array([-1,  1,  1,  1, -1])
-    >>> clf.score_samples(X)
-    array([1.7798..., 2.0547..., 2.0556..., 2.0561..., 1.7332...])
-    """
-
-    _impl = "one_class"
-
-    def __init__(
-        self,
-        *,
-        kernel="rbf",
-        degree=3,
-        gamma="scale",
-        coef0=0.0,
-        tol=1e-3,
-        nu=0.5,
-        shrinking=True,
-        cache_size=200,
-        verbose=False,
-        max_iter=-1,
-    ):
-
-        super().__init__(
-            kernel,
-            degree,
-            gamma,
-            coef0,
-            tol,
-            0.0,
-            nu,
-            0.0,
-            shrinking,
-            False,
-            cache_size,
-            None,
-            verbose,
-            max_iter,
-            random_state=None,
-        )
-
-    def fit(self, X, y=None, sample_weight=None, **params):
-        """Detect the soft boundary of the set of samples X.
-
-        Parameters
-        ----------
-        X : {array-like, sparse matrix} of shape (n_samples, n_features)
-            Set of samples, where `n_samples` is the number of samples and
-            `n_features` is the number of features.
-
-        y : Ignored
-            Not used, present for API consistency by convention.
-
-        sample_weight : array-like of shape (n_samples,), default=None
-            Per-sample weights. Rescale C per sample. Higher weights
-            force the classifier to put more emphasis on these points.
-
-        **params : dict
-            Additional fit parameters.
-
-            .. deprecated:: 1.0
-                The `fit` method will not longer accept extra keyword
-                parameters in 1.2. These keyword parameters were
-                already discarded.
-
-        Returns
-        -------
-        self : object
-            Fitted estimator.
-
-        Notes
-        -----
-        If X is not a C-ordered contiguous array it is copied.
-        """
-        # TODO: Remove in v1.2
-        if len(params) > 0:
-            warnings.warn(
-                "Passing additional keyword parameters has no effect and is "
-                "deprecated in 1.0. An error will be raised from 1.2 and "
-                "beyond. The ignored keyword parameter(s) are: "
-                f"{params.keys()}.",
-                FutureWarning,
-            )
-        super().fit(X, np.ones(_num_samples(X)), sample_weight=sample_weight)
-        self.offset_ = -self._intercept_
-        return self
-
-    def decision_function(self, X):
-        """Signed distance to the separating hyperplane.
-
-        Signed distance is positive for an inlier and negative for an outlier.
-
-        Parameters
-        ----------
-        X : array-like of shape (n_samples, n_features)
-            The data matrix.
-
-        Returns
-        -------
-        dec : ndarray of shape (n_samples,)
-            Returns the decision function of the samples.
-        """
-        dec = self._decision_function(X).ravel()
-        return dec
-
-    def score_samples(self, X):
-        """Raw scoring function of the samples.
-
-        Parameters
-        ----------
-        X : array-like of shape (n_samples, n_features)
-            The data matrix.
-
-        Returns
-        -------
-        score_samples : ndarray of shape (n_samples,)
-            Returns the (unshifted) scoring function of the samples.
-        """
-        return self.decision_function(X) + self.offset_
-
-    def predict(self, X):
-        """Perform classification on samples in X.
-
-        For a one-class model, +1 or -1 is returned.
-
-        Parameters
-        ----------
-        X : {array-like, sparse matrix} of shape (n_samples, n_features) or \
-                (n_samples_test, n_samples_train)
-            For kernel="precomputed", the expected shape of X is
-            (n_samples_test, n_samples_train).
-
-        Returns
-        -------
-        y_pred : ndarray of shape (n_samples,)
-            Class labels for samples in X.
-        """
-        y = super().predict(X)
-        return np.asarray(y, dtype=np.intp)
-
-    def _more_tags(self):
-        return {
-            "_xfail_checks": {
-                "check_sample_weights_invariance": (
-                    "zero sample_weight is not equivalent to removing samples"
-                ),
-            }
-        }
