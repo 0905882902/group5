@@ -1,62 +1,157 @@
-import os
-import sys
-from distutils.command.build import build as old_build
+"""distutils.command.build
+
+Implements the Distutils 'build' command."""
+
+import sys, os
+from distutils.core import Command
+from distutils.errors import DistutilsOptionError
 from distutils.util import get_platform
-from numpy.distutils.command.config_compiler import show_fortran_compilers
 
-class build(old_build):
 
-    sub_commands = [('config_cc',     lambda *args: True),
-                    ('config_fc',     lambda *args: True),
-                    ('build_src',     old_build.has_ext_modules),
-                    ] + old_build.sub_commands
+def show_compilers():
+    from distutils.ccompiler import show_compilers
+    show_compilers()
 
-    user_options = old_build.user_options + [
-        ('fcompiler=', None,
-         "specify the Fortran compiler type"),
-        ('warn-error', None,
-         "turn all warnings into errors (-Werror)"),
-        ('cpu-baseline=', None,
-         "specify a list of enabled baseline CPU optimizations"),
-        ('cpu-dispatch=', None,
-         "specify a list of dispatched CPU optimizations"),
-        ('disable-optimization', None,
-         "disable CPU optimized code(dispatch,simd,fast...)"),
-        ('simd-test=', None,
-         "specify a list of CPU optimizations to be tested against NumPy SIMD interface"),
+
+class build(Command):
+
+    description = "build everything needed to install"
+
+    user_options = [
+        ('build-base=', 'b',
+         "base directory for build library"),
+        ('build-purelib=', None,
+         "build directory for platform-neutral distributions"),
+        ('build-platlib=', None,
+         "build directory for platform-specific distributions"),
+        ('build-lib=', None,
+         "build directory for all distribution (defaults to either " +
+         "build-purelib or build-platlib"),
+        ('build-scripts=', None,
+         "build directory for scripts"),
+        ('build-temp=', 't',
+         "temporary build directory"),
+        ('plat-name=', 'p',
+         "platform name to build for, if supported "
+         "(default: %s)" % get_platform()),
+        ('compiler=', 'c',
+         "specify the compiler type"),
+        ('parallel=', 'j',
+         "number of parallel build jobs"),
+        ('debug', 'g',
+         "compile extensions and libraries with debugging information"),
+        ('force', 'f',
+         "forcibly build everything (ignore file timestamps)"),
+        ('executable=', 'e',
+         "specify final destination interpreter path (build.py)"),
         ]
 
-    help_options = old_build.help_options + [
-        ('help-fcompiler', None, "list available Fortran compilers",
-         show_fortran_compilers),
+    boolean_options = ['debug', 'force']
+
+    help_options = [
+        ('help-compiler', None,
+         "list available compilers", show_compilers),
         ]
 
     def initialize_options(self):
-        old_build.initialize_options(self)
-        self.fcompiler = None
-        self.warn_error = False
-        self.cpu_baseline = "min"
-        self.cpu_dispatch = "max -xop -fma4" # drop AMD legacy features by default
-        self.disable_optimization = False
-        """
-        the '_simd' module is a very large. Adding more dispatched features
-        will increase binary size and compile time. By default we minimize
-        the targeted features to those most commonly used by the NumPy SIMD interface(NPYV),
-        NOTE: any specified features will be ignored if they're:
-            - part of the baseline(--cpu-baseline)
-            - not part of dispatch-able features(--cpu-dispatch)
-            - not supported by compiler or platform
-        """
-        self.simd_test = "BASELINE SSE2 SSE42 XOP FMA4 (FMA3 AVX2) AVX512F " \
-                         "AVX512_SKX VSX VSX2 VSX3 VSX4 NEON ASIMD VX VXE VXE2"
+        self.build_base = 'build'
+        # these are decided only after 'build_base' has its final value
+        # (unless overridden by the user or client)
+        self.build_purelib = None
+        self.build_platlib = None
+        self.build_lib = None
+        self.build_temp = None
+        self.build_scripts = None
+        self.compiler = None
+        self.plat_name = None
+        self.debug = None
+        self.force = 0
+        self.executable = None
+        self.parallel = None
 
     def finalize_options(self):
-        build_scripts = self.build_scripts
-        old_build.finalize_options(self)
-        plat_specifier = ".{}-{}.{}".format(get_platform(), *sys.version_info[:2])
-        if build_scripts is None:
+        if self.plat_name is None:
+            self.plat_name = get_platform()
+        else:
+            # plat-name only supported for windows (other platforms are
+            # supported via ./configure flags, if at all).  Avoid misleading
+            # other platforms.
+            if os.name != 'nt':
+                raise DistutilsOptionError(
+                            "--plat-name only supported on Windows (try "
+                            "using './configure --help' on your platform)")
+
+        plat_specifier = ".%s-%d.%d" % (self.plat_name, *sys.version_info[:2])
+
+        # Make it so Python 2.x and Python 2.x with --with-pydebug don't
+        # share the same build directories. Doing so confuses the build
+        # process for C modules
+        if hasattr(sys, 'gettotalrefcount'):
+            plat_specifier += '-pydebug'
+
+        # 'build_purelib' and 'build_platlib' just default to 'lib' and
+        # 'lib.<plat>' under the base build directory.  We only use one of
+        # them for a given distribution, though --
+        if self.build_purelib is None:
+            self.build_purelib = os.path.join(self.build_base, 'lib')
+        if self.build_platlib is None:
+            self.build_platlib = os.path.join(self.build_base,
+                                              'lib' + plat_specifier)
+
+        # 'build_lib' is the actual directory that we will use for this
+        # particular module distribution -- if user didn't supply it, pick
+        # one of 'build_purelib' or 'build_platlib'.
+        if self.build_lib is None:
+            if self.distribution.has_ext_modules():
+                self.build_lib = self.build_platlib
+            else:
+                self.build_lib = self.build_purelib
+
+        # 'build_temp' -- temporary directory for compiler turds,
+        # "build/temp.<plat>"
+        if self.build_temp is None:
+            self.build_temp = os.path.join(self.build_base,
+                                           'temp' + plat_specifier)
+        if self.build_scripts is None:
             self.build_scripts = os.path.join(self.build_base,
-                                              'scripts' + plat_specifier)
+                                              'scripts-%d.%d' % sys.version_info[:2])
+
+        if self.executable is None and sys.executable:
+            self.executable = os.path.normpath(sys.executable)
+
+        if isinstance(self.parallel, str):
+            try:
+                self.parallel = int(self.parallel)
+            except ValueError:
+                raise DistutilsOptionError("parallel should be an integer")
 
     def run(self):
-        old_build.run(self)
+        # Run all relevant sub-commands.  This will be some subset of:
+        #  - build_py      - pure Python modules
+        #  - build_clib    - standalone C libraries
+        #  - build_ext     - Python extensions
+        #  - build_scripts - (Python) scripts
+        for cmd_name in self.get_sub_commands():
+            self.run_command(cmd_name)
+
+
+    # -- Predicates for the sub-command list ---------------------------
+
+    def has_pure_modules(self):
+        return self.distribution.has_pure_modules()
+
+    def has_c_libraries(self):
+        return self.distribution.has_c_libraries()
+
+    def has_ext_modules(self):
+        return self.distribution.has_ext_modules()
+
+    def has_scripts(self):
+        return self.distribution.has_scripts()
+
+
+    sub_commands = [('build_py',      has_pure_modules),
+                    ('build_clib',    has_c_libraries),
+                    ('build_ext',     has_ext_modules),
+                    ('build_scripts', has_scripts),
+                   ]

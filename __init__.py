@@ -1,15 +1,8 @@
-"""distutils
-
-The main package for the Python Module Distribution Utilities.  Normally
-used from a setup script as
-
-   from distutils.core import setup
-
-   setup (...)
-"""
-
+from distutils.command.bdist import bdist
 import sys
 
-__version__ = sys.version[:sys.version.index(' ')]
+if 'egg' not in bdist.format_commands:
+    bdist.format_command['egg'] = ('bdist_egg', "Python .egg file")
+    bdist.format_commands.append('egg')
 
-local = True
+del bdist, sys

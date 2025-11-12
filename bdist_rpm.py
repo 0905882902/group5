@@ -1,22 +1,31 @@
-import os
-import sys
-if 'setuptools' in sys.modules:
-    from setuptools.command.bdist_rpm import bdist_rpm as old_bdist_rpm
-else:
-    from distutils.command.bdist_rpm import bdist_rpm as old_bdist_rpm
+import distutils.command.bdist_rpm as orig
 
-class bdist_rpm(old_bdist_rpm):
+
+class bdist_rpm(orig.bdist_rpm):
+    """
+    Override the default bdist_rpm behavior to do the following:
+
+    1. Run egg_info to ensure the name and version are properly calculated.
+    2. Always run 'install' using --single-version-externally-managed to
+       disable eggs in RPM distributions.
+    """
+
+    def run(self):
+        # ensure distro name is up-to-date
+        self.run_command('egg_info')
+
+        orig.bdist_rpm.run(self)
 
     def _make_spec_file(self):
-        spec_file = old_bdist_rpm._make_spec_file(self)
-
-        # Replace hardcoded setup.py script name
-        # with the real setup script name.
-        setup_py = os.path.basename(sys.argv[0])
-        if setup_py == 'setup.py':
-            return spec_file
-        new_spec_file = []
-        for line in spec_file:
-            line = line.replace('setup.py', setup_py)
-            new_spec_file.append(line)
-        return new_spec_file
+        spec = orig.bdist_rpm._make_spec_file(self)
+        spec = [
+            line.replace(
+                "setup.py install ",
+                "setup.py install --single-version-externally-managed "
+            ).replace(
+                "%setup",
+                "%setup -n %{name}-%{unmangled_version}"
+            )
+            for line in spec
+        ]
+        return spec
