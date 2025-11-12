@@ -1,160 +1,201 @@
-from datetime import datetime
-
 import numpy as np
 import pytest
-from pytz import UTC
 
-from pandas._libs.tslibs import (
-    OutOfBoundsTimedelta,
-    astype_overflowsafe,
-    conversion,
-    iNaT,
-    timezones,
-    tz_convert_from_utc,
-    tzconversion,
-)
+from pandas.compat.numpy import np_version_gt2
 
+import pandas as pd
 from pandas import (
-    Timestamp,
-    date_range,
+    DataFrame,
+    MultiIndex,
 )
 import pandas._testing as tm
 
 
-def _compare_utc_to_local(tz_didx):
-    def f(x):
-        return tzconversion.tz_convert_from_utc_single(x, tz_didx.tz)
+def test_to_numpy(idx):
+    result = idx.to_numpy()
+    exp = idx.values
+    tm.assert_numpy_array_equal(result, exp)
 
-    result = tz_convert_from_utc(tz_didx.asi8, tz_didx.tz)
-    expected = np.vectorize(f)(tz_didx.asi8)
 
+def test_array_interface(idx):
+    # https://github.com/pandas-dev/pandas/pull/60046
+    result = np.asarray(idx)
+    expected = np.empty((6,), dtype=object)
+    expected[:] = [
+        ("foo", "one"),
+        ("foo", "two"),
+        ("bar", "one"),
+        ("baz", "two"),
+        ("qux", "one"),
+        ("qux", "two"),
+    ]
     tm.assert_numpy_array_equal(result, expected)
 
+    # it always gives a copy by default, but the values are cached, so results
+    # are still sharing memory
+    result_copy1 = np.asarray(idx)
+    result_copy2 = np.asarray(idx)
+    assert np.may_share_memory(result_copy1, result_copy2)
 
-def _compare_local_to_utc(tz_didx, naive_didx):
-    # Check that tz_localize behaves the same vectorized and pointwise.
-    err1 = err2 = None
-    try:
-        result = tzconversion.tz_localize_to_utc(naive_didx.asi8, tz_didx.tz)
-        err1 = None
-    except Exception as err:
-        err1 = err
+    # with explicit copy=True, then it is an actual copy
+    result_copy1 = np.array(idx, copy=True)
+    result_copy2 = np.array(idx, copy=True)
+    assert not np.may_share_memory(result_copy1, result_copy2)
 
-    try:
-        expected = naive_didx.map(lambda x: x.tz_localize(tz_didx.tz)).asi8
-    except Exception as err:
-        err2 = err
+    if not np_version_gt2:
+        # copy=False semantics are only supported in NumPy>=2.
+        return
 
-    if err1 is not None:
-        assert type(err1) == type(err2)
-    else:
-        assert err2 is None
-        tm.assert_numpy_array_equal(result, expected)
-
-
-def test_tz_localize_to_utc_copies():
-    # GH#46460
-    arr = np.arange(5, dtype="i8")
-    result = tz_convert_from_utc(arr, tz=UTC)
-    tm.assert_numpy_array_equal(result, arr)
-    assert not np.shares_memory(arr, result)
-
-    result = tz_convert_from_utc(arr, tz=None)
-    tm.assert_numpy_array_equal(result, arr)
-    assert not np.shares_memory(arr, result)
+    # for MultiIndex, copy=False is never allowed
+    msg = "Starting with NumPy 2.0, the behavior of the 'copy' keyword has changed"
+    with tm.assert_produces_warning(FutureWarning, match=msg):
+        np.array(idx, copy=False)
 
 
-def test_tz_convert_single_matches_tz_convert_hourly(tz_aware_fixture):
-    tz = tz_aware_fixture
-    tz_didx = date_range("2014-03-01", "2015-01-10", freq="h", tz=tz)
-    naive_didx = date_range("2014-03-01", "2015-01-10", freq="h")
+def test_to_frame():
+    tuples = [(1, "one"), (1, "two"), (2, "one"), (2, "two")]
 
-    _compare_utc_to_local(tz_didx)
-    _compare_local_to_utc(tz_didx, naive_didx)
+    index = MultiIndex.from_tuples(tuples)
+    result = index.to_frame(index=False)
+    expected = DataFrame(tuples)
+    tm.assert_frame_equal(result, expected)
+
+    result = index.to_frame()
+    expected.index = index
+    tm.assert_frame_equal(result, expected)
+
+    tuples = [(1, "one"), (1, "two"), (2, "one"), (2, "two")]
+    index = MultiIndex.from_tuples(tuples, names=["first", "second"])
+    result = index.to_frame(index=False)
+    expected = DataFrame(tuples)
+    expected.columns = ["first", "second"]
+    tm.assert_frame_equal(result, expected)
+
+    result = index.to_frame()
+    expected.index = index
+    tm.assert_frame_equal(result, expected)
+
+    # See GH-22580
+    index = MultiIndex.from_tuples(tuples)
+    result = index.to_frame(index=False, name=["first", "second"])
+    expected = DataFrame(tuples)
+    expected.columns = ["first", "second"]
+    tm.assert_frame_equal(result, expected)
+
+    result = index.to_frame(name=["first", "second"])
+    expected.index = index
+    expected.columns = ["first", "second"]
+    tm.assert_frame_equal(result, expected)
+
+    msg = "'name' must be a list / sequence of column names."
+    with pytest.raises(TypeError, match=msg):
+        index.to_frame(name="first")
+
+    msg = "'name' should have same length as number of levels on index."
+    with pytest.raises(ValueError, match=msg):
+        index.to_frame(name=["first"])
+
+    # Tests for datetime index
+    index = MultiIndex.from_product([range(5), pd.date_range("20130101", periods=3)])
+    result = index.to_frame(index=False)
+    expected = DataFrame(
+        {
+            0: np.repeat(np.arange(5, dtype="int64"), 3),
+            1: np.tile(pd.date_range("20130101", periods=3), 5),
+        }
+    )
+    tm.assert_frame_equal(result, expected)
+
+    result = index.to_frame()
+    expected.index = index
+    tm.assert_frame_equal(result, expected)
+
+    # See GH-22580
+    result = index.to_frame(index=False, name=["first", "second"])
+    expected = DataFrame(
+        {
+            "first": np.repeat(np.arange(5, dtype="int64"), 3),
+            "second": np.tile(pd.date_range("20130101", periods=3), 5),
+        }
+    )
+    tm.assert_frame_equal(result, expected)
+
+    result = index.to_frame(name=["first", "second"])
+    expected.index = index
+    tm.assert_frame_equal(result, expected)
 
 
-@pytest.mark.parametrize("freq", ["D", "YE"])
-def test_tz_convert_single_matches_tz_convert(tz_aware_fixture, freq):
-    tz = tz_aware_fixture
-    tz_didx = date_range("2018-01-01", "2020-01-01", freq=freq, tz=tz)
-    naive_didx = date_range("2018-01-01", "2020-01-01", freq=freq)
+def test_to_frame_dtype_fidelity():
+    # GH 22420
+    mi = MultiIndex.from_arrays(
+        [
+            pd.date_range("19910905", periods=6, tz="US/Eastern"),
+            [1, 1, 1, 2, 2, 2],
+            pd.Categorical(["a", "a", "b", "b", "c", "c"], ordered=True),
+            ["x", "x", "y", "z", "x", "y"],
+        ],
+        names=["dates", "a", "b", "c"],
+    )
+    original_dtypes = {name: mi.levels[i].dtype for i, name in enumerate(mi.names)}
 
-    _compare_utc_to_local(tz_didx)
-    _compare_local_to_utc(tz_didx, naive_didx)
+    expected_df = DataFrame(
+        {
+            "dates": pd.date_range("19910905", periods=6, tz="US/Eastern"),
+            "a": [1, 1, 1, 2, 2, 2],
+            "b": pd.Categorical(["a", "a", "b", "b", "c", "c"], ordered=True),
+            "c": ["x", "x", "y", "z", "x", "y"],
+        }
+    )
+    df = mi.to_frame(index=False)
+    df_dtypes = df.dtypes.to_dict()
 
-
-@pytest.mark.parametrize(
-    "arr",
-    [
-        pytest.param(np.array([], dtype=np.int64), id="empty"),
-        pytest.param(np.array([iNaT], dtype=np.int64), id="all_nat"),
-    ],
-)
-def test_tz_convert_corner(arr):
-    result = tz_convert_from_utc(arr, timezones.maybe_get_tz("Asia/Tokyo"))
-    tm.assert_numpy_array_equal(result, arr)
-
-
-def test_tz_convert_readonly():
-    # GH#35530
-    arr = np.array([0], dtype=np.int64)
-    arr.setflags(write=False)
-    result = tz_convert_from_utc(arr, UTC)
-    tm.assert_numpy_array_equal(result, arr)
+    tm.assert_frame_equal(df, expected_df)
+    assert original_dtypes == df_dtypes
 
 
-@pytest.mark.parametrize("copy", [True, False])
-@pytest.mark.parametrize("dtype", ["M8[ns]", "M8[s]"])
-def test_length_zero_copy(dtype, copy):
-    arr = np.array([], dtype=dtype)
-    result = astype_overflowsafe(arr, copy=copy, dtype=np.dtype("M8[ns]"))
-    if copy:
-        assert not np.shares_memory(result, arr)
-    elif arr.dtype == result.dtype:
-        assert result is arr
-    else:
-        assert not np.shares_memory(result, arr)
-
-
-def test_ensure_datetime64ns_bigendian():
-    # GH#29684
-    arr = np.array([np.datetime64(1, "ms")], dtype=">M8[ms]")
-    result = astype_overflowsafe(arr, dtype=np.dtype("M8[ns]"))
-
-    expected = np.array([np.datetime64(1, "ms")], dtype="M8[ns]")
-    tm.assert_numpy_array_equal(result, expected)
-
-
-def test_ensure_timedelta64ns_overflows():
-    arr = np.arange(10).astype("m8[Y]") * 100
-    msg = r"Cannot convert 300 years to timedelta64\[ns\] without overflow"
-    with pytest.raises(OutOfBoundsTimedelta, match=msg):
-        astype_overflowsafe(arr, dtype=np.dtype("m8[ns]"))
-
-
-class SubDatetime(datetime):
-    pass
-
-
-@pytest.mark.parametrize(
-    "dt, expected",
-    [
-        pytest.param(
-            Timestamp("2000-01-01"), Timestamp("2000-01-01", tz=UTC), id="timestamp"
-        ),
-        pytest.param(
-            datetime(2000, 1, 1), datetime(2000, 1, 1, tzinfo=UTC), id="datetime"
-        ),
-        pytest.param(
-            SubDatetime(2000, 1, 1),
-            SubDatetime(2000, 1, 1, tzinfo=UTC),
-            id="subclassed_datetime",
-        ),
-    ],
-)
-def test_localize_pydatetime_dt_types(dt, expected):
-    # GH 25851
-    # ensure that subclassed datetime works with
-    # localize_pydatetime
-    result = conversion.localize_pydatetime(dt, UTC)
+def test_to_frame_resulting_column_order():
+    # GH 22420
+    expected = ["z", 0, "a"]
+    mi = MultiIndex.from_arrays(
+        [["a", "b", "c"], ["x", "y", "z"], ["q", "w", "e"]], names=expected
+    )
+    result = mi.to_frame().columns.tolist()
     assert result == expected
+
+
+def test_to_frame_duplicate_labels():
+    # GH 45245
+    data = [(1, 2), (3, 4)]
+    names = ["a", "a"]
+    index = MultiIndex.from_tuples(data, names=names)
+    with pytest.raises(ValueError, match="Cannot create duplicate column labels"):
+        index.to_frame()
+
+    result = index.to_frame(allow_duplicates=True)
+    expected = DataFrame(data, index=index, columns=names)
+    tm.assert_frame_equal(result, expected)
+
+    names = [None, 0]
+    index = MultiIndex.from_tuples(data, names=names)
+    with pytest.raises(ValueError, match="Cannot create duplicate column labels"):
+        index.to_frame()
+
+    result = index.to_frame(allow_duplicates=True)
+    expected = DataFrame(data, index=index, columns=[0, 0])
+    tm.assert_frame_equal(result, expected)
+
+
+def test_to_flat_index(idx):
+    expected = pd.Index(
+        (
+            ("foo", "one"),
+            ("foo", "two"),
+            ("bar", "one"),
+            ("baz", "two"),
+            ("qux", "one"),
+            ("qux", "two"),
+        ),
+        tupleize_cols=False,
+    )
+    result = idx.to_flat_index()
+    tm.assert_index_equal(result, expected)

@@ -1,860 +1,691 @@
-from datetime import (
-    date,
-    datetime,
-)
-import itertools
-
 import numpy as np
 import pytest
 
-from pandas.core.dtypes.cast import construct_1d_object_array_from_listlike
+from pandas._libs.tslibs.period import IncompatibleFrequency
 
-import pandas as pd
+from pandas.core.dtypes.dtypes import PeriodDtype
+
 from pandas import (
     Index,
-    MultiIndex,
+    NaT,
+    Period,
+    PeriodIndex,
     Series,
-    Timestamp,
     date_range,
+    offsets,
+    period_range,
 )
 import pandas._testing as tm
+from pandas.core.arrays import PeriodArray
 
 
-def test_constructor_single_level():
-    result = MultiIndex(
-        levels=[["foo", "bar", "baz", "qux"]], codes=[[0, 1, 2, 3]], names=["first"]
+class TestPeriodIndexDisallowedFreqs:
+    @pytest.mark.parametrize(
+        "freq,freq_depr",
+        [
+            ("2M", "2ME"),
+            ("2Q-MAR", "2QE-MAR"),
+            ("2Y-FEB", "2YE-FEB"),
+            ("2M", "2me"),
+            ("2Q-MAR", "2qe-MAR"),
+            ("2Y-FEB", "2yE-feb"),
+        ],
     )
-    assert isinstance(result, MultiIndex)
-    expected = Index(["foo", "bar", "baz", "qux"], name="first")
-    tm.assert_index_equal(result.levels[0], expected)
-    assert result.names == ["first"]
+    def test_period_index_offsets_frequency_error_message(self, freq, freq_depr):
+        # GH#52064
+        msg = f"for Period, please use '{freq[1:]}' instead of '{freq_depr[1:]}'"
+
+        with pytest.raises(ValueError, match=msg):
+            PeriodIndex(["2020-01-01", "2020-01-02"], freq=freq_depr)
+
+        with pytest.raises(ValueError, match=msg):
+            period_range(start="2020-01-01", end="2020-01-02", freq=freq_depr)
+
+    @pytest.mark.parametrize("freq_depr", ["2SME", "2sme", "2CBME", "2BYE", "2Bye"])
+    def test_period_index_frequency_invalid_freq(self, freq_depr):
+        # GH#9586
+        msg = f"Invalid frequency: {freq_depr[1:]}"
+
+        with pytest.raises(ValueError, match=msg):
+            period_range("2020-01", "2020-05", freq=freq_depr)
+        with pytest.raises(ValueError, match=msg):
+            PeriodIndex(["2020-01", "2020-05"], freq=freq_depr)
+
+    @pytest.mark.parametrize("freq", ["2BQE-SEP", "2BYE-MAR", "2BME"])
+    def test_period_index_from_datetime_index_invalid_freq(self, freq):
+        # GH#56899
+        msg = f"Invalid frequency: {freq[1:]}"
+
+        rng = date_range("01-Jan-2012", periods=8, freq=freq)
+        with pytest.raises(ValueError, match=msg):
+            rng.to_period()
 
 
-def test_constructor_no_levels():
-    msg = "non-zero number of levels/codes"
-    with pytest.raises(ValueError, match=msg):
-        MultiIndex(levels=[], codes=[])
+class TestPeriodIndex:
+    def test_from_ordinals(self):
+        Period(ordinal=-1000, freq="Y")
+        Period(ordinal=0, freq="Y")
 
-    msg = "Must pass both levels and codes"
-    with pytest.raises(TypeError, match=msg):
-        MultiIndex(levels=[])
-    with pytest.raises(TypeError, match=msg):
-        MultiIndex(codes=[])
+        msg = "The 'ordinal' keyword in PeriodIndex is deprecated"
+        with tm.assert_produces_warning(FutureWarning, match=msg):
+            idx1 = PeriodIndex(ordinal=[-1, 0, 1], freq="Y")
+        with tm.assert_produces_warning(FutureWarning, match=msg):
+            idx2 = PeriodIndex(ordinal=np.array([-1, 0, 1]), freq="Y")
+        tm.assert_index_equal(idx1, idx2)
 
+        alt1 = PeriodIndex.from_ordinals([-1, 0, 1], freq="Y")
+        tm.assert_index_equal(alt1, idx1)
 
-def test_constructor_nonhashable_names():
-    # GH 20527
-    levels = [[1, 2], ["one", "two"]]
-    codes = [[0, 0, 1, 1], [0, 1, 0, 1]]
-    names = (["foo"], ["bar"])
-    msg = r"MultiIndex\.name must be a hashable type"
-    with pytest.raises(TypeError, match=msg):
-        MultiIndex(levels=levels, codes=codes, names=names)
+        alt2 = PeriodIndex.from_ordinals(np.array([-1, 0, 1]), freq="Y")
+        tm.assert_index_equal(alt2, idx2)
 
-    # With .rename()
-    mi = MultiIndex(
-        levels=[[1, 2], ["one", "two"]],
-        codes=[[0, 0, 1, 1], [0, 1, 0, 1]],
-        names=("foo", "bar"),
-    )
-    renamed = [["fooo"], ["barr"]]
-    with pytest.raises(TypeError, match=msg):
-        mi.rename(names=renamed)
+    def test_keyword_mismatch(self):
+        # GH#55961 we should get exactly one of data/ordinals/**fields
+        per = Period("2016-01-01", "D")
+        depr_msg1 = "The 'ordinal' keyword in PeriodIndex is deprecated"
+        depr_msg2 = "Constructing PeriodIndex from fields is deprecated"
 
-    # With .set_names()
-    with pytest.raises(TypeError, match=msg):
-        mi.set_names(names=renamed)
+        err_msg1 = "Cannot pass both data and ordinal"
+        with pytest.raises(ValueError, match=err_msg1):
+            with tm.assert_produces_warning(FutureWarning, match=depr_msg1):
+                PeriodIndex(data=[per], ordinal=[per.ordinal], freq=per.freq)
 
+        err_msg2 = "Cannot pass both data and fields"
+        with pytest.raises(ValueError, match=err_msg2):
+            with tm.assert_produces_warning(FutureWarning, match=depr_msg2):
+                PeriodIndex(data=[per], year=[per.year], freq=per.freq)
 
-def test_constructor_mismatched_codes_levels(idx):
-    codes = [np.array([1]), np.array([2]), np.array([3])]
-    levels = ["a"]
+        err_msg3 = "Cannot pass both ordinal and fields"
+        with pytest.raises(ValueError, match=err_msg3):
+            with tm.assert_produces_warning(FutureWarning, match=depr_msg2):
+                PeriodIndex(ordinal=[per.ordinal], year=[per.year], freq=per.freq)
 
-    msg = "Length of levels and codes must be the same"
-    with pytest.raises(ValueError, match=msg):
-        MultiIndex(levels=levels, codes=codes)
+    def test_construction_base_constructor(self):
+        # GH 13664
+        arr = [Period("2011-01", freq="M"), NaT, Period("2011-03", freq="M")]
+        tm.assert_index_equal(Index(arr), PeriodIndex(arr))
+        tm.assert_index_equal(Index(np.array(arr)), PeriodIndex(np.array(arr)))
 
-    length_error = (
-        r"On level 0, code max \(3\) >= length of level \(1\)\. "
-        "NOTE: this index is in an inconsistent state"
-    )
-    label_error = r"Unequal code lengths: \[4, 2\]"
-    code_value_error = r"On level 0, code value \(-2\) < -1"
+        arr = [np.nan, NaT, Period("2011-03", freq="M")]
+        tm.assert_index_equal(Index(arr), PeriodIndex(arr))
+        tm.assert_index_equal(Index(np.array(arr)), PeriodIndex(np.array(arr)))
 
-    # important to check that it's looking at the right thing.
-    with pytest.raises(ValueError, match=length_error):
-        MultiIndex(levels=[["a"], ["b"]], codes=[[0, 1, 2, 3], [0, 3, 4, 1]])
+        arr = [Period("2011-01", freq="M"), NaT, Period("2011-03", freq="D")]
+        tm.assert_index_equal(Index(arr), Index(arr, dtype=object))
 
-    with pytest.raises(ValueError, match=label_error):
-        MultiIndex(levels=[["a"], ["b"]], codes=[[0, 0, 0, 0], [0, 0]])
+        tm.assert_index_equal(Index(np.array(arr)), Index(np.array(arr), dtype=object))
 
-    # external API
-    with pytest.raises(ValueError, match=length_error):
-        idx.copy().set_levels([["a"], ["b"]])
+    def test_base_constructor_with_period_dtype(self):
+        dtype = PeriodDtype("D")
+        values = ["2011-01-01", "2012-03-04", "2014-05-01"]
+        result = Index(values, dtype=dtype)
 
-    with pytest.raises(ValueError, match=label_error):
-        idx.copy().set_codes([[0, 0, 0, 0], [0, 0]])
-
-    # test set_codes with verify_integrity=False
-    # the setting should not raise any value error
-    idx.copy().set_codes(codes=[[0, 0, 0, 0], [0, 0]], verify_integrity=False)
-
-    # code value smaller than -1
-    with pytest.raises(ValueError, match=code_value_error):
-        MultiIndex(levels=[["a"], ["b"]], codes=[[0, -2], [0, 0]])
-
-
-def test_na_levels():
-    # GH26408
-    # test if codes are re-assigned value -1 for levels
-    # with missing values (NaN, NaT, None)
-    result = MultiIndex(
-        levels=[[np.nan, None, pd.NaT, 128, 2]], codes=[[0, -1, 1, 2, 3, 4]]
-    )
-    expected = MultiIndex(
-        levels=[[np.nan, None, pd.NaT, 128, 2]], codes=[[-1, -1, -1, -1, 3, 4]]
-    )
-    tm.assert_index_equal(result, expected)
-
-    result = MultiIndex(
-        levels=[[np.nan, "s", pd.NaT, 128, None]], codes=[[0, -1, 1, 2, 3, 4]]
-    )
-    expected = MultiIndex(
-        levels=[[np.nan, "s", pd.NaT, 128, None]], codes=[[-1, -1, 1, -1, 3, -1]]
-    )
-    tm.assert_index_equal(result, expected)
-
-    # verify set_levels and set_codes
-    result = MultiIndex(
-        levels=[[1, 2, 3, 4, 5]], codes=[[0, -1, 1, 2, 3, 4]]
-    ).set_levels([[np.nan, "s", pd.NaT, 128, None]])
-    tm.assert_index_equal(result, expected)
-
-    result = MultiIndex(
-        levels=[[np.nan, "s", pd.NaT, 128, None]], codes=[[1, 2, 2, 2, 2, 2]]
-    ).set_codes([[0, -1, 1, 2, 3, 4]])
-    tm.assert_index_equal(result, expected)
-
-
-def test_copy_in_constructor():
-    levels = np.array(["a", "b", "c"])
-    codes = np.array([1, 1, 2, 0, 0, 1, 1])
-    val = codes[0]
-    mi = MultiIndex(levels=[levels, levels], codes=[codes, codes], copy=True)
-    assert mi.codes[0][0] == val
-    codes[0] = 15
-    assert mi.codes[0][0] == val
-    val = levels[0]
-    levels[0] = "PANDA"
-    assert mi.levels[0][0] == val
-
-
-# ----------------------------------------------------------------------------
-# from_arrays
-# ----------------------------------------------------------------------------
-def test_from_arrays(idx):
-    arrays = [
-        np.asarray(lev).take(level_codes)
-        for lev, level_codes in zip(idx.levels, idx.codes)
-    ]
-
-    # list of arrays as input
-    result = MultiIndex.from_arrays(arrays, names=idx.names)
-    tm.assert_index_equal(result, idx)
-
-    # infer correctly
-    result = MultiIndex.from_arrays([[pd.NaT, Timestamp("20130101")], ["a", "b"]])
-    assert result.levels[0].equals(Index([Timestamp("20130101")]))
-    assert result.levels[1].equals(Index(["a", "b"]))
-
-
-def test_from_arrays_iterator(idx):
-    # GH 18434
-    arrays = [
-        np.asarray(lev).take(level_codes)
-        for lev, level_codes in zip(idx.levels, idx.codes)
-    ]
-
-    # iterator as input
-    result = MultiIndex.from_arrays(iter(arrays), names=idx.names)
-    tm.assert_index_equal(result, idx)
-
-    # invalid iterator input
-    msg = "Input must be a list / sequence of array-likes."
-    with pytest.raises(TypeError, match=msg):
-        MultiIndex.from_arrays(0)
-
-
-def test_from_arrays_tuples(idx):
-    arrays = tuple(
-        tuple(np.asarray(lev).take(level_codes))
-        for lev, level_codes in zip(idx.levels, idx.codes)
-    )
-
-    # tuple of tuples as input
-    result = MultiIndex.from_arrays(arrays, names=idx.names)
-    tm.assert_index_equal(result, idx)
-
-
-@pytest.mark.parametrize(
-    ("idx1", "idx2"),
-    [
-        (
-            pd.period_range("2011-01-01", freq="D", periods=3),
-            pd.period_range("2015-01-01", freq="h", periods=3),
-        ),
-        (
-            date_range("2015-01-01 10:00", freq="D", periods=3, tz="US/Eastern"),
-            date_range("2015-01-01 10:00", freq="h", periods=3, tz="Asia/Tokyo"),
-        ),
-        (
-            pd.timedelta_range("1 days", freq="D", periods=3),
-            pd.timedelta_range("2 hours", freq="h", periods=3),
-        ),
-    ],
-)
-def test_from_arrays_index_series_period_datetimetz_and_timedelta(idx1, idx2):
-    result = MultiIndex.from_arrays([idx1, idx2])
-    tm.assert_index_equal(result.get_level_values(0), idx1)
-    tm.assert_index_equal(result.get_level_values(1), idx2)
-
-    result2 = MultiIndex.from_arrays([Series(idx1), Series(idx2)])
-    tm.assert_index_equal(result2.get_level_values(0), idx1)
-    tm.assert_index_equal(result2.get_level_values(1), idx2)
-
-    tm.assert_index_equal(result, result2)
-
-
-def test_from_arrays_index_datetimelike_mixed():
-    idx1 = date_range("2015-01-01 10:00", freq="D", periods=3, tz="US/Eastern")
-    idx2 = date_range("2015-01-01 10:00", freq="h", periods=3)
-    idx3 = pd.timedelta_range("1 days", freq="D", periods=3)
-    idx4 = pd.period_range("2011-01-01", freq="D", periods=3)
-
-    result = MultiIndex.from_arrays([idx1, idx2, idx3, idx4])
-    tm.assert_index_equal(result.get_level_values(0), idx1)
-    tm.assert_index_equal(result.get_level_values(1), idx2)
-    tm.assert_index_equal(result.get_level_values(2), idx3)
-    tm.assert_index_equal(result.get_level_values(3), idx4)
-
-    result2 = MultiIndex.from_arrays(
-        [Series(idx1), Series(idx2), Series(idx3), Series(idx4)]
-    )
-    tm.assert_index_equal(result2.get_level_values(0), idx1)
-    tm.assert_index_equal(result2.get_level_values(1), idx2)
-    tm.assert_index_equal(result2.get_level_values(2), idx3)
-    tm.assert_index_equal(result2.get_level_values(3), idx4)
-
-    tm.assert_index_equal(result, result2)
-
-
-def test_from_arrays_index_series_categorical():
-    # GH13743
-    idx1 = pd.CategoricalIndex(list("abcaab"), categories=list("bac"), ordered=False)
-    idx2 = pd.CategoricalIndex(list("abcaab"), categories=list("bac"), ordered=True)
-
-    result = MultiIndex.from_arrays([idx1, idx2])
-    tm.assert_index_equal(result.get_level_values(0), idx1)
-    tm.assert_index_equal(result.get_level_values(1), idx2)
-
-    result2 = MultiIndex.from_arrays([Series(idx1), Series(idx2)])
-    tm.assert_index_equal(result2.get_level_values(0), idx1)
-    tm.assert_index_equal(result2.get_level_values(1), idx2)
-
-    result3 = MultiIndex.from_arrays([idx1.values, idx2.values])
-    tm.assert_index_equal(result3.get_level_values(0), idx1)
-    tm.assert_index_equal(result3.get_level_values(1), idx2)
-
-
-def test_from_arrays_empty():
-    # 0 levels
-    msg = "Must pass non-zero number of levels/codes"
-    with pytest.raises(ValueError, match=msg):
-        MultiIndex.from_arrays(arrays=[])
-
-    # 1 level
-    result = MultiIndex.from_arrays(arrays=[[]], names=["A"])
-    assert isinstance(result, MultiIndex)
-    expected = Index([], name="A")
-    tm.assert_index_equal(result.levels[0], expected)
-    assert result.names == ["A"]
-
-    # N levels
-    for N in [2, 3]:
-        arrays = [[]] * N
-        names = list("ABC")[:N]
-        result = MultiIndex.from_arrays(arrays=arrays, names=names)
-        expected = MultiIndex(levels=[[]] * N, codes=[[]] * N, names=names)
+        expected = PeriodIndex(values, dtype=dtype)
         tm.assert_index_equal(result, expected)
 
-
-@pytest.mark.parametrize(
-    "invalid_sequence_of_arrays",
-    [
-        1,
-        [1],
-        [1, 2],
-        [[1], 2],
-        [1, [2]],
-        "a",
-        ["a"],
-        ["a", "b"],
-        [["a"], "b"],
-        (1,),
-        (1, 2),
-        ([1], 2),
-        (1, [2]),
-        "a",
-        ("a",),
-        ("a", "b"),
-        (["a"], "b"),
-        [(1,), 2],
-        [1, (2,)],
-        [("a",), "b"],
-        ((1,), 2),
-        (1, (2,)),
-        (("a",), "b"),
-    ],
-)
-def test_from_arrays_invalid_input(invalid_sequence_of_arrays):
-    msg = "Input must be a list / sequence of array-likes"
-    with pytest.raises(TypeError, match=msg):
-        MultiIndex.from_arrays(arrays=invalid_sequence_of_arrays)
-
-
-@pytest.mark.parametrize(
-    "idx1, idx2", [([1, 2, 3], ["a", "b"]), ([], ["a", "b"]), ([1, 2, 3], [])]
-)
-def test_from_arrays_different_lengths(idx1, idx2):
-    # see gh-13599
-    msg = "^all arrays must be same length$"
-    with pytest.raises(ValueError, match=msg):
-        MultiIndex.from_arrays([idx1, idx2])
-
-
-def test_from_arrays_respects_none_names():
-    # GH27292
-    a = Series([1, 2, 3], name="foo")
-    b = Series(["a", "b", "c"], name="bar")
-
-    result = MultiIndex.from_arrays([a, b], names=None)
-    expected = MultiIndex(
-        levels=[[1, 2, 3], ["a", "b", "c"]], codes=[[0, 1, 2], [0, 1, 2]], names=None
+    @pytest.mark.parametrize(
+        "values_constructor", [list, np.array, PeriodIndex, PeriodArray._from_sequence]
     )
-
-    tm.assert_index_equal(result, expected)
-
-
-# ----------------------------------------------------------------------------
-# from_tuples
-# ----------------------------------------------------------------------------
-def test_from_tuples():
-    msg = "Cannot infer number of levels from empty list"
-    with pytest.raises(TypeError, match=msg):
-        MultiIndex.from_tuples([])
-
-    expected = MultiIndex(
-        levels=[[1, 3], [2, 4]], codes=[[0, 1], [0, 1]], names=["a", "b"]
-    )
-
-    # input tuples
-    result = MultiIndex.from_tuples(((1, 2), (3, 4)), names=["a", "b"])
-    tm.assert_index_equal(result, expected)
-
-
-def test_from_tuples_iterator():
-    # GH 18434
-    # input iterator for tuples
-    expected = MultiIndex(
-        levels=[[1, 3], [2, 4]], codes=[[0, 1], [0, 1]], names=["a", "b"]
-    )
-
-    result = MultiIndex.from_tuples(zip([1, 3], [2, 4]), names=["a", "b"])
-    tm.assert_index_equal(result, expected)
-
-    # input non-iterables
-    msg = "Input must be a list / sequence of tuple-likes."
-    with pytest.raises(TypeError, match=msg):
-        MultiIndex.from_tuples(0)
-
-
-def test_from_tuples_empty():
-    # GH 16777
-    result = MultiIndex.from_tuples([], names=["a", "b"])
-    expected = MultiIndex.from_arrays(arrays=[[], []], names=["a", "b"])
-    tm.assert_index_equal(result, expected)
-
-
-def test_from_tuples_index_values(idx):
-    result = MultiIndex.from_tuples(idx)
-    assert (result.values == idx.values).all()
-
-
-def test_tuples_with_name_string():
-    # GH 15110 and GH 14848
-
-    li = [(0, 0, 1), (0, 1, 0), (1, 0, 0)]
-    msg = "Names should be list-like for a MultiIndex"
-    with pytest.raises(ValueError, match=msg):
-        Index(li, name="abc")
-    with pytest.raises(ValueError, match=msg):
-        Index(li, name="a")
-
-
-def test_from_tuples_with_tuple_label():
-    # GH 15457
-    expected = pd.DataFrame(
-        [[2, 1, 2], [4, (1, 2), 3]], columns=["a", "b", "c"]
-    ).set_index(["a", "b"])
-    idx = MultiIndex.from_tuples([(2, 1), (4, (1, 2))], names=("a", "b"))
-    result = pd.DataFrame([2, 3], columns=["c"], index=idx)
-    tm.assert_frame_equal(expected, result)
-
-
-# ----------------------------------------------------------------------------
-# from_product
-# ----------------------------------------------------------------------------
-def test_from_product_empty_zero_levels():
-    # 0 levels
-    msg = "Must pass non-zero number of levels/codes"
-    with pytest.raises(ValueError, match=msg):
-        MultiIndex.from_product([])
-
-
-def test_from_product_empty_one_level():
-    result = MultiIndex.from_product([[]], names=["A"])
-    expected = Index([], name="A")
-    tm.assert_index_equal(result.levels[0], expected)
-    assert result.names == ["A"]
-
-
-@pytest.mark.parametrize(
-    "first, second", [([], []), (["foo", "bar", "baz"], []), ([], ["a", "b", "c"])]
-)
-def test_from_product_empty_two_levels(first, second):
-    names = ["A", "B"]
-    result = MultiIndex.from_product([first, second], names=names)
-    expected = MultiIndex(levels=[first, second], codes=[[], []], names=names)
-    tm.assert_index_equal(result, expected)
-
-
-@pytest.mark.parametrize("N", list(range(4)))
-def test_from_product_empty_three_levels(N):
-    # GH12258
-    names = ["A", "B", "C"]
-    lvl2 = list(range(N))
-    result = MultiIndex.from_product([[], lvl2, []], names=names)
-    expected = MultiIndex(levels=[[], lvl2, []], codes=[[], [], []], names=names)
-    tm.assert_index_equal(result, expected)
-
-
-@pytest.mark.parametrize(
-    "invalid_input", [1, [1], [1, 2], [[1], 2], "a", ["a"], ["a", "b"], [["a"], "b"]]
-)
-def test_from_product_invalid_input(invalid_input):
-    msg = r"Input must be a list / sequence of iterables|Input must be list-like"
-    with pytest.raises(TypeError, match=msg):
-        MultiIndex.from_product(iterables=invalid_input)
-
-
-def test_from_product_datetimeindex():
-    dt_index = date_range("2000-01-01", periods=2)
-    mi = MultiIndex.from_product([[1, 2], dt_index])
-    etalon = construct_1d_object_array_from_listlike(
-        [
-            (1, Timestamp("2000-01-01")),
-            (1, Timestamp("2000-01-02")),
-            (2, Timestamp("2000-01-01")),
-            (2, Timestamp("2000-01-02")),
+    def test_index_object_dtype(self, values_constructor):
+        # Index(periods, dtype=object) is an Index (not an PeriodIndex)
+        periods = [
+            Period("2011-01", freq="M"),
+            NaT,
+            Period("2011-03", freq="M"),
         ]
-    )
-    tm.assert_numpy_array_equal(mi.values, etalon)
+        values = values_constructor(periods)
+        result = Index(values, dtype=object)
 
+        assert type(result) is Index
+        tm.assert_numpy_array_equal(result.values, np.array(values))
 
-def test_from_product_rangeindex():
-    # RangeIndex is preserved by factorize, so preserved in levels
-    rng = Index(range(5))
-    other = ["a", "b"]
-    mi = MultiIndex.from_product([rng, other])
-    tm.assert_index_equal(mi._levels[0], rng, exact=True)
+    def test_constructor_use_start_freq(self):
+        # GH #1118
+        msg1 = "Period with BDay freq is deprecated"
+        with tm.assert_produces_warning(FutureWarning, match=msg1):
+            p = Period("4/2/2012", freq="B")
+        msg2 = r"PeriodDtype\[B\] is deprecated"
+        with tm.assert_produces_warning(FutureWarning, match=msg2):
+            expected = period_range(start="4/2/2012", periods=10, freq="B")
 
+        with tm.assert_produces_warning(FutureWarning, match=msg2):
+            index = period_range(start=p, periods=10)
+        tm.assert_index_equal(index, expected)
 
-@pytest.mark.parametrize("ordered", [False, True])
-@pytest.mark.parametrize("f", [lambda x: x, lambda x: Series(x), lambda x: x.values])
-def test_from_product_index_series_categorical(ordered, f):
-    # GH13743
-    first = ["foo", "bar"]
+    def test_constructor_field_arrays(self):
+        # GH #1264
 
-    idx = pd.CategoricalIndex(list("abcaab"), categories=list("bac"), ordered=ordered)
-    expected = pd.CategoricalIndex(
-        list("abcaab") + list("abcaab"), categories=list("bac"), ordered=ordered
-    )
+        years = np.arange(1990, 2010).repeat(4)[2:-2]
+        quarters = np.tile(np.arange(1, 5), 20)[2:-2]
 
-    result = MultiIndex.from_product([first, f(idx)])
-    tm.assert_index_equal(result.get_level_values(1), expected)
+        depr_msg = "Constructing PeriodIndex from fields is deprecated"
+        with tm.assert_produces_warning(FutureWarning, match=depr_msg):
+            index = PeriodIndex(year=years, quarter=quarters, freq="Q-DEC")
+        expected = period_range("1990Q3", "2009Q2", freq="Q-DEC")
+        tm.assert_index_equal(index, expected)
 
+        with tm.assert_produces_warning(FutureWarning, match=depr_msg):
+            index2 = PeriodIndex(year=years, quarter=quarters, freq="2Q-DEC")
+        tm.assert_numpy_array_equal(index.asi8, index2.asi8)
 
-def test_from_product():
-    first = ["foo", "bar", "buz"]
-    second = ["a", "b", "c"]
-    names = ["first", "second"]
-    result = MultiIndex.from_product([first, second], names=names)
+        with tm.assert_produces_warning(FutureWarning, match=depr_msg):
+            index = PeriodIndex(year=years, quarter=quarters)
+        tm.assert_index_equal(index, expected)
 
-    tuples = [
-        ("foo", "a"),
-        ("foo", "b"),
-        ("foo", "c"),
-        ("bar", "a"),
-        ("bar", "b"),
-        ("bar", "c"),
-        ("buz", "a"),
-        ("buz", "b"),
-        ("buz", "c"),
-    ]
-    expected = MultiIndex.from_tuples(tuples, names=names)
+        years = [2007, 2007, 2007]
+        months = [1, 2]
 
-    tm.assert_index_equal(result, expected)
+        msg = "Mismatched Period array lengths"
+        with pytest.raises(ValueError, match=msg):
+            with tm.assert_produces_warning(FutureWarning, match=depr_msg):
+                PeriodIndex(year=years, month=months, freq="M")
+        with pytest.raises(ValueError, match=msg):
+            with tm.assert_produces_warning(FutureWarning, match=depr_msg):
+                PeriodIndex(year=years, month=months, freq="2M")
 
+        years = [2007, 2007, 2007]
+        months = [1, 2, 3]
+        with tm.assert_produces_warning(FutureWarning, match=depr_msg):
+            idx = PeriodIndex(year=years, month=months, freq="M")
+        exp = period_range("2007-01", periods=3, freq="M")
+        tm.assert_index_equal(idx, exp)
 
-def test_from_product_iterator():
-    # GH 18434
-    first = ["foo", "bar", "buz"]
-    second = ["a", "b", "c"]
-    names = ["first", "second"]
-    tuples = [
-        ("foo", "a"),
-        ("foo", "b"),
-        ("foo", "c"),
-        ("bar", "a"),
-        ("bar", "b"),
-        ("bar", "c"),
-        ("buz", "a"),
-        ("buz", "b"),
-        ("buz", "c"),
-    ]
-    expected = MultiIndex.from_tuples(tuples, names=names)
-
-    # iterator as input
-    result = MultiIndex.from_product(iter([first, second]), names=names)
-    tm.assert_index_equal(result, expected)
-
-    # Invalid non-iterable input
-    msg = "Input must be a list / sequence of iterables."
-    with pytest.raises(TypeError, match=msg):
-        MultiIndex.from_product(0)
-
-
-@pytest.mark.parametrize(
-    "a, b, expected_names",
-    [
-        (
-            Series([1, 2, 3], name="foo"),
-            Series(["a", "b"], name="bar"),
-            ["foo", "bar"],
-        ),
-        (Series([1, 2, 3], name="foo"), ["a", "b"], ["foo", None]),
-        ([1, 2, 3], ["a", "b"], None),
-    ],
-)
-def test_from_product_infer_names(a, b, expected_names):
-    # GH27292
-    result = MultiIndex.from_product([a, b])
-    expected = MultiIndex(
-        levels=[[1, 2, 3], ["a", "b"]],
-        codes=[[0, 0, 1, 1, 2, 2], [0, 1, 0, 1, 0, 1]],
-        names=expected_names,
-    )
-    tm.assert_index_equal(result, expected)
-
-
-def test_from_product_respects_none_names():
-    # GH27292
-    a = Series([1, 2, 3], name="foo")
-    b = Series(["a", "b"], name="bar")
-
-    result = MultiIndex.from_product([a, b], names=None)
-    expected = MultiIndex(
-        levels=[[1, 2, 3], ["a", "b"]],
-        codes=[[0, 0, 1, 1, 2, 2], [0, 1, 0, 1, 0, 1]],
-        names=None,
-    )
-    tm.assert_index_equal(result, expected)
-
-
-def test_from_product_readonly():
-    # GH#15286 passing read-only array to from_product
-    a = np.array(range(3))
-    b = ["a", "b"]
-    expected = MultiIndex.from_product([a, b])
-
-    a.setflags(write=False)
-    result = MultiIndex.from_product([a, b])
-    tm.assert_index_equal(result, expected)
-
-
-def test_create_index_existing_name(idx):
-    # GH11193, when an existing index is passed, and a new name is not
-    # specified, the new index should inherit the previous object name
-    index = idx
-    index.names = ["foo", "bar"]
-    result = Index(index)
-    expected = Index(
-        Index(
+    def test_constructor_nano(self):
+        idx = period_range(
+            start=Period(ordinal=1, freq="ns"),
+            end=Period(ordinal=4, freq="ns"),
+            freq="ns",
+        )
+        exp = PeriodIndex(
             [
-                ("foo", "one"),
-                ("foo", "two"),
-                ("bar", "one"),
-                ("baz", "two"),
-                ("qux", "one"),
-                ("qux", "two"),
+                Period(ordinal=1, freq="ns"),
+                Period(ordinal=2, freq="ns"),
+                Period(ordinal=3, freq="ns"),
+                Period(ordinal=4, freq="ns"),
             ],
-            dtype="object",
+            freq="ns",
         )
-    )
-    tm.assert_index_equal(result, expected)
+        tm.assert_index_equal(idx, exp)
 
-    result = Index(index, name="A")
-    expected = Index(
-        Index(
-            [
-                ("foo", "one"),
-                ("foo", "two"),
-                ("bar", "one"),
-                ("baz", "two"),
-                ("qux", "one"),
-                ("qux", "two"),
-            ],
-            dtype="object",
-        ),
-        name="A",
-    )
-    tm.assert_index_equal(result, expected)
+    def test_constructor_arrays_negative_year(self):
+        years = np.arange(1960, 2000, dtype=np.int64).repeat(4)
+        quarters = np.tile(np.array([1, 2, 3, 4], dtype=np.int64), 40)
 
+        msg = "Constructing PeriodIndex from fields is deprecated"
+        with tm.assert_produces_warning(FutureWarning, match=msg):
+            pindex = PeriodIndex(year=years, quarter=quarters)
 
-# ----------------------------------------------------------------------------
-# from_frame
-# ----------------------------------------------------------------------------
-def test_from_frame():
-    # GH 22420
-    df = pd.DataFrame(
-        [["a", "a"], ["a", "b"], ["b", "a"], ["b", "b"]], columns=["L1", "L2"]
-    )
-    expected = MultiIndex.from_tuples(
-        [("a", "a"), ("a", "b"), ("b", "a"), ("b", "b")], names=["L1", "L2"]
-    )
-    result = MultiIndex.from_frame(df)
-    tm.assert_index_equal(expected, result)
+        tm.assert_index_equal(pindex.year, Index(years))
+        tm.assert_index_equal(pindex.quarter, Index(quarters))
 
+        alt = PeriodIndex.from_fields(year=years, quarter=quarters)
+        tm.assert_index_equal(alt, pindex)
 
-def test_from_frame_missing_values_multiIndex():
-    # GH 39984
-    pa = pytest.importorskip("pyarrow")
+    def test_constructor_invalid_quarters(self):
+        depr_msg = "Constructing PeriodIndex from fields is deprecated"
+        msg = "Quarter must be 1 <= q <= 4"
+        with pytest.raises(ValueError, match=msg):
+            with tm.assert_produces_warning(FutureWarning, match=depr_msg):
+                PeriodIndex(
+                    year=range(2000, 2004), quarter=list(range(4)), freq="Q-DEC"
+                )
 
-    df = pd.DataFrame(
-        {
-            "a": Series([1, 2, None], dtype="Int64"),
-            "b": pd.Float64Dtype().__from_arrow__(pa.array([0.2, np.nan, None])),
-        }
-    )
-    multi_indexed = MultiIndex.from_frame(df)
-    expected = MultiIndex.from_arrays(
+    def test_period_range_fractional_period(self):
+        msg = "Non-integer 'periods' in pd.date_range, pd.timedelta_range"
+        with tm.assert_produces_warning(FutureWarning, match=msg):
+            result = period_range("2007-01", periods=10.5, freq="M")
+        exp = period_range("2007-01", periods=10, freq="M")
+        tm.assert_index_equal(result, exp)
+
+    def test_constructor_with_without_freq(self):
+        # GH53687
+        start = Period("2002-01-01 00:00", freq="30min")
+        exp = period_range(start=start, periods=5, freq=start.freq)
+        result = period_range(start=start, periods=5)
+        tm.assert_index_equal(exp, result)
+
+    def test_constructor_fromarraylike(self):
+        idx = period_range("2007-01", periods=20, freq="M")
+
+        # values is an array of Period, thus can retrieve freq
+        tm.assert_index_equal(PeriodIndex(idx.values), idx)
+        tm.assert_index_equal(PeriodIndex(list(idx.values)), idx)
+
+        msg = "freq not specified and cannot be inferred"
+        with pytest.raises(ValueError, match=msg):
+            PeriodIndex(idx.asi8)
+        with pytest.raises(ValueError, match=msg):
+            PeriodIndex(list(idx.asi8))
+
+        msg = "'Period' object is not iterable"
+        with pytest.raises(TypeError, match=msg):
+            PeriodIndex(data=Period("2007", freq="Y"))
+
+        result = PeriodIndex(iter(idx))
+        tm.assert_index_equal(result, idx)
+
+        result = PeriodIndex(idx)
+        tm.assert_index_equal(result, idx)
+
+        result = PeriodIndex(idx, freq="M")
+        tm.assert_index_equal(result, idx)
+
+        result = PeriodIndex(idx, freq=offsets.MonthEnd())
+        tm.assert_index_equal(result, idx)
+        assert result.freq == "ME"
+
+        result = PeriodIndex(idx, freq="2M")
+        tm.assert_index_equal(result, idx.asfreq("2M"))
+        assert result.freq == "2ME"
+
+        result = PeriodIndex(idx, freq=offsets.MonthEnd(2))
+        tm.assert_index_equal(result, idx.asfreq("2M"))
+        assert result.freq == "2ME"
+
+        result = PeriodIndex(idx, freq="D")
+        exp = idx.asfreq("D", "e")
+        tm.assert_index_equal(result, exp)
+
+    def test_constructor_datetime64arr(self):
+        vals = np.arange(100000, 100000 + 10000, 100, dtype=np.int64)
+        vals = vals.view(np.dtype("M8[us]"))
+
+        pi = PeriodIndex(vals, freq="D")
+
+        expected = PeriodIndex(vals.astype("M8[ns]"), freq="D")
+        tm.assert_index_equal(pi, expected)
+
+    @pytest.mark.parametrize("box", [None, "series", "index"])
+    def test_constructor_datetime64arr_ok(self, box):
+        # https://github.com/pandas-dev/pandas/issues/23438
+        data = date_range("2017", periods=4, freq="ME")
+        if box is None:
+            data = data._values
+        elif box == "series":
+            data = Series(data)
+
+        result = PeriodIndex(data, freq="D")
+        expected = PeriodIndex(
+            ["2017-01-31", "2017-02-28", "2017-03-31", "2017-04-30"], freq="D"
+        )
+        tm.assert_index_equal(result, expected)
+
+    def test_constructor_dtype(self):
+        # passing a dtype with a tz should localize
+        idx = PeriodIndex(["2013-01", "2013-03"], dtype="period[M]")
+        exp = PeriodIndex(["2013-01", "2013-03"], freq="M")
+        tm.assert_index_equal(idx, exp)
+        assert idx.dtype == "period[M]"
+
+        idx = PeriodIndex(["2013-01-05", "2013-03-05"], dtype="period[3D]")
+        exp = PeriodIndex(["2013-01-05", "2013-03-05"], freq="3D")
+        tm.assert_index_equal(idx, exp)
+        assert idx.dtype == "period[3D]"
+
+        # if we already have a freq and its not the same, then asfreq
+        # (not changed)
+        idx = PeriodIndex(["2013-01-01", "2013-01-02"], freq="D")
+
+        res = PeriodIndex(idx, dtype="period[M]")
+        exp = PeriodIndex(["2013-01", "2013-01"], freq="M")
+        tm.assert_index_equal(res, exp)
+        assert res.dtype == "period[M]"
+
+        res = PeriodIndex(idx, freq="M")
+        tm.assert_index_equal(res, exp)
+        assert res.dtype == "period[M]"
+
+        msg = "specified freq and dtype are different"
+        with pytest.raises(IncompatibleFrequency, match=msg):
+            PeriodIndex(["2011-01"], freq="M", dtype="period[D]")
+
+    def test_constructor_empty(self):
+        idx = PeriodIndex([], freq="M")
+        assert isinstance(idx, PeriodIndex)
+        assert len(idx) == 0
+        assert idx.freq == "ME"
+
+        with pytest.raises(ValueError, match="freq not specified"):
+            PeriodIndex([])
+
+    def test_constructor_pi_nat(self):
+        idx = PeriodIndex(
+            [Period("2011-01", freq="M"), NaT, Period("2011-01", freq="M")]
+        )
+        exp = PeriodIndex(["2011-01", "NaT", "2011-01"], freq="M")
+        tm.assert_index_equal(idx, exp)
+
+        idx = PeriodIndex(
+            np.array([Period("2011-01", freq="M"), NaT, Period("2011-01", freq="M")])
+        )
+        tm.assert_index_equal(idx, exp)
+
+        idx = PeriodIndex(
+            [NaT, NaT, Period("2011-01", freq="M"), Period("2011-01", freq="M")]
+        )
+        exp = PeriodIndex(["NaT", "NaT", "2011-01", "2011-01"], freq="M")
+        tm.assert_index_equal(idx, exp)
+
+        idx = PeriodIndex(
+            np.array(
+                [NaT, NaT, Period("2011-01", freq="M"), Period("2011-01", freq="M")]
+            )
+        )
+        tm.assert_index_equal(idx, exp)
+
+        idx = PeriodIndex([NaT, NaT, "2011-01", "2011-01"], freq="M")
+        tm.assert_index_equal(idx, exp)
+
+        with pytest.raises(ValueError, match="freq not specified"):
+            PeriodIndex([NaT, NaT])
+
+        with pytest.raises(ValueError, match="freq not specified"):
+            PeriodIndex(np.array([NaT, NaT]))
+
+        with pytest.raises(ValueError, match="freq not specified"):
+            PeriodIndex(["NaT", "NaT"])
+
+        with pytest.raises(ValueError, match="freq not specified"):
+            PeriodIndex(np.array(["NaT", "NaT"]))
+
+    def test_constructor_incompat_freq(self):
+        msg = "Input has different freq=D from PeriodIndex\\(freq=M\\)"
+
+        with pytest.raises(IncompatibleFrequency, match=msg):
+            PeriodIndex([Period("2011-01", freq="M"), NaT, Period("2011-01", freq="D")])
+
+        with pytest.raises(IncompatibleFrequency, match=msg):
+            PeriodIndex(
+                np.array(
+                    [Period("2011-01", freq="M"), NaT, Period("2011-01", freq="D")]
+                )
+            )
+
+        # first element is NaT
+        with pytest.raises(IncompatibleFrequency, match=msg):
+            PeriodIndex([NaT, Period("2011-01", freq="M"), Period("2011-01", freq="D")])
+
+        with pytest.raises(IncompatibleFrequency, match=msg):
+            PeriodIndex(
+                np.array(
+                    [NaT, Period("2011-01", freq="M"), Period("2011-01", freq="D")]
+                )
+            )
+
+    def test_constructor_mixed(self):
+        idx = PeriodIndex(["2011-01", NaT, Period("2011-01", freq="M")])
+        exp = PeriodIndex(["2011-01", "NaT", "2011-01"], freq="M")
+        tm.assert_index_equal(idx, exp)
+
+        idx = PeriodIndex(["NaT", NaT, Period("2011-01", freq="M")])
+        exp = PeriodIndex(["NaT", "NaT", "2011-01"], freq="M")
+        tm.assert_index_equal(idx, exp)
+
+        idx = PeriodIndex([Period("2011-01-01", freq="D"), NaT, "2012-01-01"])
+        exp = PeriodIndex(["2011-01-01", "NaT", "2012-01-01"], freq="D")
+        tm.assert_index_equal(idx, exp)
+
+    @pytest.mark.parametrize("floats", [[1.1, 2.1], np.array([1.1, 2.1])])
+    def test_constructor_floats(self, floats):
+        msg = "PeriodIndex does not allow floating point in construction"
+        with pytest.raises(TypeError, match=msg):
+            PeriodIndex(floats)
+
+    def test_constructor_year_and_quarter(self):
+        year = Series([2001, 2002, 2003])
+        quarter = year - 2000
+        msg = "Constructing PeriodIndex from fields is deprecated"
+        with tm.assert_produces_warning(FutureWarning, match=msg):
+            idx = PeriodIndex(year=year, quarter=quarter)
+        strs = [f"{t[0]:d}Q{t[1]:d}" for t in zip(quarter, year)]
+        lops = list(map(Period, strs))
+        p = PeriodIndex(lops)
+        tm.assert_index_equal(p, idx)
+
+    def test_constructor_freq_mult(self):
+        # GH #7811
+        pidx = period_range(start="2014-01", freq="2M", periods=4)
+        expected = PeriodIndex(["2014-01", "2014-03", "2014-05", "2014-07"], freq="2M")
+        tm.assert_index_equal(pidx, expected)
+
+        pidx = period_range(start="2014-01-02", end="2014-01-15", freq="3D")
+        expected = PeriodIndex(
+            ["2014-01-02", "2014-01-05", "2014-01-08", "2014-01-11", "2014-01-14"],
+            freq="3D",
+        )
+        tm.assert_index_equal(pidx, expected)
+
+        pidx = period_range(end="2014-01-01 17:00", freq="4h", periods=3)
+        expected = PeriodIndex(
+            ["2014-01-01 09:00", "2014-01-01 13:00", "2014-01-01 17:00"], freq="4h"
+        )
+        tm.assert_index_equal(pidx, expected)
+
+        msg = "Frequency must be positive, because it represents span: -1M"
+        with pytest.raises(ValueError, match=msg):
+            PeriodIndex(["2011-01"], freq="-1M")
+
+        msg = "Frequency must be positive, because it represents span: 0M"
+        with pytest.raises(ValueError, match=msg):
+            PeriodIndex(["2011-01"], freq="0M")
+
+        msg = "Frequency must be positive, because it represents span: 0M"
+        with pytest.raises(ValueError, match=msg):
+            period_range("2011-01", periods=3, freq="0M")
+
+    @pytest.mark.parametrize(
+        "freq_offset, freq_period",
         [
-            Series([1, 2, None]).astype("Int64"),
-            pd.Float64Dtype().__from_arrow__(pa.array([0.2, np.nan, None])),
+            ("YE", "Y"),
+            ("ME", "M"),
+            ("D", "D"),
+            ("min", "min"),
+            ("s", "s"),
         ],
-        names=["a", "b"],
     )
-    tm.assert_index_equal(multi_indexed, expected)
+    @pytest.mark.parametrize("mult", [1, 2, 3, 4, 5])
+    def test_constructor_freq_mult_dti_compat(self, mult, freq_offset, freq_period):
+        freqstr_offset = str(mult) + freq_offset
+        freqstr_period = str(mult) + freq_period
+        pidx = period_range(start="2014-04-01", freq=freqstr_period, periods=10)
+        expected = date_range(
+            start="2014-04-01", freq=freqstr_offset, periods=10
+        ).to_period(freqstr_period)
+        tm.assert_index_equal(pidx, expected)
 
+    @pytest.mark.parametrize("mult", [1, 2, 3, 4, 5])
+    def test_constructor_freq_mult_dti_compat_month(self, mult):
+        pidx = period_range(start="2014-04-01", freq=f"{mult}M", periods=10)
+        expected = date_range(
+            start="2014-04-01", freq=f"{mult}ME", periods=10
+        ).to_period(f"{mult}M")
+        tm.assert_index_equal(pidx, expected)
 
-@pytest.mark.parametrize(
-    "non_frame",
-    [
-        Series([1, 2, 3, 4]),
-        [1, 2, 3, 4],
-        [[1, 2], [3, 4], [5, 6]],
-        Index([1, 2, 3, 4]),
-        np.array([[1, 2], [3, 4], [5, 6]]),
-        27,
-    ],
-)
-def test_from_frame_error(non_frame):
-    # GH 22420
-    with pytest.raises(TypeError, match="Input must be a DataFrame"):
-        MultiIndex.from_frame(non_frame)
+    def test_constructor_freq_combined(self):
+        for freq in ["1D1h", "1h1D"]:
+            pidx = PeriodIndex(["2016-01-01", "2016-01-02"], freq=freq)
+            expected = PeriodIndex(["2016-01-01 00:00", "2016-01-02 00:00"], freq="25h")
+        for freq in ["1D1h", "1h1D"]:
+            pidx = period_range(start="2016-01-01", periods=2, freq=freq)
+            expected = PeriodIndex(["2016-01-01 00:00", "2016-01-02 01:00"], freq="25h")
+            tm.assert_index_equal(pidx, expected)
 
+    def test_period_range_length(self):
+        pi = period_range(freq="Y", start="1/1/2001", end="12/1/2009")
+        assert len(pi) == 9
 
-def test_from_frame_dtype_fidelity():
-    # GH 22420
-    df = pd.DataFrame(
-        {
-            "dates": date_range("19910905", periods=6, tz="US/Eastern"),
-            "a": [1, 1, 1, 2, 2, 2],
-            "b": pd.Categorical(["a", "a", "b", "b", "c", "c"], ordered=True),
-            "c": ["x", "x", "y", "z", "x", "y"],
-        }
+        pi = period_range(freq="Q", start="1/1/2001", end="12/1/2009")
+        assert len(pi) == 4 * 9
+
+        pi = period_range(freq="M", start="1/1/2001", end="12/1/2009")
+        assert len(pi) == 12 * 9
+
+        pi = period_range(freq="D", start="1/1/2001", end="12/31/2009")
+        assert len(pi) == 365 * 9 + 2
+
+        msg = "Period with BDay freq is deprecated"
+        with tm.assert_produces_warning(FutureWarning, match=msg):
+            pi = period_range(freq="B", start="1/1/2001", end="12/31/2009")
+        assert len(pi) == 261 * 9
+
+        pi = period_range(freq="h", start="1/1/2001", end="12/31/2001 23:00")
+        assert len(pi) == 365 * 24
+
+        pi = period_range(freq="Min", start="1/1/2001", end="1/1/2001 23:59")
+        assert len(pi) == 24 * 60
+
+        pi = period_range(freq="s", start="1/1/2001", end="1/1/2001 23:59:59")
+        assert len(pi) == 24 * 60 * 60
+
+        with tm.assert_produces_warning(FutureWarning, match=msg):
+            start = Period("02-Apr-2005", "B")
+            i1 = period_range(start=start, periods=20)
+        assert len(i1) == 20
+        assert i1.freq == start.freq
+        assert i1[0] == start
+
+        end_intv = Period("2006-12-31", "W")
+        i1 = period_range(end=end_intv, periods=10)
+        assert len(i1) == 10
+        assert i1.freq == end_intv.freq
+        assert i1[-1] == end_intv
+
+        msg = "'w' is deprecated and will be removed in a future version."
+        with tm.assert_produces_warning(FutureWarning, match=msg):
+            end_intv = Period("2006-12-31", "1w")
+        i2 = period_range(end=end_intv, periods=10)
+        assert len(i1) == len(i2)
+        assert (i1 == i2).all()
+        assert i1.freq == i2.freq
+
+    def test_infer_freq_from_first_element(self):
+        msg = "Period with BDay freq is deprecated"
+        with tm.assert_produces_warning(FutureWarning, match=msg):
+            start = Period("02-Apr-2005", "B")
+            end_intv = Period("2005-05-01", "B")
+            period_range(start=start, end=end_intv)
+
+            # infer freq from first element
+            i2 = PeriodIndex([end_intv, Period("2005-05-05", "B")])
+        assert len(i2) == 2
+        assert i2[0] == end_intv
+
+        with tm.assert_produces_warning(FutureWarning, match=msg):
+            i2 = PeriodIndex(np.array([end_intv, Period("2005-05-05", "B")]))
+        assert len(i2) == 2
+        assert i2[0] == end_intv
+
+    def test_mixed_freq_raises(self):
+        # Mixed freq should fail
+        msg = "Period with BDay freq is deprecated"
+        with tm.assert_produces_warning(FutureWarning, match=msg):
+            end_intv = Period("2005-05-01", "B")
+
+        msg = "'w' is deprecated and will be removed in a future version."
+        with tm.assert_produces_warning(FutureWarning, match=msg):
+            vals = [end_intv, Period("2006-12-31", "w")]
+        msg = r"Input has different freq=W-SUN from PeriodIndex\(freq=B\)"
+        depr_msg = r"PeriodDtype\[B\] is deprecated"
+        with pytest.raises(IncompatibleFrequency, match=msg):
+            with tm.assert_produces_warning(FutureWarning, match=depr_msg):
+                PeriodIndex(vals)
+        vals = np.array(vals)
+        with pytest.raises(IncompatibleFrequency, match=msg):
+            with tm.assert_produces_warning(FutureWarning, match=depr_msg):
+                PeriodIndex(vals)
+
+    @pytest.mark.parametrize(
+        "freq", ["M", "Q", "Y", "D", "B", "min", "s", "ms", "us", "ns", "h"]
     )
-    original_dtypes = df.dtypes.to_dict()
-
-    expected_mi = MultiIndex.from_arrays(
-        [
-            date_range("19910905", periods=6, tz="US/Eastern"),
-            [1, 1, 1, 2, 2, 2],
-            pd.Categorical(["a", "a", "b", "b", "c", "c"], ordered=True),
-            ["x", "x", "y", "z", "x", "y"],
-        ],
-        names=["dates", "a", "b", "c"],
+    @pytest.mark.filterwarnings(
+        r"ignore:Period with BDay freq is deprecated:FutureWarning"
     )
-    mi = MultiIndex.from_frame(df)
-    mi_dtypes = {name: mi.levels[i].dtype for i, name in enumerate(mi.names)}
+    @pytest.mark.filterwarnings(r"ignore:PeriodDtype\[B\] is deprecated:FutureWarning")
+    def test_recreate_from_data(self, freq):
+        org = period_range(start="2001/04/01", freq=freq, periods=1)
+        idx = PeriodIndex(org.values, freq=freq)
+        tm.assert_index_equal(idx, org)
 
-    tm.assert_index_equal(expected_mi, mi)
-    assert original_dtypes == mi_dtypes
+    def test_map_with_string_constructor(self):
+        raw = [2005, 2007, 2009]
+        index = PeriodIndex(raw, freq="Y")
 
+        expected = Index([str(num) for num in raw])
+        res = index.map(str)
 
-@pytest.mark.parametrize(
-    "names_in,names_out", [(None, [("L1", "x"), ("L2", "y")]), (["x", "y"], ["x", "y"])]
-)
-def test_from_frame_valid_names(names_in, names_out):
-    # GH 22420
-    df = pd.DataFrame(
-        [["a", "a"], ["a", "b"], ["b", "a"], ["b", "b"]],
-        columns=MultiIndex.from_tuples([("L1", "x"), ("L2", "y")]),
-    )
-    mi = MultiIndex.from_frame(df, names=names_in)
-    assert mi.names == names_out
+        # should return an Index
+        assert isinstance(res, Index)
 
+        # preserve element types
+        assert all(isinstance(resi, str) for resi in res)
 
-@pytest.mark.parametrize(
-    "names,expected_error_msg",
-    [
-        ("bad_input", "Names should be list-like for a MultiIndex"),
-        (["a", "b", "c"], "Length of names must match number of levels in MultiIndex"),
-    ],
-)
-def test_from_frame_invalid_names(names, expected_error_msg):
-    # GH 22420
-    df = pd.DataFrame(
-        [["a", "a"], ["a", "b"], ["b", "a"], ["b", "b"]],
-        columns=MultiIndex.from_tuples([("L1", "x"), ("L2", "y")]),
-    )
-    with pytest.raises(ValueError, match=expected_error_msg):
-        MultiIndex.from_frame(df, names=names)
+        # lastly, values should compare equal
+        tm.assert_index_equal(res, expected)
 
 
-def test_index_equal_empty_iterable():
-    # #16844
-    a = MultiIndex(levels=[[], []], codes=[[], []], names=["a", "b"])
-    b = MultiIndex.from_arrays(arrays=[[], []], names=["a", "b"])
-    tm.assert_index_equal(a, b)
+class TestSimpleNew:
+    def test_constructor_simple_new(self):
+        idx = period_range("2007-01", name="p", periods=2, freq="M")
+
+        with pytest.raises(AssertionError, match="<class .*PeriodIndex'>"):
+            idx._simple_new(idx, name="p")
+
+        result = idx._simple_new(idx._data, name="p")
+        tm.assert_index_equal(result, idx)
+
+        msg = "Should be numpy array of type i8"
+        with pytest.raises(AssertionError, match=msg):
+            # Need ndarray, not int64 Index
+            type(idx._data)._simple_new(Index(idx.asi8), dtype=idx.dtype)
+
+        arr = type(idx._data)._simple_new(idx.asi8, dtype=idx.dtype)
+        result = idx._simple_new(arr, name="p")
+        tm.assert_index_equal(result, idx)
+
+    def test_constructor_simple_new_empty(self):
+        # GH13079
+        idx = PeriodIndex([], freq="M", name="p")
+        with pytest.raises(AssertionError, match="<class .*PeriodIndex'>"):
+            idx._simple_new(idx, name="p")
+
+        result = idx._simple_new(idx._data, name="p")
+        tm.assert_index_equal(result, idx)
+
+    @pytest.mark.parametrize("floats", [[1.1, 2.1], np.array([1.1, 2.1])])
+    def test_period_index_simple_new_disallows_floats(self, floats):
+        with pytest.raises(AssertionError, match="<class "):
+            PeriodIndex._simple_new(floats)
 
 
-def test_raise_invalid_sortorder():
-    # Test that the MultiIndex constructor raise when a incorrect sortorder is given
-    # GH#28518
+class TestShallowCopy:
+    def test_shallow_copy_empty(self):
+        # GH#13067
+        idx = PeriodIndex([], freq="M")
+        result = idx._view()
+        expected = idx
 
-    levels = [[0, 1], [0, 1, 2]]
+        tm.assert_index_equal(result, expected)
 
-    # Correct sortorder
-    MultiIndex(
-        levels=levels, codes=[[0, 0, 0, 1, 1, 1], [0, 1, 2, 0, 1, 2]], sortorder=2
-    )
+    def test_shallow_copy_disallow_i8(self):
+        # GH#24391
+        pi = period_range("2018-01-01", periods=3, freq="2D")
+        with pytest.raises(AssertionError, match="ndarray"):
+            pi._shallow_copy(pi.asi8)
 
-    with pytest.raises(ValueError, match=r".* sortorder 2 with lexsort_depth 1.*"):
-        MultiIndex(
-            levels=levels, codes=[[0, 0, 0, 1, 1, 1], [0, 1, 2, 0, 2, 1]], sortorder=2
-        )
-
-    with pytest.raises(ValueError, match=r".* sortorder 1 with lexsort_depth 0.*"):
-        MultiIndex(
-            levels=levels, codes=[[0, 0, 1, 0, 1, 1], [0, 1, 0, 2, 2, 1]], sortorder=1
-        )
-
-
-def test_datetimeindex():
-    idx1 = pd.DatetimeIndex(
-        ["2013-04-01 9:00", "2013-04-02 9:00", "2013-04-03 9:00"] * 2, tz="Asia/Tokyo"
-    )
-    idx2 = date_range("2010/01/01", periods=6, freq="ME", tz="US/Eastern")
-    idx = MultiIndex.from_arrays([idx1, idx2])
-
-    expected1 = pd.DatetimeIndex(
-        ["2013-04-01 9:00", "2013-04-02 9:00", "2013-04-03 9:00"], tz="Asia/Tokyo"
-    )
-
-    tm.assert_index_equal(idx.levels[0], expected1)
-    tm.assert_index_equal(idx.levels[1], idx2)
-
-    # from datetime combos
-    # GH 7888
-    date1 = np.datetime64("today")
-    date2 = datetime.today()
-    date3 = Timestamp.today()
-
-    for d1, d2 in itertools.product([date1, date2, date3], [date1, date2, date3]):
-        index = MultiIndex.from_product([[d1], [d2]])
-        assert isinstance(index.levels[0], pd.DatetimeIndex)
-        assert isinstance(index.levels[1], pd.DatetimeIndex)
-
-    # but NOT date objects, matching Index behavior
-    date4 = date.today()
-    index = MultiIndex.from_product([[date4], [date2]])
-    assert not isinstance(index.levels[0], pd.DatetimeIndex)
-    assert isinstance(index.levels[1], pd.DatetimeIndex)
+    def test_shallow_copy_requires_disallow_period_index(self):
+        pi = period_range("2018-01-01", periods=3, freq="2D")
+        with pytest.raises(AssertionError, match="PeriodIndex"):
+            pi._shallow_copy(pi)
 
 
-def test_constructor_with_tz():
-    index = pd.DatetimeIndex(
-        ["2013/01/01 09:00", "2013/01/02 09:00"], name="dt1", tz="US/Pacific"
-    )
-    columns = pd.DatetimeIndex(
-        ["2014/01/01 09:00", "2014/01/02 09:00"], name="dt2", tz="Asia/Tokyo"
-    )
+class TestSeriesPeriod:
+    def test_constructor_cant_cast_period(self):
+        msg = "Cannot cast PeriodIndex to dtype float64"
+        with pytest.raises(TypeError, match=msg):
+            Series(period_range("2000-01-01", periods=10, freq="D"), dtype=float)
 
-    result = MultiIndex.from_arrays([index, columns])
-
-    assert result.names == ["dt1", "dt2"]
-    tm.assert_index_equal(result.levels[0], index)
-    tm.assert_index_equal(result.levels[1], columns)
-
-    result = MultiIndex.from_arrays([Series(index), Series(columns)])
-
-    assert result.names == ["dt1", "dt2"]
-    tm.assert_index_equal(result.levels[0], index)
-    tm.assert_index_equal(result.levels[1], columns)
-
-
-def test_multiindex_inference_consistency():
-    # check that inference behavior matches the base class
-
-    v = date.today()
-
-    arr = [v, v]
-
-    idx = Index(arr)
-    assert idx.dtype == object
-
-    mi = MultiIndex.from_arrays([arr])
-    lev = mi.levels[0]
-    assert lev.dtype == object
-
-    mi = MultiIndex.from_product([arr])
-    lev = mi.levels[0]
-    assert lev.dtype == object
-
-    mi = MultiIndex.from_tuples([(x,) for x in arr])
-    lev = mi.levels[0]
-    assert lev.dtype == object
-
-
-def test_dtype_representation(using_infer_string):
-    # GH#46900
-    pmidx = MultiIndex.from_arrays([[1], ["a"]], names=[("a", "b"), ("c", "d")])
-    result = pmidx.dtypes
-    exp = "object" if not using_infer_string else pd.StringDtype(na_value=np.nan)
-    expected = Series(
-        ["int64", exp],
-        index=MultiIndex.from_tuples([("a", "b"), ("c", "d")]),
-        dtype=object,
-    )
-    tm.assert_series_equal(result, expected)
+    def test_constructor_cast_object(self):
+        pi = period_range("1/1/2000", periods=10)
+        ser = Series(pi, dtype=PeriodDtype("D"))
+        exp = Series(pi)
+        tm.assert_series_equal(ser, exp)

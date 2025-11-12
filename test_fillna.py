@@ -1,62 +1,41 @@
-import pytest
-
-import pandas as pd
+from pandas import (
+    Index,
+    NaT,
+    Period,
+    PeriodIndex,
+)
 import pandas._testing as tm
 
 
-class TestDatetimeIndexFillNA:
-    @pytest.mark.parametrize("tz", ["US/Eastern", "Asia/Tokyo"])
-    def test_fillna_datetime64(self, tz):
-        # GH 11343
-        idx = pd.DatetimeIndex(["2011-01-01 09:00", pd.NaT, "2011-01-01 11:00"])
+class TestFillNA:
+    def test_fillna_period(self):
+        # GH#11343
+        idx = PeriodIndex(["2011-01-01 09:00", NaT, "2011-01-01 11:00"], freq="h")
 
-        exp = pd.DatetimeIndex(
-            ["2011-01-01 09:00", "2011-01-01 10:00", "2011-01-01 11:00"]
+        exp = PeriodIndex(
+            ["2011-01-01 09:00", "2011-01-01 10:00", "2011-01-01 11:00"], freq="h"
         )
-        tm.assert_index_equal(idx.fillna(pd.Timestamp("2011-01-01 10:00")), exp)
+        result = idx.fillna(Period("2011-01-01 10:00", freq="h"))
+        tm.assert_index_equal(result, exp)
 
-        # tz mismatch
-        exp = pd.Index(
+        exp = Index(
             [
-                pd.Timestamp("2011-01-01 09:00"),
-                pd.Timestamp("2011-01-01 10:00", tz=tz),
-                pd.Timestamp("2011-01-01 11:00"),
-            ],
-            dtype=object,
-        )
-        tm.assert_index_equal(idx.fillna(pd.Timestamp("2011-01-01 10:00", tz=tz)), exp)
-
-        # object
-        exp = pd.Index(
-            [pd.Timestamp("2011-01-01 09:00"), "x", pd.Timestamp("2011-01-01 11:00")],
-            dtype=object,
-        )
-        tm.assert_index_equal(idx.fillna("x"), exp)
-
-        idx = pd.DatetimeIndex(["2011-01-01 09:00", pd.NaT, "2011-01-01 11:00"], tz=tz)
-
-        exp = pd.DatetimeIndex(
-            ["2011-01-01 09:00", "2011-01-01 10:00", "2011-01-01 11:00"], tz=tz
-        )
-        tm.assert_index_equal(idx.fillna(pd.Timestamp("2011-01-01 10:00", tz=tz)), exp)
-
-        exp = pd.Index(
-            [
-                pd.Timestamp("2011-01-01 09:00", tz=tz),
-                pd.Timestamp("2011-01-01 10:00"),
-                pd.Timestamp("2011-01-01 11:00", tz=tz),
-            ],
-            dtype=object,
-        )
-        tm.assert_index_equal(idx.fillna(pd.Timestamp("2011-01-01 10:00")), exp)
-
-        # object
-        exp = pd.Index(
-            [
-                pd.Timestamp("2011-01-01 09:00", tz=tz),
+                Period("2011-01-01 09:00", freq="h"),
                 "x",
-                pd.Timestamp("2011-01-01 11:00", tz=tz),
+                Period("2011-01-01 11:00", freq="h"),
             ],
             dtype=object,
         )
-        tm.assert_index_equal(idx.fillna("x"), exp)
+        result = idx.fillna("x")
+        tm.assert_index_equal(result, exp)
+
+        exp = Index(
+            [
+                Period("2011-01-01 09:00", freq="h"),
+                Period("2011-01-01", freq="D"),
+                Period("2011-01-01 11:00", freq="h"),
+            ],
+            dtype=object,
+        )
+        result = idx.fillna(Period("2011-01-01", freq="D"))
+        tm.assert_index_equal(result, exp)

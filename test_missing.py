@@ -1,105 +1,111 @@
-from datetime import timedelta
-
 import numpy as np
 import pytest
 
-from pandas._libs import iNaT
-
 import pandas as pd
-from pandas import (
-    Categorical,
-    Index,
-    NaT,
-    Series,
-    isna,
-)
+from pandas import MultiIndex
 import pandas._testing as tm
 
 
-class TestSeriesMissingData:
-    def test_categorical_nan_handling(self):
-        # NaNs are represented as -1 in labels
-        s = Series(Categorical(["a", "b", np.nan, "a"]))
-        tm.assert_index_equal(s.cat.categories, Index(["a", "b"]))
-        tm.assert_numpy_array_equal(
-            s.values.codes, np.array([0, 1, -1, 0], dtype=np.int8)
-        )
+def test_fillna(idx):
+    # GH 11343
+    msg = "isna is not defined for MultiIndex"
+    with pytest.raises(NotImplementedError, match=msg):
+        idx.fillna(idx[0])
 
-    def test_isna_for_inf(self):
-        s = Series(["a", np.inf, np.nan, pd.NA, 1.0])
-        msg = "use_inf_as_na option is deprecated"
-        with tm.assert_produces_warning(FutureWarning, match=msg):
-            with pd.option_context("mode.use_inf_as_na", True):
-                r = s.isna()
-                dr = s.dropna()
-        e = Series([False, True, True, True, False])
-        de = Series(["a", 1.0], index=[0, 4])
-        tm.assert_series_equal(r, e)
-        tm.assert_series_equal(dr, de)
 
-    def test_timedelta64_nan(self):
-        td = Series([timedelta(days=i) for i in range(10)])
-
-        # nan ops on timedeltas
-        td1 = td.copy()
-        td1[0] = np.nan
-        assert isna(td1[0])
-        assert td1[0]._value == iNaT
-        td1[0] = td[0]
-        assert not isna(td1[0])
-
-        # GH#16674 iNaT is treated as an integer when given by the user
-        with tm.assert_produces_warning(FutureWarning, match="incompatible dtype"):
-            td1[1] = iNaT
-        assert not isna(td1[1])
-        assert td1.dtype == np.object_
-        assert td1[1] == iNaT
-        td1[1] = td[1]
-        assert not isna(td1[1])
-
-        td1[2] = NaT
-        assert isna(td1[2])
-        assert td1[2]._value == iNaT
-        td1[2] = td[2]
-        assert not isna(td1[2])
-
-        # boolean setting
-        # GH#2899 boolean setting
-        td3 = np.timedelta64(timedelta(days=3))
-        td7 = np.timedelta64(timedelta(days=7))
-        td[(td > td3) & (td < td7)] = np.nan
-        assert isna(td).sum() == 3
-
-    @pytest.mark.xfail(
-        reason="Chained inequality raises when trying to define 'selector'"
+def test_dropna():
+    # GH 6194
+    idx = MultiIndex.from_arrays(
+        [
+            [1, np.nan, 3, np.nan, 5],
+            [1, 2, np.nan, np.nan, 5],
+            ["a", "b", "c", np.nan, "e"],
+        ]
     )
-    def test_logical_range_select(self, datetime_series):
-        # NumPy limitation =(
-        # https://github.com/pandas-dev/pandas/commit/9030dc021f07c76809848925cb34828f6c8484f3
 
-        selector = -0.5 <= datetime_series <= 0.5
-        expected = (datetime_series >= -0.5) & (datetime_series <= 0.5)
-        tm.assert_series_equal(selector, expected)
+    exp = MultiIndex.from_arrays([[1, 5], [1, 5], ["a", "e"]])
+    tm.assert_index_equal(idx.dropna(), exp)
+    tm.assert_index_equal(idx.dropna(how="any"), exp)
 
-    def test_valid(self, datetime_series):
-        ts = datetime_series.copy()
-        ts.index = ts.index._with_freq(None)
-        ts[::2] = np.nan
+    exp = MultiIndex.from_arrays(
+        [[1, np.nan, 3, 5], [1, 2, np.nan, 5], ["a", "b", "c", "e"]]
+    )
+    tm.assert_index_equal(idx.dropna(how="all"), exp)
 
-        result = ts.dropna()
-        assert len(result) == ts.count()
-        tm.assert_series_equal(result, ts[1::2])
-        tm.assert_series_equal(result, ts[pd.notna(ts)])
+    msg = "invalid how option: xxx"
+    with pytest.raises(ValueError, match=msg):
+        idx.dropna(how="xxx")
+
+    # GH26408
+    # test if missing values are dropped for multiindex constructed
+    # from codes and values
+    idx = MultiIndex(
+        levels=[[np.nan, None, pd.NaT, "128", 2], [np.nan, None, pd.NaT, "128", 2]],
+        codes=[[0, -1, 1, 2, 3, 4], [0, -1, 3, 3, 3, 4]],
+    )
+    expected = MultiIndex.from_arrays([["128", 2], ["128", 2]])
+    tm.assert_index_equal(idx.dropna(), expected)
+    tm.assert_index_equal(idx.dropna(how="any"), expected)
+
+    expected = MultiIndex.from_arrays(
+        [[np.nan, np.nan, "128", 2], ["128", "128", "128", 2]]
+    )
+    tm.assert_index_equal(idx.dropna(how="all"), expected)
 
 
-def test_hasnans_uncached_for_series():
-    # GH#19700
-    # set float64 dtype to avoid upcast when setting nan
-    idx = Index([0, 1], dtype="float64")
-    assert idx.hasnans is False
-    assert "hasnans" in idx._cache
-    ser = idx.to_series()
-    assert ser.hasnans is False
-    assert not hasattr(ser, "_cache")
-    ser.iloc[-1] = np.nan
-    assert ser.hasnans is True
+def test_nulls(idx):
+    # this is really a smoke test for the methods
+    # as these are adequately tested for function elsewhere
+
+    msg = "isna is not defined for MultiIndex"
+    with pytest.raises(NotImplementedError, match=msg):
+        idx.isna()
+
+
+@pytest.mark.xfail(reason="isna is not defined for MultiIndex")
+def test_hasnans_isnans(idx):
+    # GH 11343, added tests for hasnans / isnans
+    index = idx.copy()
+
+    # cases in indices doesn't include NaN
+    expected = np.array([False] * len(index), dtype=bool)
+    tm.assert_numpy_array_equal(index._isnan, expected)
+    assert index.hasnans is False
+
+    index = idx.copy()
+    values = index.values
+    values[1] = np.nan
+
+    index = type(idx)(values)
+
+    expected = np.array([False] * len(index), dtype=bool)
+    expected[1] = True
+    tm.assert_numpy_array_equal(index._isnan, expected)
+    assert index.hasnans is True
+
+
+def test_nan_stays_float():
+    # GH 7031
+    idx0 = MultiIndex(levels=[["A", "B"], []], codes=[[1, 0], [-1, -1]], names=[0, 1])
+    idx1 = MultiIndex(levels=[["C"], ["D"]], codes=[[0], [0]], names=[0, 1])
+    idxm = idx0.join(idx1, how="outer")
+    assert pd.isna(idx0.get_level_values(1)).all()
+    # the following failed in 0.14.1
+    assert pd.isna(idxm.get_level_values(1)[:-1]).all()
+
+    df0 = pd.DataFrame([[1, 2]], index=idx0)
+    df1 = pd.DataFrame([[3, 4]], index=idx1)
+    dfm = df0 - df1
+    assert pd.isna(df0.index.get_level_values(1)).all()
+    # the following failed in 0.14.1
+    assert pd.isna(dfm.index.get_level_values(1)[:-1]).all()
+
+
+def test_tuples_have_na():
+    index = MultiIndex(
+        levels=[[1, 0], [0, 1, 2, 3]],
+        codes=[[1, 1, 1, 1, -1, 0, 0, 0], [0, 1, 2, 3, 0, 1, 2, 3]],
+    )
+
+    assert pd.isna(index[4][0])
+    assert pd.isna(index.values[4][0])

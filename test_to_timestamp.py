@@ -1,154 +1,142 @@
-from datetime import timedelta
+from datetime import datetime
 
 import numpy as np
 import pytest
 
 from pandas import (
-    DataFrame,
     DatetimeIndex,
+    NaT,
     PeriodIndex,
-    Series,
     Timedelta,
+    Timestamp,
     date_range,
     period_range,
-    to_datetime,
 )
 import pandas._testing as tm
 
 
-def _get_with_delta(delta, freq="YE-DEC"):
-    return date_range(
-        to_datetime("1/1/2001") + delta,
-        to_datetime("12/31/2009") + delta,
-        freq=freq,
-    )
-
-
 class TestToTimestamp:
-    def test_to_timestamp(self, frame_or_series):
-        K = 5
-        index = period_range(freq="Y", start="1/1/2001", end="12/1/2009")
-        obj = DataFrame(
-            np.random.default_rng(2).standard_normal((len(index), K)),
-            index=index,
-            columns=["A", "B", "C", "D", "E"],
+    def test_to_timestamp_non_contiguous(self):
+        # GH#44100
+        dti = date_range("2021-10-18", periods=9, freq="D")
+        pi = dti.to_period()
+
+        result = pi[::2].to_timestamp()
+        expected = dti[::2]
+        tm.assert_index_equal(result, expected)
+
+        result = pi._data[::2].to_timestamp()
+        expected = dti._data[::2]
+        # TODO: can we get the freq to round-trip?
+        tm.assert_datetime_array_equal(result, expected, check_freq=False)
+
+        result = pi[::-1].to_timestamp()
+        expected = dti[::-1]
+        tm.assert_index_equal(result, expected)
+
+        result = pi._data[::-1].to_timestamp()
+        expected = dti._data[::-1]
+        tm.assert_datetime_array_equal(result, expected, check_freq=False)
+
+        result = pi[::2][::-1].to_timestamp()
+        expected = dti[::2][::-1]
+        tm.assert_index_equal(result, expected)
+
+        result = pi._data[::2][::-1].to_timestamp()
+        expected = dti._data[::2][::-1]
+        tm.assert_datetime_array_equal(result, expected, check_freq=False)
+
+    def test_to_timestamp_freq(self):
+        idx = period_range("2017", periods=12, freq="Y-DEC")
+        result = idx.to_timestamp()
+        expected = date_range("2017", periods=12, freq="YS-JAN")
+        tm.assert_index_equal(result, expected)
+
+    def test_to_timestamp_pi_nat(self):
+        # GH#7228
+        index = PeriodIndex(["NaT", "2011-01", "2011-02"], freq="M", name="idx")
+
+        result = index.to_timestamp("D")
+        expected = DatetimeIndex(
+            [NaT, datetime(2011, 1, 1), datetime(2011, 2, 1)],
+            dtype="M8[ns]",
+            name="idx",
         )
-        obj["mix"] = "a"
-        obj = tm.get_obj(obj, frame_or_series)
+        tm.assert_index_equal(result, expected)
+        assert result.name == "idx"
 
-        exp_index = date_range("1/1/2001", end="12/31/2009", freq="YE-DEC")
-        exp_index = exp_index + Timedelta(1, "D") - Timedelta(1, "ns")
-        result = obj.to_timestamp("D", "end")
-        tm.assert_index_equal(result.index, exp_index)
-        tm.assert_numpy_array_equal(result.values, obj.values)
-        if frame_or_series is Series:
-            assert result.name == "A"
+        result2 = result.to_period(freq="M")
+        tm.assert_index_equal(result2, index)
+        assert result2.name == "idx"
 
-        exp_index = date_range("1/1/2001", end="1/1/2009", freq="YS-JAN")
-        result = obj.to_timestamp("D", "start")
-        tm.assert_index_equal(result.index, exp_index)
+        result3 = result.to_period(freq="3M")
+        exp = PeriodIndex(["NaT", "2011-01", "2011-02"], freq="3M", name="idx")
+        tm.assert_index_equal(result3, exp)
+        assert result3.freqstr == "3M"
 
-        result = obj.to_timestamp(how="start")
-        tm.assert_index_equal(result.index, exp_index)
+        msg = "Frequency must be positive, because it represents span: -2Y"
+        with pytest.raises(ValueError, match=msg):
+            result.to_period(freq="-2Y")
 
-        delta = timedelta(hours=23)
-        result = obj.to_timestamp("H", "end")
-        exp_index = _get_with_delta(delta)
-        exp_index = exp_index + Timedelta(1, "h") - Timedelta(1, "ns")
-        tm.assert_index_equal(result.index, exp_index)
+    def test_to_timestamp_preserve_name(self):
+        index = period_range(freq="Y", start="1/1/2001", end="12/1/2009", name="foo")
+        assert index.name == "foo"
 
-        delta = timedelta(hours=23, minutes=59)
-        result = obj.to_timestamp("T", "end")
-        exp_index = _get_with_delta(delta)
-        exp_index = exp_index + Timedelta(1, "m") - Timedelta(1, "ns")
-        tm.assert_index_equal(result.index, exp_index)
+        conv = index.to_timestamp("D")
+        assert conv.name == "foo"
 
-        result = obj.to_timestamp("S", "end")
-        delta = timedelta(hours=23, minutes=59, seconds=59)
-        exp_index = _get_with_delta(delta)
-        exp_index = exp_index + Timedelta(1, "s") - Timedelta(1, "ns")
-        tm.assert_index_equal(result.index, exp_index)
+    def test_to_timestamp_quarterly_bug(self):
+        years = np.arange(1960, 2000).repeat(4)
+        quarters = np.tile(list(range(1, 5)), 40)
 
-    def test_to_timestamp_columns(self):
-        K = 5
-        index = period_range(freq="Y", start="1/1/2001", end="12/1/2009")
-        df = DataFrame(
-            np.random.default_rng(2).standard_normal((len(index), K)),
-            index=index,
-            columns=["A", "B", "C", "D", "E"],
+        pindex = PeriodIndex.from_fields(year=years, quarter=quarters)
+
+        stamps = pindex.to_timestamp("D", "end")
+        expected = DatetimeIndex([x.to_timestamp("D", "end") for x in pindex])
+        tm.assert_index_equal(stamps, expected)
+        assert stamps.freq == expected.freq
+
+    def test_to_timestamp_pi_mult(self):
+        idx = PeriodIndex(["2011-01", "NaT", "2011-02"], freq="2M", name="idx")
+
+        result = idx.to_timestamp()
+        expected = DatetimeIndex(
+            ["2011-01-01", "NaT", "2011-02-01"], dtype="M8[ns]", name="idx"
         )
-        df["mix"] = "a"
+        tm.assert_index_equal(result, expected)
 
-        # columns
-        df = df.T
-
-        exp_index = date_range("1/1/2001", end="12/31/2009", freq="YE-DEC")
-        exp_index = exp_index + Timedelta(1, "D") - Timedelta(1, "ns")
-        result = df.to_timestamp("D", "end", axis=1)
-        tm.assert_index_equal(result.columns, exp_index)
-        tm.assert_numpy_array_equal(result.values, df.values)
-
-        exp_index = date_range("1/1/2001", end="1/1/2009", freq="YS-JAN")
-        result = df.to_timestamp("D", "start", axis=1)
-        tm.assert_index_equal(result.columns, exp_index)
-
-        delta = timedelta(hours=23)
-        result = df.to_timestamp("H", "end", axis=1)
-        exp_index = _get_with_delta(delta)
-        exp_index = exp_index + Timedelta(1, "h") - Timedelta(1, "ns")
-        tm.assert_index_equal(result.columns, exp_index)
-
-        delta = timedelta(hours=23, minutes=59)
-        result = df.to_timestamp("min", "end", axis=1)
-        exp_index = _get_with_delta(delta)
-        exp_index = exp_index + Timedelta(1, "m") - Timedelta(1, "ns")
-        tm.assert_index_equal(result.columns, exp_index)
-
-        result = df.to_timestamp("S", "end", axis=1)
-        delta = timedelta(hours=23, minutes=59, seconds=59)
-        exp_index = _get_with_delta(delta)
-        exp_index = exp_index + Timedelta(1, "s") - Timedelta(1, "ns")
-        tm.assert_index_equal(result.columns, exp_index)
-
-        result1 = df.to_timestamp("5min", axis=1)
-        result2 = df.to_timestamp("min", axis=1)
-        expected = date_range("2001-01-01", "2009-01-01", freq="YS")
-        assert isinstance(result1.columns, DatetimeIndex)
-        assert isinstance(result2.columns, DatetimeIndex)
-        tm.assert_numpy_array_equal(result1.columns.asi8, expected.asi8)
-        tm.assert_numpy_array_equal(result2.columns.asi8, expected.asi8)
-        # PeriodIndex.to_timestamp always use 'infer'
-        assert result1.columns.freqstr == "YS-JAN"
-        assert result2.columns.freqstr == "YS-JAN"
-
-    def test_to_timestamp_invalid_axis(self):
-        index = period_range(freq="Y", start="1/1/2001", end="12/1/2009")
-        obj = DataFrame(
-            np.random.default_rng(2).standard_normal((len(index), 5)), index=index
+        result = idx.to_timestamp(how="E")
+        expected = DatetimeIndex(
+            ["2011-02-28", "NaT", "2011-03-31"], dtype="M8[ns]", name="idx"
         )
+        expected = expected + Timedelta(1, "D") - Timedelta(1, "ns")
+        tm.assert_index_equal(result, expected)
 
-        # invalid axis
-        with pytest.raises(ValueError, match="axis"):
-            obj.to_timestamp(axis=2)
+    def test_to_timestamp_pi_combined(self):
+        idx = period_range(start="2011", periods=2, freq="1D1h", name="idx")
 
-    def test_to_timestamp_hourly(self, frame_or_series):
-        index = period_range(freq="h", start="1/1/2001", end="1/2/2001")
-        obj = Series(1, index=index, name="foo")
-        if frame_or_series is not Series:
-            obj = obj.to_frame()
+        result = idx.to_timestamp()
+        expected = DatetimeIndex(
+            ["2011-01-01 00:00", "2011-01-02 01:00"], dtype="M8[ns]", name="idx"
+        )
+        tm.assert_index_equal(result, expected)
 
-        exp_index = date_range("1/1/2001 00:59:59", end="1/2/2001 00:59:59", freq="h")
-        result = obj.to_timestamp(how="end")
-        exp_index = exp_index + Timedelta(1, "s") - Timedelta(1, "ns")
-        tm.assert_index_equal(result.index, exp_index)
-        if frame_or_series is Series:
-            assert result.name == "foo"
+        result = idx.to_timestamp(how="E")
+        expected = DatetimeIndex(
+            ["2011-01-02 00:59:59", "2011-01-03 01:59:59"], name="idx", dtype="M8[ns]"
+        )
+        expected = expected + Timedelta(1, "s") - Timedelta(1, "ns")
+        tm.assert_index_equal(result, expected)
 
-    def test_to_timestamp_raises(self, index, frame_or_series):
-        # GH#33327
-        obj = frame_or_series(index=index, dtype=object)
+        result = idx.to_timestamp(how="E", freq="h")
+        expected = DatetimeIndex(
+            ["2011-01-02 00:00", "2011-01-03 01:00"], dtype="M8[ns]", name="idx"
+        )
+        expected = expected + Timedelta(1, "h") - Timedelta(1, "ns")
+        tm.assert_index_equal(result, expected)
 
-        if not isinstance(index, PeriodIndex):
-            msg = f"unsupported Type {type(index).__name__}"
-            with pytest.raises(TypeError, match=msg):
-                obj.to_timestamp()
+    def test_to_timestamp_1703(self):
+        index = period_range("1/1/2012", periods=4, freq="D")
+
+        result = index.to_timestamp()
+        assert result[0] == Timestamp("1/1/2012")

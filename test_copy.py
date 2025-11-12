@@ -1,91 +1,96 @@
-import numpy as np
+from copy import (
+    copy,
+    deepcopy,
+)
+
 import pytest
 
-from pandas import (
-    Series,
-    Timestamp,
-)
+from pandas import MultiIndex
 import pandas._testing as tm
 
 
-class TestCopy:
-    @pytest.mark.parametrize("deep", ["default", None, False, True])
-    def test_copy(self, deep, using_copy_on_write, warn_copy_on_write):
-        ser = Series(np.arange(10), dtype="float64")
+def assert_multiindex_copied(copy, original):
+    # Levels should be (at least, shallow copied)
+    tm.assert_copy(copy.levels, original.levels)
+    tm.assert_almost_equal(copy.codes, original.codes)
 
-        # default deep is True
-        if deep == "default":
-            ser2 = ser.copy()
-        else:
-            ser2 = ser.copy(deep=deep)
+    # Labels doesn't matter which way copied
+    tm.assert_almost_equal(copy.codes, original.codes)
+    assert copy.codes is not original.codes
 
-        if using_copy_on_write:
-            # INFO(CoW) a shallow copy doesn't yet copy the data
-            # but parent will not be modified (CoW)
-            if deep is None or deep is False:
-                assert np.may_share_memory(ser.values, ser2.values)
-            else:
-                assert not np.may_share_memory(ser.values, ser2.values)
+    # Names doesn't matter which way copied
+    assert copy.names == original.names
+    assert copy.names is not original.names
 
-        with tm.assert_cow_warning(warn_copy_on_write and deep is False):
-            ser2[::2] = np.nan
+    # Sort order should be copied
+    assert copy.sortorder == original.sortorder
 
-        if deep is not False or using_copy_on_write:
-            # Did not modify original Series
-            assert np.isnan(ser2[0])
-            assert not np.isnan(ser[0])
-        else:
-            # we DID modify the original Series
-            assert np.isnan(ser2[0])
-            assert np.isnan(ser[0])
 
-    @pytest.mark.filterwarnings("ignore:Setting a value on a view:FutureWarning")
-    @pytest.mark.parametrize("deep", ["default", None, False, True])
-    def test_copy_tzaware(self, deep, using_copy_on_write):
-        # GH#11794
-        # copy of tz-aware
-        expected = Series([Timestamp("2012/01/01", tz="UTC")])
-        expected2 = Series([Timestamp("1999/01/01", tz="UTC")])
+def test_copy(idx):
+    i_copy = idx.copy()
 
-        ser = Series([Timestamp("2012/01/01", tz="UTC")])
+    assert_multiindex_copied(i_copy, idx)
 
-        if deep == "default":
-            ser2 = ser.copy()
-        else:
-            ser2 = ser.copy(deep=deep)
 
-        if using_copy_on_write:
-            # INFO(CoW) a shallow copy doesn't yet copy the data
-            # but parent will not be modified (CoW)
-            if deep is None or deep is False:
-                assert np.may_share_memory(ser.values, ser2.values)
-            else:
-                assert not np.may_share_memory(ser.values, ser2.values)
+def test_shallow_copy(idx):
+    i_copy = idx._view()
 
-        ser2[0] = Timestamp("1999/01/01", tz="UTC")
+    assert_multiindex_copied(i_copy, idx)
 
-        # default deep is True
-        if deep is not False or using_copy_on_write:
-            # Did not modify original Series
-            tm.assert_series_equal(ser2, expected2)
-            tm.assert_series_equal(ser, expected)
-        else:
-            # we DID modify the original Series
-            tm.assert_series_equal(ser2, expected2)
-            tm.assert_series_equal(ser, expected2)
 
-    def test_copy_name(self, datetime_series):
-        result = datetime_series.copy()
-        assert result.name == datetime_series.name
+def test_view(idx):
+    i_view = idx.view()
+    assert_multiindex_copied(i_view, idx)
 
-    def test_copy_index_name_checking(self, datetime_series):
-        # don't want to be able to modify the index stored elsewhere after
-        # making a copy
 
-        datetime_series.index.name = None
-        assert datetime_series.index.name is None
-        assert datetime_series is datetime_series
+@pytest.mark.parametrize("func", [copy, deepcopy])
+def test_copy_and_deepcopy(func):
+    idx = MultiIndex(
+        levels=[["foo", "bar"], ["fizz", "buzz"]],
+        codes=[[0, 0, 0, 1], [0, 0, 1, 1]],
+        names=["first", "second"],
+    )
+    idx_copy = func(idx)
+    assert idx_copy is not idx
+    assert idx_copy.equals(idx)
 
-        cp = datetime_series.copy()
-        cp.index.name = "foo"
-        assert datetime_series.index.name is None
+
+@pytest.mark.parametrize("deep", [True, False])
+def test_copy_method(deep):
+    idx = MultiIndex(
+        levels=[["foo", "bar"], ["fizz", "buzz"]],
+        codes=[[0, 0, 0, 1], [0, 0, 1, 1]],
+        names=["first", "second"],
+    )
+    idx_copy = idx.copy(deep=deep)
+    assert idx_copy.equals(idx)
+
+
+@pytest.mark.parametrize("deep", [True, False])
+@pytest.mark.parametrize(
+    "kwarg, value",
+    [
+        ("names", ["third", "fourth"]),
+    ],
+)
+def test_copy_method_kwargs(deep, kwarg, value):
+    # gh-12309: Check that the "name" argument as well other kwargs are honored
+    idx = MultiIndex(
+        levels=[["foo", "bar"], ["fizz", "buzz"]],
+        codes=[[0, 0, 0, 1], [0, 0, 1, 1]],
+        names=["first", "second"],
+    )
+    idx_copy = idx.copy(**{kwarg: value, "deep": deep})
+    assert getattr(idx_copy, kwarg) == value
+
+
+def test_copy_deep_false_retains_id():
+    # GH#47878
+    idx = MultiIndex(
+        levels=[["foo", "bar"], ["fizz", "buzz"]],
+        codes=[[0, 0, 0, 1], [0, 0, 1, 1]],
+        names=["first", "second"],
+    )
+
+    res = idx.copy(deep=False)
+    assert res._id is idx._id

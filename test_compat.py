@@ -1,75 +1,122 @@
+import numpy as np
 import pytest
 
 import pandas as pd
+from pandas import MultiIndex
 import pandas._testing as tm
 
-tables = pytest.importorskip("tables")
+
+def test_numeric_compat(idx):
+    with pytest.raises(TypeError, match="cannot perform __mul__"):
+        idx * 1
+
+    with pytest.raises(TypeError, match="cannot perform __rmul__"):
+        1 * idx
+
+    div_err = "cannot perform __truediv__"
+    with pytest.raises(TypeError, match=div_err):
+        idx / 1
+
+    div_err = div_err.replace(" __", " __r")
+    with pytest.raises(TypeError, match=div_err):
+        1 / idx
+
+    with pytest.raises(TypeError, match="cannot perform __floordiv__"):
+        idx // 1
+
+    with pytest.raises(TypeError, match="cannot perform __rfloordiv__"):
+        1 // idx
 
 
-@pytest.fixture
-def pytables_hdf5_file(tmp_path):
-    """
-    Use PyTables to create a simple HDF5 file.
-    """
-    table_schema = {
-        "c0": tables.Time64Col(pos=0),
-        "c1": tables.StringCol(5, pos=1),
-        "c2": tables.Int64Col(pos=2),
-    }
+@pytest.mark.parametrize("method", ["all", "any", "__invert__"])
+def test_logical_compat(idx, method):
+    msg = f"cannot perform {method}"
 
-    t0 = 1_561_105_000.0
-
-    testsamples = [
-        {"c0": t0, "c1": "aaaaa", "c2": 1},
-        {"c0": t0 + 1, "c1": "bbbbb", "c2": 2},
-        {"c0": t0 + 2, "c1": "ccccc", "c2": 10**5},
-        {"c0": t0 + 3, "c1": "ddddd", "c2": 4_294_967_295},
-    ]
-
-    objname = "pandas_test_timeseries"
-
-    path = tmp_path / "written_with_pytables.h5"
-    with tables.open_file(path, mode="w") as f:
-        t = f.create_table("/", name=objname, description=table_schema)
-        for sample in testsamples:
-            for key, value in sample.items():
-                t.row[key] = value
-            t.row.append()
-
-    yield path, objname, pd.DataFrame(testsamples)
+    with pytest.raises(TypeError, match=msg):
+        getattr(idx, method)()
 
 
-class TestReadPyTablesHDF5:
-    """
-    A group of tests which covers reading HDF5 files written by plain PyTables
-    (not written by pandas).
+def test_inplace_mutation_resets_values():
+    levels = [["a", "b", "c"], [4]]
+    levels2 = [[1, 2, 3], ["a"]]
+    codes = [[0, 1, 0, 2, 2, 0], [0, 0, 0, 0, 0, 0]]
 
-    Was introduced for regression-testing issue 11188.
-    """
+    mi1 = MultiIndex(levels=levels, codes=codes)
+    mi2 = MultiIndex(levels=levels2, codes=codes)
 
-    def test_read_complete(self, pytables_hdf5_file):
-        path, objname, df = pytables_hdf5_file
-        result = pd.read_hdf(path, key=objname)
-        expected = df
-        tm.assert_frame_equal(result, expected, check_index_type=True)
+    # instantiating MultiIndex should not access/cache _.values
+    assert "_values" not in mi1._cache
+    assert "_values" not in mi2._cache
 
-    def test_read_with_start(self, pytables_hdf5_file):
-        path, objname, df = pytables_hdf5_file
-        # This is a regression test for pandas-dev/pandas/issues/11188
-        result = pd.read_hdf(path, key=objname, start=1)
-        expected = df[1:].reset_index(drop=True)
-        tm.assert_frame_equal(result, expected, check_index_type=True)
+    vals = mi1.values.copy()
+    vals2 = mi2.values.copy()
 
-    def test_read_with_stop(self, pytables_hdf5_file):
-        path, objname, df = pytables_hdf5_file
-        # This is a regression test for pandas-dev/pandas/issues/11188
-        result = pd.read_hdf(path, key=objname, stop=1)
-        expected = df[:1].reset_index(drop=True)
-        tm.assert_frame_equal(result, expected, check_index_type=True)
+    # accessing .values should cache ._values
+    assert mi1._values is mi1._cache["_values"]
+    assert mi1.values is mi1._cache["_values"]
+    assert isinstance(mi1._cache["_values"], np.ndarray)
 
-    def test_read_with_startstop(self, pytables_hdf5_file):
-        path, objname, df = pytables_hdf5_file
-        # This is a regression test for pandas-dev/pandas/issues/11188
-        result = pd.read_hdf(path, key=objname, start=1, stop=2)
-        expected = df[1:2].reset_index(drop=True)
-        tm.assert_frame_equal(result, expected, check_index_type=True)
+    # Make sure level setting works
+    new_vals = mi1.set_levels(levels2).values
+    tm.assert_almost_equal(vals2, new_vals)
+
+    #  Doesn't drop _values from _cache [implementation detail]
+    tm.assert_almost_equal(mi1._cache["_values"], vals)
+
+    # ...and values is still same too
+    tm.assert_almost_equal(mi1.values, vals)
+
+    # Make sure label setting works too
+    codes2 = [[0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0]]
+    exp_values = np.empty((6,), dtype=object)
+    exp_values[:] = [(1, "a")] * 6
+
+    # Must be 1d array of tuples
+    assert exp_values.shape == (6,)
+
+    new_mi = mi2.set_codes(codes2)
+    assert "_values" not in new_mi._cache
+    new_values = new_mi.values
+    assert "_values" in new_mi._cache
+
+    # Shouldn't change cache
+    tm.assert_almost_equal(mi2._cache["_values"], vals2)
+
+    # Should have correct values
+    tm.assert_almost_equal(exp_values, new_values)
+
+
+def test_boxable_categorical_values():
+    cat = pd.Categorical(pd.date_range("2012-01-01", periods=3, freq="h"))
+    result = MultiIndex.from_product([["a", "b", "c"], cat]).values
+    expected = pd.Series(
+        [
+            ("a", pd.Timestamp("2012-01-01 00:00:00")),
+            ("a", pd.Timestamp("2012-01-01 01:00:00")),
+            ("a", pd.Timestamp("2012-01-01 02:00:00")),
+            ("b", pd.Timestamp("2012-01-01 00:00:00")),
+            ("b", pd.Timestamp("2012-01-01 01:00:00")),
+            ("b", pd.Timestamp("2012-01-01 02:00:00")),
+            ("c", pd.Timestamp("2012-01-01 00:00:00")),
+            ("c", pd.Timestamp("2012-01-01 01:00:00")),
+            ("c", pd.Timestamp("2012-01-01 02:00:00")),
+        ]
+    ).values
+    tm.assert_numpy_array_equal(result, expected)
+    result = pd.DataFrame({"a": ["a", "b", "c"], "b": cat, "c": np.array(cat)}).values
+    expected = pd.DataFrame(
+        {
+            "a": ["a", "b", "c"],
+            "b": [
+                pd.Timestamp("2012-01-01 00:00:00"),
+                pd.Timestamp("2012-01-01 01:00:00"),
+                pd.Timestamp("2012-01-01 02:00:00"),
+            ],
+            "c": [
+                pd.Timestamp("2012-01-01 00:00:00"),
+                pd.Timestamp("2012-01-01 01:00:00"),
+                pd.Timestamp("2012-01-01 02:00:00"),
+            ],
+        }
+    ).values
+    tm.assert_numpy_array_equal(result, expected)
