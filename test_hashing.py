@@ -1,417 +1,520 @@
-import numpy as np
-import pytest
+"""
+Test the hashing module.
+"""
 
-import pandas as pd
-from pandas import (
-    DataFrame,
-    Index,
-    MultiIndex,
-    Series,
-    period_range,
-    timedelta_range,
-)
-import pandas._testing as tm
-from pandas.core.util.hashing import hash_tuples
-from pandas.util import (
-    hash_array,
-    hash_pandas_object,
-)
+# Author: Gael Varoquaux <gael dot varoquaux at normalesup dot org>
+# Copyright (c) 2009 Gael Varoquaux
+# License: BSD Style, 3 clauses.
 
+import collections
+import gc
+import hashlib
+import io
+import itertools
+import pickle
+import random
+import sys
+import time
+from concurrent.futures import ProcessPoolExecutor
+from decimal import Decimal
 
-@pytest.fixture(
-    params=[
-        Series([1, 2, 3] * 3, dtype="int32"),
-        Series([None, 2.5, 3.5] * 3, dtype="float32"),
-        Series(["a", "b", "c"] * 3, dtype="category"),
-        Series(["d", "e", "f"] * 3),
-        Series([True, False, True] * 3),
-        Series(pd.date_range("20130101", periods=9)),
-        Series(pd.date_range("20130101", periods=9, tz="US/Eastern")),
-        Series(timedelta_range("2000", periods=9)),
-    ]
-)
-def series(request):
-    return request.param
+from joblib.func_inspect import filter_args
+from joblib.hashing import hash
+from joblib.memory import Memory
+from joblib.test.common import np, with_numpy
+from joblib.testing import fixture, parametrize, raises, skipif
 
 
-@pytest.fixture(params=[True, False])
-def index(request):
-    return request.param
+def unicode(s):
+    return s
 
 
-def test_consistency():
-    # Check that our hash doesn't change because of a mistake
-    # in the actual code; this is the ground truth.
-    result = hash_pandas_object(Index(["foo", "bar", "baz"]))
-    expected = Series(
-        np.array(
-            [3600424527151052760, 1374399572096150070, 477881037637427054],
-            dtype="uint64",
-        ),
-        index=["foo", "bar", "baz"],
-    )
-    tm.assert_series_equal(result, expected)
+###############################################################################
+# Helper functions for the tests
+def time_func(func, *args):
+    """Time function func on *args."""
+    times = list()
+    for _ in range(3):
+        t1 = time.time()
+        func(*args)
+        times.append(time.time() - t1)
+    return min(times)
 
 
-def test_hash_array(series):
-    arr = series.values
-    tm.assert_numpy_array_equal(hash_array(arr), hash_array(arr))
+def relative_time(func1, func2, *args):
+    """Return the relative time between func1 and func2 applied on
+    *args.
+    """
+    time_func1 = time_func(func1, *args)
+    time_func2 = time_func(func2, *args)
+    relative_diff = 0.5 * (abs(time_func1 - time_func2) / (time_func1 + time_func2))
+    return relative_diff
 
 
-@pytest.mark.parametrize("dtype", ["U", object])
-def test_hash_array_mixed(dtype):
-    result1 = hash_array(np.array(["3", "4", "All"]))
-    result2 = hash_array(np.array([3, 4, "All"], dtype=dtype))
-
-    tm.assert_numpy_array_equal(result1, result2)
+class Klass(object):
+    def f(self, x):
+        return x
 
 
-@pytest.mark.parametrize("val", [5, "foo", pd.Timestamp("20130101")])
-def test_hash_array_errors(val):
-    msg = "must pass a ndarray-like"
-    with pytest.raises(TypeError, match=msg):
-        hash_array(val)
+class KlassWithCachedMethod(object):
+    def __init__(self, cachedir):
+        mem = Memory(location=cachedir)
+        self.f = mem.cache(self.f)
+
+    def f(self, x):
+        return x
 
 
-def test_hash_array_index_exception():
-    # GH42003 TypeError instead of AttributeError
-    obj = pd.DatetimeIndex(["2018-10-28 01:20:00"], tz="Europe/Berlin")
+###############################################################################
+# Tests
 
-    msg = "Use hash_pandas_object instead"
-    with pytest.raises(TypeError, match=msg):
-        hash_array(obj)
-
-
-def test_hash_tuples():
-    tuples = [(1, "one"), (1, "two"), (2, "one")]
-    result = hash_tuples(tuples)
-
-    expected = hash_pandas_object(MultiIndex.from_tuples(tuples)).values
-    tm.assert_numpy_array_equal(result, expected)
-
-    # We only need to support MultiIndex and list-of-tuples
-    msg = "|".join(["object is not iterable", "zip argument #1 must support iteration"])
-    with pytest.raises(TypeError, match=msg):
-        hash_tuples(tuples[0])
-
-
-@pytest.mark.parametrize("val", [5, "foo", pd.Timestamp("20130101")])
-def test_hash_tuples_err(val):
-    msg = "must be convertible to a list-of-tuples"
-    with pytest.raises(TypeError, match=msg):
-        hash_tuples(val)
-
-
-def test_multiindex_unique():
-    mi = MultiIndex.from_tuples([(118, 472), (236, 118), (51, 204), (102, 51)])
-    assert mi.is_unique is True
-
-    result = hash_pandas_object(mi)
-    assert result.is_unique is True
-
-
-def test_multiindex_objects():
-    mi = MultiIndex(
-        levels=[["b", "d", "a"], [1, 2, 3]],
-        codes=[[0, 1, 0, 2], [2, 0, 0, 1]],
-        names=["col1", "col2"],
-    )
-    recons = mi._sort_levels_monotonic()
-
-    # These are equal.
-    assert mi.equals(recons)
-    assert Index(mi.values).equals(Index(recons.values))
-
-
-@pytest.mark.parametrize(
-    "obj",
+input_list = [
+    1,
+    2,
+    1.0,
+    2.0,
+    1 + 1j,
+    2.0 + 1j,
+    "a",
+    "b",
+    (1,),
+    (
+        1,
+        1,
+    ),
     [
-        Series([1, 2, 3]),
-        Series([1.0, 1.5, 3.2]),
-        Series([1.0, 1.5, np.nan]),
-        Series([1.0, 1.5, 3.2], index=[1.5, 1.1, 3.3]),
-        Series(["a", "b", "c"]),
-        Series(["a", np.nan, "c"]),
-        Series(["a", None, "c"]),
-        Series([True, False, True]),
-        Series(dtype=object),
-        DataFrame({"x": ["a", "b", "c"], "y": [1, 2, 3]}),
-        DataFrame(),
-        DataFrame(np.full((10, 4), np.nan)),
-        DataFrame(
+        1,
+    ],
+    [
+        1,
+        1,
+    ],
+    {1: 1},
+    {1: 2},
+    {2: 1},
+    None,
+    gc.collect,
+    [
+        1,
+    ].append,
+    # Next 2 sets have unorderable elements in python 3.
+    set(("a", 1)),
+    set(("a", 1, ("a", 1))),
+    # Next 2 dicts have unorderable type of keys in python 3.
+    {"a": 1, 1: 2},
+    {"a": 1, 1: 2, "d": {"a": 1}},
+]
+
+
+@parametrize("obj1", input_list)
+@parametrize("obj2", input_list)
+def test_trivial_hash(obj1, obj2):
+    """Smoke test hash on various types."""
+    # Check that 2 objects have the same hash only if they are the same.
+    are_hashes_equal = hash(obj1) == hash(obj2)
+    are_objs_identical = obj1 is obj2
+    assert are_hashes_equal == are_objs_identical
+
+
+def test_hash_methods():
+    # Check that hashing instance methods works
+    a = io.StringIO(unicode("a"))
+    assert hash(a.flush) == hash(a.flush)
+    a1 = collections.deque(range(10))
+    a2 = collections.deque(range(9))
+    assert hash(a1.extend) != hash(a2.extend)
+
+
+@fixture(scope="function")
+@with_numpy
+def three_np_arrays():
+    rnd = np.random.RandomState(0)
+    arr1 = rnd.random_sample((10, 10))
+    arr2 = arr1.copy()
+    arr3 = arr2.copy()
+    arr3[0] += 1
+    return arr1, arr2, arr3
+
+
+def test_hash_numpy_arrays(three_np_arrays):
+    arr1, arr2, arr3 = three_np_arrays
+
+    for obj1, obj2 in itertools.product(three_np_arrays, repeat=2):
+        are_hashes_equal = hash(obj1) == hash(obj2)
+        are_arrays_equal = np.all(obj1 == obj2)
+        assert are_hashes_equal == are_arrays_equal
+
+    assert hash(arr1) != hash(arr1.T)
+
+
+def test_hash_numpy_dict_of_arrays(three_np_arrays):
+    arr1, arr2, arr3 = three_np_arrays
+
+    d1 = {1: arr1, 2: arr2}
+    d2 = {1: arr2, 2: arr1}
+    d3 = {1: arr2, 2: arr3}
+
+    assert hash(d1) == hash(d2)
+    assert hash(d1) != hash(d3)
+
+
+@with_numpy
+@parametrize("dtype", ["datetime64[s]", "timedelta64[D]"])
+def test_numpy_datetime_array(dtype):
+    # memoryview is not supported for some dtypes e.g. datetime64
+    # see https://github.com/joblib/joblib/issues/188 for more details
+    a_hash = hash(np.arange(10))
+    array = np.arange(0, 10, dtype=dtype)
+    assert hash(array) != a_hash
+
+
+@with_numpy
+def test_hash_numpy_noncontiguous():
+    a = np.asarray(np.arange(6000).reshape((1000, 2, 3)), order="F")[:, :1, :]
+    b = np.ascontiguousarray(a)
+    assert hash(a) != hash(b)
+
+    c = np.asfortranarray(a)
+    assert hash(a) != hash(c)
+
+
+@with_numpy
+@parametrize("coerce_mmap", [True, False])
+def test_hash_memmap(tmpdir, coerce_mmap):
+    """Check that memmap and arrays hash identically if coerce_mmap is True."""
+    filename = tmpdir.join("memmap_temp").strpath
+    try:
+        m = np.memmap(filename, shape=(10, 10), mode="w+")
+        a = np.asarray(m)
+        are_hashes_equal = hash(a, coerce_mmap=coerce_mmap) == hash(
+            m, coerce_mmap=coerce_mmap
+        )
+        assert are_hashes_equal == coerce_mmap
+    finally:
+        if "m" in locals():
+            del m
+            # Force a garbage-collection cycle, to be certain that the
+            # object is delete, and we don't run in a problem under
+            # Windows with a file handle still open.
+            gc.collect()
+
+
+@with_numpy
+@skipif(
+    sys.platform == "win32",
+    reason="This test is not stable under windows for some reason",
+)
+def test_hash_numpy_performance():
+    """Check the performance of hashing numpy arrays:
+
+    In [22]: a = np.random.random(1000000)
+
+    In [23]: %timeit hashlib.md5(a).hexdigest()
+    100 loops, best of 3: 20.7 ms per loop
+
+    In [24]: %timeit hashlib.md5(pickle.dumps(a, protocol=2)).hexdigest()
+    1 loops, best of 3: 73.1 ms per loop
+
+    In [25]: %timeit hashlib.md5(cPickle.dumps(a, protocol=2)).hexdigest()
+    10 loops, best of 3: 53.9 ms per loop
+
+    In [26]: %timeit hash(a)
+    100 loops, best of 3: 20.8 ms per loop
+    """
+    rnd = np.random.RandomState(0)
+    a = rnd.random_sample(1000000)
+
+    def md5_hash(x):
+        return hashlib.md5(memoryview(x)).hexdigest()
+
+    relative_diff = relative_time(md5_hash, hash, a)
+    assert relative_diff < 0.3
+
+    # Check that hashing an tuple of 3 arrays takes approximately
+    # 3 times as much as hashing one array
+    time_hashlib = 3 * time_func(md5_hash, a)
+    time_hash = time_func(hash, (a, a, a))
+    relative_diff = 0.5 * (abs(time_hash - time_hashlib) / (time_hash + time_hashlib))
+    assert relative_diff < 0.3
+
+
+def test_bound_methods_hash():
+    """Make sure that calling the same method on two different instances
+    of the same class does resolve to the same hashes.
+    """
+    a = Klass()
+    b = Klass()
+    assert hash(filter_args(a.f, [], (1,))) == hash(filter_args(b.f, [], (1,)))
+
+
+def test_bound_cached_methods_hash(tmpdir):
+    """Make sure that calling the same _cached_ method on two different
+    instances of the same class does resolve to the same hashes.
+    """
+    a = KlassWithCachedMethod(tmpdir.strpath)
+    b = KlassWithCachedMethod(tmpdir.strpath)
+    assert hash(filter_args(a.f.func, [], (1,))) == hash(
+        filter_args(b.f.func, [], (1,))
+    )
+
+
+@with_numpy
+def test_hash_object_dtype():
+    """Make sure that ndarrays with dtype `object' hash correctly."""
+
+    a = np.array([np.arange(i) for i in range(6)], dtype=object)
+    b = np.array([np.arange(i) for i in range(6)], dtype=object)
+
+    assert hash(a) == hash(b)
+
+
+@with_numpy
+def test_numpy_scalar():
+    # Numpy scalars are built from compiled functions, and lead to
+    # strange pickling paths explored, that can give hash collisions
+    a = np.float64(2.0)
+    b = np.float64(3.0)
+    assert hash(a) != hash(b)
+
+
+def test_dict_hash(tmpdir):
+    # Check that dictionaries hash consistently, even though the ordering
+    # of the keys is not guaranteed
+    k = KlassWithCachedMethod(tmpdir.strpath)
+
+    d = {
+        "#s12069__c_maps.nii.gz": [33],
+        "#s12158__c_maps.nii.gz": [33],
+        "#s12258__c_maps.nii.gz": [33],
+        "#s12277__c_maps.nii.gz": [33],
+        "#s12300__c_maps.nii.gz": [33],
+        "#s12401__c_maps.nii.gz": [33],
+        "#s12430__c_maps.nii.gz": [33],
+        "#s13817__c_maps.nii.gz": [33],
+        "#s13903__c_maps.nii.gz": [33],
+        "#s13916__c_maps.nii.gz": [33],
+        "#s13981__c_maps.nii.gz": [33],
+        "#s13982__c_maps.nii.gz": [33],
+        "#s13983__c_maps.nii.gz": [33],
+    }
+
+    a = k.f(d)
+    b = k.f(a)
+
+    assert hash(a) == hash(b)
+
+
+def test_set_hash(tmpdir):
+    # Check that sets hash consistently, even though their ordering
+    # is not guaranteed
+    k = KlassWithCachedMethod(tmpdir.strpath)
+
+    s = set(
+        [
+            "#s12069__c_maps.nii.gz",
+            "#s12158__c_maps.nii.gz",
+            "#s12258__c_maps.nii.gz",
+            "#s12277__c_maps.nii.gz",
+            "#s12300__c_maps.nii.gz",
+            "#s12401__c_maps.nii.gz",
+            "#s12430__c_maps.nii.gz",
+            "#s13817__c_maps.nii.gz",
+            "#s13903__c_maps.nii.gz",
+            "#s13916__c_maps.nii.gz",
+            "#s13981__c_maps.nii.gz",
+            "#s13982__c_maps.nii.gz",
+            "#s13983__c_maps.nii.gz",
+        ]
+    )
+
+    a = k.f(s)
+    b = k.f(a)
+
+    assert hash(a) == hash(b)
+
+
+def test_set_decimal_hash():
+    # Check that sets containing decimals hash consistently, even though
+    # ordering is not guaranteed
+    assert hash(set([Decimal(0), Decimal("NaN")])) == hash(
+        set([Decimal("NaN"), Decimal(0)])
+    )
+
+
+def test_string():
+    # Test that we obtain the same hash for object owning several strings,
+    # whatever the past of these strings (which are immutable in Python)
+    string = "foo"
+    a = {string: "bar"}
+    b = {string: "bar"}
+    c = pickle.loads(pickle.dumps(b))
+    assert hash([a, b]) == hash([a, c])
+
+
+@with_numpy
+def test_numpy_dtype_pickling():
+    # numpy dtype hashing is tricky to get right: see #231, #239, #251 #1080,
+    # #1082, and explanatory comments inside
+    # ``joblib.hashing.NumpyHasher.save``.
+
+    # In this test, we make sure that the pickling of numpy dtypes is robust to
+    # object identity and object copy.
+
+    dt1 = np.dtype("f4")
+    dt2 = np.dtype("f4")
+
+    # simple dtypes objects are interned
+    assert dt1 is dt2
+    assert hash(dt1) == hash(dt2)
+
+    dt1_roundtripped = pickle.loads(pickle.dumps(dt1))
+    assert dt1 is not dt1_roundtripped
+    assert hash(dt1) == hash(dt1_roundtripped)
+
+    assert hash([dt1, dt1]) == hash([dt1_roundtripped, dt1_roundtripped])
+    assert hash([dt1, dt1]) == hash([dt1, dt1_roundtripped])
+
+    complex_dt1 = np.dtype([("name", np.str_, 16), ("grades", np.float64, (2,))])
+    complex_dt2 = np.dtype([("name", np.str_, 16), ("grades", np.float64, (2,))])
+
+    # complex dtypes objects are not interned
+    assert hash(complex_dt1) == hash(complex_dt2)
+
+    complex_dt1_roundtripped = pickle.loads(pickle.dumps(complex_dt1))
+    assert complex_dt1_roundtripped is not complex_dt1
+    assert hash(complex_dt1) == hash(complex_dt1_roundtripped)
+
+    assert hash([complex_dt1, complex_dt1]) == hash(
+        [complex_dt1_roundtripped, complex_dt1_roundtripped]
+    )
+    assert hash([complex_dt1, complex_dt1]) == hash(
+        [complex_dt1_roundtripped, complex_dt1]
+    )
+
+
+@parametrize(
+    "to_hash,expected",
+    [
+        ("This is a string to hash", "71b3f47df22cb19431d85d92d0b230b2"),
+        ("C'est l\xe9t\xe9", "2d8d189e9b2b0b2e384d93c868c0e576"),
+        ((123456, 54321, -98765), "e205227dd82250871fa25aa0ec690aa3"),
+        (
+            [random.Random(42).random() for _ in range(5)],
+            "a11ffad81f9682a7d901e6edc3d16c84",
+        ),
+        ({"abcde": 123, "sadfas": [-9999, 2, 3]}, "aeda150553d4bb5c69f0e69d51b0e2ef"),
+    ],
+)
+def test_hashes_stay_the_same(to_hash, expected):
+    # We want to make sure that hashes don't change with joblib
+    # version. For end users, that would mean that they have to
+    # regenerate their cache from scratch, which potentially means
+    # lengthy recomputations.
+    # Expected results have been generated with joblib 0.9.2
+    assert hash(to_hash) == expected
+
+
+@with_numpy
+def test_hashes_are_different_between_c_and_fortran_contiguous_arrays():
+    # We want to be sure that the c-contiguous and f-contiguous versions of the
+    # same array produce 2 different hashes.
+    rng = np.random.RandomState(0)
+    arr_c = rng.random_sample((10, 10))
+    arr_f = np.asfortranarray(arr_c)
+    assert hash(arr_c) != hash(arr_f)
+
+
+@with_numpy
+def test_0d_array():
+    hash(np.array(0))
+
+
+@with_numpy
+def test_0d_and_1d_array_hashing_is_different():
+    assert hash(np.array(0)) != hash(np.array([0]))
+
+
+@with_numpy
+def test_hashes_stay_the_same_with_numpy_objects():
+    # Note: joblib used to test numpy objects hashing by comparing the produced
+    # hash of an object with some hard-coded target value to guarantee that
+    # hashing remains the same across joblib versions. However, since numpy
+    # 1.20 and joblib 1.0, joblib relies on potentially unstable implementation
+    # details of numpy to hash np.dtype objects, which makes the stability of
+    # hash values across different environments hard to guarantee and to test.
+    # As a result, hashing stability across joblib versions becomes best-effort
+    # only, and we only test the consistency within a single environment by
+    # making sure:
+    # - the hash of two copies of the same objects is the same
+    # - hashing some object in two different python processes produces the same
+    #   value. This should be viewed as a proxy for testing hash consistency
+    #   through time between Python sessions (provided no change in the
+    #   environment was done between sessions).
+
+    def create_objects_to_hash():
+        rng = np.random.RandomState(42)
+        # Being explicit about dtypes in order to avoid
+        # architecture-related differences. Also using 'f4' rather than
+        # 'f8' for float arrays because 'f8' arrays generated by
+        # rng.random.randn don't seem to be bit-identical on 32bit and
+        # 64bit machines.
+        to_hash_list = [
+            rng.randint(-1000, high=1000, size=50).astype("<i8"),
+            tuple(rng.randn(3).astype("<f4") for _ in range(5)),
+            [rng.randn(3).astype("<f4") for _ in range(5)],
             {
-                "A": [0.0, 1.0, 2.0, 3.0, 4.0],
-                "B": [0.0, 1.0, 0.0, 1.0, 0.0],
-                "C": Index(["foo1", "foo2", "foo3", "foo4", "foo5"], dtype=object),
-                "D": pd.date_range("20130101", periods=5),
-            }
-        ),
-        DataFrame(range(5), index=pd.date_range("2020-01-01", periods=5)),
-        Series(range(5), index=pd.date_range("2020-01-01", periods=5)),
-        Series(period_range("2020-01-01", periods=10, freq="D")),
-        Series(pd.date_range("20130101", periods=3, tz="US/Eastern")),
-    ],
-)
-def test_hash_pandas_object(obj, index):
-    a = hash_pandas_object(obj, index=index)
-    b = hash_pandas_object(obj, index=index)
-    tm.assert_series_equal(a, b)
+                -3333: rng.randn(3, 5).astype("<f4"),
+                0: [
+                    rng.randint(10, size=20).astype("<i8"),
+                    rng.randn(10).astype("<f4"),
+                ],
+            },
+            # Non regression cases for
+            # https://github.com/joblib/joblib/issues/308
+            np.arange(100, dtype="<i8").reshape((10, 10)),
+            # Fortran contiguous array
+            np.asfortranarray(np.arange(100, dtype="<i8").reshape((10, 10))),
+            # Non contiguous array
+            np.arange(100, dtype="<i8").reshape((10, 10))[:, :2],
+        ]
+        return to_hash_list
+
+    # Create two lists containing copies of the same objects.  joblib.hash
+    # should return the same hash for to_hash_list_one[i] and
+    # to_hash_list_two[i]
+    to_hash_list_one = create_objects_to_hash()
+    to_hash_list_two = create_objects_to_hash()
+
+    e1 = ProcessPoolExecutor(max_workers=1)
+    e2 = ProcessPoolExecutor(max_workers=1)
+
+    try:
+        for obj_1, obj_2 in zip(to_hash_list_one, to_hash_list_two):
+            # testing consistency of hashes across python processes
+            hash_1 = e1.submit(hash, obj_1).result()
+            hash_2 = e2.submit(hash, obj_1).result()
+            assert hash_1 == hash_2
+
+            # testing consistency when hashing two copies of the same objects.
+            hash_3 = e1.submit(hash, obj_2).result()
+            assert hash_1 == hash_3
+
+    finally:
+        e1.shutdown()
+        e2.shutdown()
 
 
-@pytest.mark.parametrize(
-    "obj",
-    [
-        Series([1, 2, 3]),
-        Series([1.0, 1.5, 3.2]),
-        Series([1.0, 1.5, np.nan]),
-        Series([1.0, 1.5, 3.2], index=[1.5, 1.1, 3.3]),
-        Series(["a", "b", "c"]),
-        Series(["a", np.nan, "c"]),
-        Series(["a", None, "c"]),
-        Series([True, False, True]),
-        DataFrame({"x": ["a", "b", "c"], "y": [1, 2, 3]}),
-        DataFrame(np.full((10, 4), np.nan)),
-        DataFrame(
-            {
-                "A": [0.0, 1.0, 2.0, 3.0, 4.0],
-                "B": [0.0, 1.0, 0.0, 1.0, 0.0],
-                "C": Index(["foo1", "foo2", "foo3", "foo4", "foo5"], dtype=object),
-                "D": pd.date_range("20130101", periods=5),
-            }
-        ),
-        DataFrame(range(5), index=pd.date_range("2020-01-01", periods=5)),
-        Series(range(5), index=pd.date_range("2020-01-01", periods=5)),
-        Series(period_range("2020-01-01", periods=10, freq="D")),
-        Series(pd.date_range("20130101", periods=3, tz="US/Eastern")),
-    ],
-)
-def test_hash_pandas_object_diff_index_non_empty(obj):
-    a = hash_pandas_object(obj, index=True)
-    b = hash_pandas_object(obj, index=False)
-    assert not (a == b).all()
+def test_hashing_pickling_error():
+    def non_picklable():
+        return 42
+
+    with raises(pickle.PicklingError) as excinfo:
+        hash(non_picklable)
+    excinfo.match("PicklingError while hashing")
 
 
-@pytest.mark.parametrize(
-    "obj",
-    [
-        Index([1, 2, 3]),
-        Index([True, False, True]),
-        timedelta_range("1 day", periods=2),
-        period_range("2020-01-01", freq="D", periods=2),
-        MultiIndex.from_product(
-            [range(5), ["foo", "bar", "baz"], pd.date_range("20130101", periods=2)]
-        ),
-        MultiIndex.from_product([pd.CategoricalIndex(list("aabc")), range(3)]),
-    ],
-)
-def test_hash_pandas_index(obj, index):
-    a = hash_pandas_object(obj, index=index)
-    b = hash_pandas_object(obj, index=index)
-    tm.assert_series_equal(a, b)
-
-
-def test_hash_pandas_series(series, index):
-    a = hash_pandas_object(series, index=index)
-    b = hash_pandas_object(series, index=index)
-    tm.assert_series_equal(a, b)
-
-
-def test_hash_pandas_series_diff_index(series):
-    a = hash_pandas_object(series, index=True)
-    b = hash_pandas_object(series, index=False)
-    assert not (a == b).all()
-
-
-@pytest.mark.parametrize(
-    "obj", [Series([], dtype="float64"), Series([], dtype="object"), Index([])]
-)
-def test_hash_pandas_empty_object(obj, index):
-    # These are by-definition the same with
-    # or without the index as the data is empty.
-    a = hash_pandas_object(obj, index=index)
-    b = hash_pandas_object(obj, index=index)
-    tm.assert_series_equal(a, b)
-
-
-@pytest.mark.parametrize(
-    "s1",
-    [
-        Series(["a", "b", "c", "d"]),
-        Series([1000, 2000, 3000, 4000]),
-        Series(pd.date_range(0, periods=4)),
-    ],
-)
-@pytest.mark.parametrize("categorize", [True, False])
-def test_categorical_consistency(s1, categorize):
-    # see gh-15143
-    #
-    # Check that categoricals hash consistent with their values,
-    # not codes. This should work for categoricals of any dtype.
-    s2 = s1.astype("category").cat.set_categories(s1)
-    s3 = s2.cat.set_categories(list(reversed(s1)))
-
-    # These should all hash identically.
-    h1 = hash_pandas_object(s1, categorize=categorize)
-    h2 = hash_pandas_object(s2, categorize=categorize)
-    h3 = hash_pandas_object(s3, categorize=categorize)
-
-    tm.assert_series_equal(h1, h2)
-    tm.assert_series_equal(h1, h3)
-
-
-def test_categorical_with_nan_consistency():
-    c = pd.Categorical.from_codes(
-        [-1, 0, 1, 2, 3, 4], categories=pd.date_range("2012-01-01", periods=5, name="B")
-    )
-    expected = hash_array(c, categorize=False)
-
-    c = pd.Categorical.from_codes([-1, 0], categories=[pd.Timestamp("2012-01-01")])
-    result = hash_array(c, categorize=False)
-
-    assert result[0] in expected
-    assert result[1] in expected
-
-
-def test_pandas_errors():
-    msg = "Unexpected type for hashing"
-    with pytest.raises(TypeError, match=msg):
-        hash_pandas_object(pd.Timestamp("20130101"))
-
-
-def test_hash_keys():
-    # Using different hash keys, should have
-    # different hashes for the same data.
-    #
-    # This only matters for object dtypes.
-    obj = Series(list("abc"))
-
-    a = hash_pandas_object(obj, hash_key="9876543210123456")
-    b = hash_pandas_object(obj, hash_key="9876543210123465")
-
-    assert (a != b).all()
-
-
-def test_df_hash_keys():
-    # DataFrame version of the test_hash_keys.
-    # https://github.com/pandas-dev/pandas/issues/41404
-    obj = DataFrame({"x": np.arange(3), "y": list("abc")})
-
-    a = hash_pandas_object(obj, hash_key="9876543210123456")
-    b = hash_pandas_object(obj, hash_key="9876543210123465")
-
-    assert (a != b).all()
-
-
-def test_df_encoding():
-    # Check that DataFrame recognizes optional encoding.
-    # https://github.com/pandas-dev/pandas/issues/41404
-    # https://github.com/pandas-dev/pandas/pull/42049
-    obj = DataFrame({"x": np.arange(3), "y": list("a+c")})
-
-    a = hash_pandas_object(obj, encoding="utf8")
-    b = hash_pandas_object(obj, encoding="utf7")
-
-    # Note that the "+" is encoded as "+-" in utf-7.
-    assert a[0] == b[0]
-    assert a[1] != b[1]
-    assert a[2] == b[2]
-
-
-def test_invalid_key():
-    # This only matters for object dtypes.
-    msg = "key should be a 16-byte string encoded"
-
-    with pytest.raises(ValueError, match=msg):
-        hash_pandas_object(Series(list("abc")), hash_key="foo")
-
-
-def test_already_encoded(index):
-    # If already encoded, then ok.
-    obj = Series(list("abc")).str.encode("utf8")
-    a = hash_pandas_object(obj, index=index)
-    b = hash_pandas_object(obj, index=index)
-    tm.assert_series_equal(a, b)
-
-
-def test_alternate_encoding(index):
-    obj = Series(list("abc"))
-    a = hash_pandas_object(obj, index=index)
-    b = hash_pandas_object(obj, index=index)
-    tm.assert_series_equal(a, b)
-
-
-@pytest.mark.parametrize("l_exp", range(8))
-@pytest.mark.parametrize("l_add", [0, 1])
-def test_same_len_hash_collisions(l_exp, l_add):
-    length = 2 ** (l_exp + 8) + l_add
-    idx = np.array([str(i) for i in range(length)], dtype=object)
-
-    result = hash_array(idx, "utf8")
-    assert not result[0] == result[1]
-
-
-def test_hash_collisions():
-    # Hash collisions are bad.
-    #
-    # https://github.com/pandas-dev/pandas/issues/14711#issuecomment-264885726
-    hashes = [
-        "Ingrid-9Z9fKIZmkO7i7Cn51Li34pJm44fgX6DYGBNj3VPlOH50m7HnBlPxfIwFMrcNJNMP6PSgLmwWnInciMWrCSAlLEvt7JkJl4IxiMrVbXSa8ZQoVaq5xoQPjltuJEfwdNlO6jo8qRRHvD8sBEBMQASrRa6TsdaPTPCBo3nwIBpE7YzzmyH0vMBhjQZLx1aCT7faSEx7PgFxQhHdKFWROcysamgy9iVj8DO2Fmwg1NNl93rIAqC3mdqfrCxrzfvIY8aJdzin2cHVzy3QUJxZgHvtUtOLxoqnUHsYbNTeq0xcLXpTZEZCxD4PGubIuCNf32c33M7HFsnjWSEjE2yVdWKhmSVodyF8hFYVmhYnMCztQnJrt3O8ZvVRXd5IKwlLexiSp4h888w7SzAIcKgc3g5XQJf6MlSMftDXm9lIsE1mJNiJEv6uY6pgvC3fUPhatlR5JPpVAHNSbSEE73MBzJrhCAbOLXQumyOXigZuPoME7QgJcBalliQol7YZ9",
-        "Tim-b9MddTxOWW2AT1Py6vtVbZwGAmYCjbp89p8mxsiFoVX4FyDOF3wFiAkyQTUgwg9sVqVYOZo09Dh1AzhFHbgij52ylF0SEwgzjzHH8TGY8Lypart4p4onnDoDvVMBa0kdthVGKl6K0BDVGzyOXPXKpmnMF1H6rJzqHJ0HywfwS4XYpVwlAkoeNsiicHkJUFdUAhG229INzvIAiJuAHeJDUoyO4DCBqtoZ5TDend6TK7Y914yHlfH3g1WZu5LksKv68VQHJriWFYusW5e6ZZ6dKaMjTwEGuRgdT66iU5nqWTHRH8WSzpXoCFwGcTOwyuqPSe0fTe21DVtJn1FKj9F9nEnR9xOvJUO7E0piCIF4Ad9yAIDY4DBimpsTfKXCu1vdHpKYerzbndfuFe5AhfMduLYZJi5iAw8qKSwR5h86ttXV0Mc0QmXz8dsRvDgxjXSmupPxBggdlqUlC828hXiTPD7am0yETBV0F3bEtvPiNJfremszcV8NcqAoARMe",
-    ]
-
-    # These should be different.
-    result1 = hash_array(np.asarray(hashes[0:1], dtype=object), "utf8")
-    expected1 = np.array([14963968704024874985], dtype=np.uint64)
-    tm.assert_numpy_array_equal(result1, expected1)
-
-    result2 = hash_array(np.asarray(hashes[1:2], dtype=object), "utf8")
-    expected2 = np.array([16428432627716348016], dtype=np.uint64)
-    tm.assert_numpy_array_equal(result2, expected2)
-
-    result = hash_array(np.asarray(hashes, dtype=object), "utf8")
-    tm.assert_numpy_array_equal(result, np.concatenate([expected1, expected2], axis=0))
-
-
-@pytest.mark.parametrize(
-    "data, result_data",
-    [
-        [[tuple("1"), tuple("2")], [10345501319357378243, 8331063931016360761]],
-        [[(1,), (2,)], [9408946347443669104, 3278256261030523334]],
-    ],
-)
-def test_hash_with_tuple(data, result_data):
-    # GH#28969 array containing a tuple raises on call to arr.astype(str)
-    #  apparently a numpy bug github.com/numpy/numpy/issues/9441
-
-    df = DataFrame({"data": data})
-    result = hash_pandas_object(df)
-    expected = Series(result_data, dtype=np.uint64)
-    tm.assert_series_equal(result, expected)
-
-
-def test_hashable_tuple_args():
-    # require that the elements of such tuples are themselves hashable
-
-    df3 = DataFrame(
-        {
-            "data": [
-                (
-                    1,
-                    [],
-                ),
-                (
-                    2,
-                    {},
-                ),
-            ]
-        }
-    )
-    with pytest.raises(TypeError, match="unhashable type: 'list'"):
-        hash_pandas_object(df3)
-
-
-def test_hash_object_none_key():
-    # https://github.com/pandas-dev/pandas/issues/30887
-    result = pd.util.hash_pandas_object(Series(["a", "b"]), hash_key=None)
-    expected = Series([4578374827886788867, 17338122309987883691], dtype="uint64")
-    tm.assert_series_equal(result, expected)
+def test_wrong_hash_name():
+    msg = "Valid options for 'hash_name' are"
+    with raises(ValueError, match=msg):
+        data = {"foo": "bar"}
+        hash(data, hash_name="invalid")

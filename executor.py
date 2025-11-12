@@ -1,239 +1,131 @@
-from __future__ import annotations
+"""Utility function to construct a loky.ReusableExecutor with custom pickler.
 
-import functools
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Callable,
-)
+This module provides efficient ways of working with data stored in
+shared memory with numpy.memmap arrays without inducing any memory
+copy between the parent and child processes.
+"""
+# Author: Thomas Moreau <thomas.moreau.2010@gmail.com>
+# Copyright: 2017, Thomas Moreau
+# License: BSD 3 clause
 
-if TYPE_CHECKING:
-    from pandas._typing import Scalar
+from ._memmapping_reducer import TemporaryResourcesManager, get_memmapping_reducers
+from .externals.loky.reusable_executor import _ReusablePoolExecutor
 
-import numpy as np
-
-from pandas.compat._optional import import_optional_dependency
-
-
-@functools.cache
-def generate_apply_looper(func, nopython=True, nogil=True, parallel=False):
-    if TYPE_CHECKING:
-        import numba
-    else:
-        numba = import_optional_dependency("numba")
-    nb_compat_func = numba.extending.register_jitable(func)
-
-    @numba.jit(nopython=nopython, nogil=nogil, parallel=parallel)
-    def nb_looper(values, axis):
-        # Operate on the first row/col in order to get
-        # the output shape
-        if axis == 0:
-            first_elem = values[:, 0]
-            dim0 = values.shape[1]
-        else:
-            first_elem = values[0]
-            dim0 = values.shape[0]
-        res0 = nb_compat_func(first_elem)
-        # Use np.asarray to get shape for
-        # https://github.com/numba/numba/issues/4202#issuecomment-1185981507
-        buf_shape = (dim0,) + np.atleast_1d(np.asarray(res0)).shape
-        if axis == 0:
-            buf_shape = buf_shape[::-1]
-        buff = np.empty(buf_shape)
-
-        if axis == 1:
-            buff[0] = res0
-            for i in numba.prange(1, values.shape[0]):
-                buff[i] = nb_compat_func(values[i])
-        else:
-            buff[:, 0] = res0
-            for j in numba.prange(1, values.shape[1]):
-                buff[:, j] = nb_compat_func(values[:, j])
-        return buff
-
-    return nb_looper
+_executor_args = None
 
 
-@functools.cache
-def make_looper(func, result_dtype, is_grouped_kernel, nopython, nogil, parallel):
-    if TYPE_CHECKING:
-        import numba
-    else:
-        numba = import_optional_dependency("numba")
-
-    if is_grouped_kernel:
-
-        @numba.jit(nopython=nopython, nogil=nogil, parallel=parallel)
-        def column_looper(
-            values: np.ndarray,
-            labels: np.ndarray,
-            ngroups: int,
-            min_periods: int,
-            *args,
-        ):
-            result = np.empty((values.shape[0], ngroups), dtype=result_dtype)
-            na_positions = {}
-            for i in numba.prange(values.shape[0]):
-                output, na_pos = func(
-                    values[i], result_dtype, labels, ngroups, min_periods, *args
-                )
-                result[i] = output
-                if len(na_pos) > 0:
-                    na_positions[i] = np.array(na_pos)
-            return result, na_positions
-
-    else:
-
-        @numba.jit(nopython=nopython, nogil=nogil, parallel=parallel)
-        def column_looper(
-            values: np.ndarray,
-            start: np.ndarray,
-            end: np.ndarray,
-            min_periods: int,
-            *args,
-        ):
-            result = np.empty((values.shape[0], len(start)), dtype=result_dtype)
-            na_positions = {}
-            for i in numba.prange(values.shape[0]):
-                output, na_pos = func(
-                    values[i], result_dtype, start, end, min_periods, *args
-                )
-                result[i] = output
-                if len(na_pos) > 0:
-                    na_positions[i] = np.array(na_pos)
-            return result, na_positions
-
-    return column_looper
+def get_memmapping_executor(n_jobs, **kwargs):
+    return MemmappingExecutor.get_memmapping_executor(n_jobs, **kwargs)
 
 
-default_dtype_mapping: dict[np.dtype, Any] = {
-    np.dtype("int8"): np.int64,
-    np.dtype("int16"): np.int64,
-    np.dtype("int32"): np.int64,
-    np.dtype("int64"): np.int64,
-    np.dtype("uint8"): np.uint64,
-    np.dtype("uint16"): np.uint64,
-    np.dtype("uint32"): np.uint64,
-    np.dtype("uint64"): np.uint64,
-    np.dtype("float32"): np.float64,
-    np.dtype("float64"): np.float64,
-    np.dtype("complex64"): np.complex128,
-    np.dtype("complex128"): np.complex128,
-}
-
-
-# TODO: Preserve complex dtypes
-
-float_dtype_mapping: dict[np.dtype, Any] = {
-    np.dtype("int8"): np.float64,
-    np.dtype("int16"): np.float64,
-    np.dtype("int32"): np.float64,
-    np.dtype("int64"): np.float64,
-    np.dtype("uint8"): np.float64,
-    np.dtype("uint16"): np.float64,
-    np.dtype("uint32"): np.float64,
-    np.dtype("uint64"): np.float64,
-    np.dtype("float32"): np.float64,
-    np.dtype("float64"): np.float64,
-    np.dtype("complex64"): np.float64,
-    np.dtype("complex128"): np.float64,
-}
-
-identity_dtype_mapping: dict[np.dtype, Any] = {
-    np.dtype("int8"): np.int8,
-    np.dtype("int16"): np.int16,
-    np.dtype("int32"): np.int32,
-    np.dtype("int64"): np.int64,
-    np.dtype("uint8"): np.uint8,
-    np.dtype("uint16"): np.uint16,
-    np.dtype("uint32"): np.uint32,
-    np.dtype("uint64"): np.uint64,
-    np.dtype("float32"): np.float32,
-    np.dtype("float64"): np.float64,
-    np.dtype("complex64"): np.complex64,
-    np.dtype("complex128"): np.complex128,
-}
-
-
-def generate_shared_aggregator(
-    func: Callable[..., Scalar],
-    dtype_mapping: dict[np.dtype, np.dtype],
-    is_grouped_kernel: bool,
-    nopython: bool,
-    nogil: bool,
-    parallel: bool,
-):
-    """
-    Generate a Numba function that loops over the columns 2D object and applies
-    a 1D numba kernel over each column.
-
-    Parameters
-    ----------
-    func : function
-        aggregation function to be applied to each column
-    dtype_mapping: dict or None
-        If not None, maps a dtype to a result dtype.
-        Otherwise, will fall back to default mapping.
-    is_grouped_kernel: bool, default False
-        Whether func operates using the group labels (True)
-        or using starts/ends arrays
-
-        If true, you also need to pass the number of groups to this function
-    nopython : bool
-        nopython to be passed into numba.jit
-    nogil : bool
-        nogil to be passed into numba.jit
-    parallel : bool
-        parallel to be passed into numba.jit
-
-    Returns
-    -------
-    Numba function
-    """
-
-    # A wrapper around the looper function,
-    # to dispatch based on dtype since numba is unable to do that in nopython mode
-
-    # It also post-processes the values by inserting nans where number of observations
-    # is less than min_periods
-    # Cannot do this in numba nopython mode
-    # (you'll run into type-unification error when you cast int -> float)
-    def looper_wrapper(
-        values,
-        start=None,
-        end=None,
-        labels=None,
-        ngroups=None,
-        min_periods: int = 0,
-        **kwargs,
+class MemmappingExecutor(_ReusablePoolExecutor):
+    @classmethod
+    def get_memmapping_executor(
+        cls,
+        n_jobs,
+        timeout=300,
+        initializer=None,
+        initargs=(),
+        env=None,
+        temp_folder=None,
+        context_id=None,
+        **backend_args,
     ):
-        result_dtype = dtype_mapping[values.dtype]
-        column_looper = make_looper(
-            func, result_dtype, is_grouped_kernel, nopython, nogil, parallel
+        """Factory for ReusableExecutor with automatic memmapping for large
+        numpy arrays.
+        """
+        global _executor_args
+        # Check if we can reuse the executor here instead of deferring the test
+        # to loky as the reducers are objects that changes at each call.
+        executor_args = backend_args.copy()
+        executor_args.update(env if env else {})
+        executor_args.update(
+            dict(timeout=timeout, initializer=initializer, initargs=initargs)
         )
-        # Need to unpack kwargs since numba only supports *args
-        if is_grouped_kernel:
-            result, na_positions = column_looper(
-                values, labels, ngroups, min_periods, *kwargs.values()
-            )
-        else:
-            result, na_positions = column_looper(
-                values, start, end, min_periods, *kwargs.values()
-            )
-        if result.dtype.kind == "i":
-            # Look if na_positions is not empty
-            # If so, convert the whole block
-            # This is OK since int dtype cannot hold nan,
-            # so if min_periods not satisfied for 1 col, it is not satisfied for
-            # all columns at that index
-            for na_pos in na_positions.values():
-                if len(na_pos) > 0:
-                    result = result.astype("float64")
-                    break
-        # TODO: Optimize this
-        for i, na_pos in na_positions.items():
-            if len(na_pos) > 0:
-                result[i, na_pos] = np.nan
-        return result
+        reuse = _executor_args is None or _executor_args == executor_args
+        _executor_args = executor_args
 
-    return looper_wrapper
+        manager = TemporaryResourcesManager(temp_folder)
+
+        # reducers access the temporary folder in which to store temporary
+        # pickles through a call to manager.resolve_temp_folder_name. resolving
+        # the folder name dynamically is useful to use different folders across
+        # calls of a same reusable executor
+        job_reducers, result_reducers = get_memmapping_reducers(
+            unlink_on_gc_collect=True,
+            temp_folder_resolver=manager.resolve_temp_folder_name,
+            **backend_args,
+        )
+        _executor, executor_is_reused = super().get_reusable_executor(
+            n_jobs,
+            job_reducers=job_reducers,
+            result_reducers=result_reducers,
+            reuse=reuse,
+            timeout=timeout,
+            initializer=initializer,
+            initargs=initargs,
+            env=env,
+        )
+
+        if not executor_is_reused:
+            # Only set a _temp_folder_manager for new executors. Reused
+            # executors already have a _temporary_folder_manager that must not
+            # be re-assigned like that because it is referenced in various
+            # places in the reducing machinery of the executor.
+            _executor._temp_folder_manager = manager
+
+        if context_id is not None:
+            # Only register the specified context once we know which manager
+            # the current executor is using, in order to not register an atexit
+            # finalizer twice for the same folder.
+            _executor._temp_folder_manager.register_new_context(context_id)
+
+        return _executor
+
+    def terminate(self, kill_workers=False):
+        self.shutdown(kill_workers=kill_workers)
+
+        # When workers are killed in a brutal manner, they cannot execute the
+        # finalizer of their shared memmaps. The refcount of those memmaps may
+        # be off by an unknown number, so instead of decref'ing them, we force
+        # delete the whole temporary folder, and unregister them. There is no
+        # risk of PermissionError at folder deletion because at this
+        # point, all child processes are dead, so all references to temporary
+        # memmaps are closed. Otherwise, just try to delete as much as possible
+        # with allow_non_empty=True but if we can't, it will be clean up later
+        # on by the resource_tracker.
+        with self._submit_resize_lock:
+            self._temp_folder_manager._clean_temporary_resources(
+                force=kill_workers, allow_non_empty=True
+            )
+
+    @property
+    def _temp_folder(self):
+        # Legacy property in tests. could be removed if we refactored the
+        # memmapping tests. SHOULD ONLY BE USED IN TESTS!
+        # We cache this property because it is called late in the tests - at
+        # this point, all context have been unregistered, and
+        # resolve_temp_folder_name raises an error.
+        if getattr(self, "_cached_temp_folder", None) is not None:
+            return self._cached_temp_folder
+        else:
+            self._cached_temp_folder = (
+                self._temp_folder_manager.resolve_temp_folder_name()
+            )  # noqa
+            return self._cached_temp_folder
+
+
+class _TestingMemmappingExecutor(MemmappingExecutor):
+    """Wrapper around ReusableExecutor to ease memmapping testing with Pool
+    and Executor. This is only for testing purposes.
+
+    """
+
+    def apply_async(self, func, args):
+        """Schedule a func to be run"""
+        future = self.submit(func, *args)
+        future.get = future.result
+        return future
+
+    def map(self, f, *args):
+        return list(super().map(f, *args))

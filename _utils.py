@@ -1,63 +1,83 @@
-from __future__ import annotations
+# Adapted from https://stackoverflow.com/a/9558001/2536294
 
-from typing import (
-    TYPE_CHECKING,
-    Any,
-)
+import ast
+import operator as op
+from dataclasses import dataclass
 
-import numpy as np
+from ._multiprocessing_helpers import mp
 
-from pandas._libs import lib
-from pandas.errors import LossySetitemError
-
-from pandas.core.dtypes.cast import np_can_hold_element
-from pandas.core.dtypes.common import is_numeric_dtype
-
-if TYPE_CHECKING:
-    from pandas._typing import (
-        ArrayLike,
-        npt,
-    )
+if mp is not None:
+    from .externals.loky.process_executor import _ExceptionWithTraceback
 
 
-def to_numpy_dtype_inference(
-    arr: ArrayLike, dtype: npt.DTypeLike | None, na_value, hasna: bool
-) -> tuple[npt.DTypeLike, Any]:
-    if dtype is None and is_numeric_dtype(arr.dtype):
-        dtype_given = False
-        if hasna:
-            if arr.dtype.kind == "b":
-                dtype = np.dtype(np.object_)
-            else:
-                if arr.dtype.kind in "iu":
-                    dtype = np.dtype(np.float64)
-                else:
-                    dtype = arr.dtype.numpy_dtype  # type: ignore[union-attr]
-                if na_value is lib.no_default:
-                    na_value = np.nan
-        else:
-            dtype = arr.dtype.numpy_dtype  # type: ignore[union-attr]
-    elif dtype is not None:
-        dtype = np.dtype(dtype)
-        dtype_given = True
+# supported operators
+operators = {
+    ast.Add: op.add,
+    ast.Sub: op.sub,
+    ast.Mult: op.mul,
+    ast.Div: op.truediv,
+    ast.FloorDiv: op.floordiv,
+    ast.Mod: op.mod,
+    ast.Pow: op.pow,
+    ast.USub: op.neg,
+}
+
+
+def eval_expr(expr):
+    """
+    >>> eval_expr('2*6')
+    12
+    >>> eval_expr('2**6')
+    64
+    >>> eval_expr('1 + 2*3**(4) / (6 + -7)')
+    -161.0
+    """
+    try:
+        return eval_(ast.parse(expr, mode="eval").body)
+    except (TypeError, SyntaxError, KeyError) as e:
+        raise ValueError(
+            f"{expr!r} is not a valid or supported arithmetic expression."
+        ) from e
+
+
+def eval_(node):
+    if isinstance(node, ast.Constant):  # <constant>
+        return node.value
+    elif isinstance(node, ast.BinOp):  # <left> <operator> <right>
+        return operators[type(node.op)](eval_(node.left), eval_(node.right))
+    elif isinstance(node, ast.UnaryOp):  # <operator> <operand> e.g., -1
+        return operators[type(node.op)](eval_(node.operand))
     else:
-        dtype_given = True
+        raise TypeError(node)
 
-    if na_value is lib.no_default:
-        if dtype is None or not hasna:
-            na_value = arr.dtype.na_value
-        elif dtype.kind == "f":  # type: ignore[union-attr]
-            na_value = np.nan
-        elif dtype.kind == "M":  # type: ignore[union-attr]
-            na_value = np.datetime64("nat")
-        elif dtype.kind == "m":  # type: ignore[union-attr]
-            na_value = np.timedelta64("nat")
-        else:
-            na_value = arr.dtype.na_value
 
-    if not dtype_given and hasna:
+@dataclass(frozen=True)
+class _Sentinel:
+    """A sentinel to mark a parameter as not explicitly set"""
+
+    default_value: object
+
+    def __repr__(self):
+        return f"default({self.default_value!r})"
+
+
+class _TracebackCapturingWrapper:
+    """Protect function call and return error with traceback."""
+
+    def __init__(self, func):
+        self.func = func
+
+    def __call__(self, **kwargs):
         try:
-            np_can_hold_element(dtype, na_value)  # type: ignore[arg-type]
-        except LossySetitemError:
-            dtype = np.dtype(np.object_)
-    return dtype, na_value
+            return self.func(**kwargs)
+        except BaseException as e:
+            return _ExceptionWithTraceback(e)
+
+
+def _retrieve_traceback_capturing_wrapped_call(out):
+    if isinstance(out, _ExceptionWithTraceback):
+        rebuild, args = out.__reduce__()
+        out = rebuild(*args)
+    if isinstance(out, BaseException):
+        raise out
+    return out

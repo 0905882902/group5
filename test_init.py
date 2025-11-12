@@ -1,20 +1,15 @@
-# Basic unittests to test functioning of module's top-level
-
-
-__author__ = "Yaroslav Halchenko"
-__license__ = "BSD"
-
+# Basic test case to test functioning of module's top-level
 
 try:
-    from sklearn import *  # noqa
+    from joblib import *  # noqa
 
     _top_import_error = None
-except Exception as e:
-    _top_import_error = e
+except Exception as ex:  # pragma: no cover
+    _top_import_error = ex
 
 
-def test_import_skl():
+def test_import_joblib():
     # Test either above import has failed for some reason
-    # "import *" is discouraged outside of the module level, hence we
+    # "import *" only allowed at module level, hence we
     # rely on setting up the variable above
     assert _top_import_error is None
