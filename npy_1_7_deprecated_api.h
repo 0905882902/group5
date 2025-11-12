@@ -66,6 +66,13 @@
 /* This way of accessing the default type is deprecated as of NumPy 1.7 */
 #define PyArray_DEFAULT NPY_DEFAULT_TYPE
 
+/* These DATETIME bits aren't used internally */
+#define PyDataType_GetDatetimeMetaData(descr)                                 \
+    ((descr->metadata == NULL) ? NULL :                                       \
+        ((PyArray_DatetimeMetaData *)(PyCapsule_GetPointer(                   \
+                PyDict_GetItemString(                                         \
+                    descr->metadata, NPY_METADATA_DTSTR), NULL))))
+
 /*
  * Deprecated as of NumPy 1.7, this kind of shortcut doesn't
  * belong in the public API.
@@ -108,5 +115,10 @@
 #define NPY_STR_fs "fs"
 #define NPY_STR_as "as"
 
+/*
+ * The macros in old_defines.h are Deprecated as of NumPy 1.7 and will be
+ * removed in the next major release.
+ */
+#include "old_defines.h"
 
 #endif  /* NUMPY_CORE_INCLUDE_NUMPY_NPY_1_7_DEPRECATED_API_H_ */

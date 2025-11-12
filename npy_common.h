@@ -195,11 +195,11 @@ enum {
 };
 
 /*
- * This is to typedef npy_intp to the appropriate size for Py_ssize_t.
- * (Before NumPy 2.0 we used Py_intptr_t and Py_uintptr_t from `pyport.h`.)
+ * This is to typedef npy_intp to the appropriate pointer size for this
+ * platform.  Py_intptr_t, Py_uintptr_t are defined in pyport.h.
  */
-typedef Py_ssize_t npy_intp;
-typedef size_t npy_uintp;
+typedef Py_intptr_t npy_intp;
+typedef Py_uintptr_t npy_uintp;
 
 /*
  * Define sizes that were not defined in numpyconfig.h.
@@ -208,6 +208,8 @@ typedef size_t npy_uintp;
 #define NPY_SIZEOF_BYTE 1
 #define NPY_SIZEOF_DATETIME 8
 #define NPY_SIZEOF_TIMEDELTA 8
+#define NPY_SIZEOF_INTP NPY_SIZEOF_PY_INTPTR_T
+#define NPY_SIZEOF_UINTP NPY_SIZEOF_PY_INTPTR_T
 #define NPY_SIZEOF_HALF 2
 #define NPY_SIZEOF_CFLOAT NPY_SIZEOF_COMPLEX_FLOAT
 #define NPY_SIZEOF_CDOUBLE NPY_SIZEOF_COMPLEX_DOUBLE
@@ -226,16 +228,7 @@ typedef size_t npy_uintp;
  *      functions use different formatting codes that are portably specified
  *      according to the Python documentation. See issue gh-2388.
  */
-#if NPY_SIZEOF_INTP == NPY_SIZEOF_LONG
-        #define NPY_INTP NPY_LONG
-        #define NPY_UINTP NPY_ULONG
-        #define PyIntpArrType_Type PyLongArrType_Type
-        #define PyUIntpArrType_Type PyULongArrType_Type
-        #define NPY_MAX_INTP NPY_MAX_LONG
-        #define NPY_MIN_INTP NPY_MIN_LONG
-        #define NPY_MAX_UINTP NPY_MAX_ULONG
-        #define NPY_INTP_FMT "ld"
-#elif NPY_SIZEOF_INTP == NPY_SIZEOF_INT
+#if NPY_SIZEOF_PY_INTPTR_T == NPY_SIZEOF_INT
         #define NPY_INTP NPY_INT
         #define NPY_UINTP NPY_UINT
         #define PyIntpArrType_Type PyIntArrType_Type
@@ -244,7 +237,16 @@ typedef size_t npy_uintp;
         #define NPY_MIN_INTP NPY_MIN_INT
         #define NPY_MAX_UINTP NPY_MAX_UINT
         #define NPY_INTP_FMT "d"
-#elif defined(PY_LONG_LONG) && (NPY_SIZEOF_INTP == NPY_SIZEOF_LONGLONG)
+#elif NPY_SIZEOF_PY_INTPTR_T == NPY_SIZEOF_LONG
+        #define NPY_INTP NPY_LONG
+        #define NPY_UINTP NPY_ULONG
+        #define PyIntpArrType_Type PyLongArrType_Type
+        #define PyUIntpArrType_Type PyULongArrType_Type
+        #define NPY_MAX_INTP NPY_MAX_LONG
+        #define NPY_MIN_INTP NPY_MIN_LONG
+        #define NPY_MAX_UINTP NPY_MAX_ULONG
+        #define NPY_INTP_FMT "ld"
+#elif defined(PY_LONG_LONG) && (NPY_SIZEOF_PY_INTPTR_T == NPY_SIZEOF_LONGLONG)
         #define NPY_INTP NPY_LONGLONG
         #define NPY_UINTP NPY_ULONGLONG
         #define PyIntpArrType_Type PyLongLongArrType_Type
@@ -253,8 +255,18 @@ typedef size_t npy_uintp;
         #define NPY_MIN_INTP NPY_MIN_LONGLONG
         #define NPY_MAX_UINTP NPY_MAX_ULONGLONG
         #define NPY_INTP_FMT "lld"
-#else
-    #error "Failed to correctly define NPY_INTP and NPY_UINTP"
+#endif
+
+/*
+ * We can only use C99 formats for npy_int_p if it is the same as
+ * intp_t, hence the condition on HAVE_UNITPTR_T
+ */
+#if (NPY_USE_C99_FORMATS) == 1 \
+        && (defined HAVE_UINTPTR_T) \
+        && (defined HAVE_INTTYPES_H)
+        #include <inttypes.h>
+        #undef NPY_INTP_FMT
+        #define NPY_INTP_FMT PRIdPTR
 #endif
 
 
@@ -324,11 +336,9 @@ typedef unsigned char npy_bool;
  */
 #if NPY_SIZEOF_LONGDOUBLE == NPY_SIZEOF_DOUBLE
     #define NPY_LONGDOUBLE_FMT "g"
-    #define longdouble_t double
     typedef double npy_longdouble;
 #else
     #define NPY_LONGDOUBLE_FMT "Lg"
-    #define longdouble_t long double
     typedef long double npy_longdouble;
 #endif
 
@@ -354,39 +364,49 @@ typedef double npy_double;
 typedef Py_hash_t npy_hash_t;
 #define NPY_SIZEOF_HASH_T NPY_SIZEOF_INTP
 
-#if defined(__cplusplus)
-
-typedef struct
-{
-    double _Val[2];
-} npy_cdouble;
-
-typedef struct
-{
-    float _Val[2];
-} npy_cfloat;
-
-typedef struct
-{
-    long double _Val[2];
-} npy_clongdouble;
-
+/*
+ * Disabling C99 complex usage: a lot of C code in numpy/scipy rely on being
+ * able to do .real/.imag. Will have to convert code first.
+ */
+#if 0
+#if defined(NPY_USE_C99_COMPLEX) && defined(NPY_HAVE_COMPLEX_DOUBLE)
+typedef complex npy_cdouble;
 #else
-
-#include <complex.h>
-
-
-#if defined(_MSC_VER) && !defined(__INTEL_COMPILER)
-typedef _Dcomplex npy_cdouble;
-typedef _Fcomplex npy_cfloat;
-typedef _Lcomplex npy_clongdouble;
-#else /* !defined(_MSC_VER) || defined(__INTEL_COMPILER) */
-typedef double _Complex npy_cdouble;
-typedef float _Complex npy_cfloat;
-typedef longdouble_t _Complex npy_clongdouble;
+typedef struct { double real, imag; } npy_cdouble;
 #endif
 
+#if defined(NPY_USE_C99_COMPLEX) && defined(NPY_HAVE_COMPLEX_FLOAT)
+typedef complex float npy_cfloat;
+#else
+typedef struct { float real, imag; } npy_cfloat;
 #endif
+
+#if defined(NPY_USE_C99_COMPLEX) && defined(NPY_HAVE_COMPLEX_LONG_DOUBLE)
+typedef complex long double npy_clongdouble;
+#else
+typedef struct {npy_longdouble real, imag;} npy_clongdouble;
+#endif
+#endif
+#if NPY_SIZEOF_COMPLEX_DOUBLE != 2 * NPY_SIZEOF_DOUBLE
+#error npy_cdouble definition is not compatible with C99 complex definition ! \
+        Please contact NumPy maintainers and give detailed information about your \
+        compiler and platform
+#endif
+typedef struct { double real, imag; } npy_cdouble;
+
+#if NPY_SIZEOF_COMPLEX_FLOAT != 2 * NPY_SIZEOF_FLOAT
+#error npy_cfloat definition is not compatible with C99 complex definition ! \
+        Please contact NumPy maintainers and give detailed information about your \
+        compiler and platform
+#endif
+typedef struct { float real, imag; } npy_cfloat;
+
+#if NPY_SIZEOF_COMPLEX_LONGDOUBLE != 2 * NPY_SIZEOF_LONGDOUBLE
+#error npy_clongdouble definition is not compatible with C99 complex definition ! \
+        Please contact NumPy maintainers and give detailed information about your \
+        compiler and platform
+#endif
+typedef struct { npy_longdouble real, imag; } npy_clongdouble;
 
 /*
  * numarray-style bit-width typedefs
