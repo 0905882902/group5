@@ -1,149 +1,141 @@
-import sys
-from numpy.testing import (
-    assert_, assert_array_equal, assert_raises,
-    )
-from numpy import random
+import os
+import pytest
+import platform
+
 import numpy as np
+import numpy.testing as npt
+
+from . import util
 
 
-class TestRegression:
+class TestIntentInOut(util.F2PyTest):
+    # Check that intent(in out) translates as intent(inout)
+    sources = [util.getpath("tests", "src", "regression", "inout.f90")]
 
-    def test_VonMises_range(self):
-        # Make sure generated random variables are in [-pi, pi].
-        # Regression test for ticket #986.
-        for mu in np.linspace(-7., 7., 5):
-            r = random.mtrand.vonmises(mu, 1, 50)
-            assert_(np.all(r > -np.pi) and np.all(r <= np.pi))
+    @pytest.mark.slow
+    def test_inout(self):
+        # non-contiguous should raise error
+        x = np.arange(6, dtype=np.float32)[::2]
+        pytest.raises(ValueError, self.module.foo, x)
 
-    def test_hypergeometric_range(self):
-        # Test for ticket #921
-        assert_(np.all(np.random.hypergeometric(3, 18, 11, size=10) < 4))
-        assert_(np.all(np.random.hypergeometric(18, 3, 11, size=10) > 0))
+        # check values with contiguous array
+        x = np.arange(3, dtype=np.float32)
+        self.module.foo(x)
+        assert np.allclose(x, [3, 1, 2])
 
-        # Test for ticket #5623
-        args = [
-            (2**20 - 2, 2**20 - 2, 2**20 - 2),  # Check for 32-bit systems
-        ]
-        is_64bits = sys.maxsize > 2**32
-        if is_64bits and sys.platform != 'win32':
-            # Check for 64-bit systems
-            args.append((2**40 - 2, 2**40 - 2, 2**40 - 2))
-        for arg in args:
-            assert_(np.random.hypergeometric(*arg) > 0)
 
-    def test_logseries_convergence(self):
-        # Test for ticket #923
-        N = 1000
-        np.random.seed(0)
-        rvsn = np.random.logseries(0.8, size=N)
-        # these two frequency counts should be close to theoretical
-        # numbers with this large sample
-        # theoretical large N result is 0.49706795
-        freq = np.sum(rvsn == 1) / N
-        msg = f'Frequency was {freq:f}, should be > 0.45'
-        assert_(freq > 0.45, msg)
-        # theoretical large N result is 0.19882718
-        freq = np.sum(rvsn == 2) / N
-        msg = f'Frequency was {freq:f}, should be < 0.23'
-        assert_(freq < 0.23, msg)
+class TestNegativeBounds(util.F2PyTest):
+    # Check that negative bounds work correctly
+    sources = [util.getpath("tests", "src", "negative_bounds", "issue_20853.f90")]
 
-    def test_shuffle_mixed_dimension(self):
-        # Test for trac ticket #2074
-        for t in [[1, 2, 3, None],
-                  [(1, 1), (2, 2), (3, 3), None],
-                  [1, (2, 2), (3, 3), None],
-                  [(1, 1), 2, 3, None]]:
-            np.random.seed(12345)
-            shuffled = list(t)
-            random.shuffle(shuffled)
-            expected = np.array([t[0], t[3], t[1], t[2]], dtype=object)
-            assert_array_equal(np.array(shuffled, dtype=object), expected)
+    @pytest.mark.slow
+    def test_negbound(self):
+        xvec = np.arange(12)
+        xlow = -6
+        xhigh = 4
+        # Calculate the upper bound,
+        # Keeping the 1 index in mind
+        def ubound(xl, xh):
+            return xh - xl + 1
+        rval = self.module.foo(is_=xlow, ie_=xhigh,
+                        arr=xvec[:ubound(xlow, xhigh)])
+        expval = np.arange(11, dtype = np.float32)
+        assert np.allclose(rval, expval)
 
-    def test_call_within_randomstate(self):
-        # Check that custom RandomState does not call into global state
-        m = np.random.RandomState()
-        res = np.array([0, 8, 7, 2, 1, 9, 4, 7, 0, 3])
-        for i in range(3):
-            np.random.seed(i)
-            m.seed(4321)
-            # If m.state is not honored, the result will change
-            assert_array_equal(m.choice(10, size=10, p=np.ones(10)/10.), res)
 
-    def test_multivariate_normal_size_types(self):
-        # Test for multivariate_normal issue with 'size' argument.
-        # Check that the multivariate_normal size argument can be a
-        # numpy integer.
-        np.random.multivariate_normal([0], [[0]], size=1)
-        np.random.multivariate_normal([0], [[0]], size=np.int_(1))
-        np.random.multivariate_normal([0], [[0]], size=np.int64(1))
+class TestNumpyVersionAttribute(util.F2PyTest):
+    # Check that th attribute __f2py_numpy_version__ is present
+    # in the compiled module and that has the value np.__version__.
+    sources = [util.getpath("tests", "src", "regression", "inout.f90")]
 
-    def test_beta_small_parameters(self):
-        # Test that beta with small a and b parameters does not produce
-        # NaNs due to roundoff errors causing 0 / 0, gh-5851
-        np.random.seed(1234567890)
-        x = np.random.beta(0.0001, 0.0001, size=100)
-        assert_(not np.any(np.isnan(x)), 'Nans in np.random.beta')
+    @pytest.mark.slow
+    def test_numpy_version_attribute(self):
 
-    def test_choice_sum_of_probs_tolerance(self):
-        # The sum of probs should be 1.0 with some tolerance.
-        # For low precision dtypes the tolerance was too tight.
-        # See numpy github issue 6123.
-        np.random.seed(1234)
-        a = [1, 2, 3]
-        counts = [4, 4, 2]
-        for dt in np.float16, np.float32, np.float64:
-            probs = np.array(counts, dtype=dt) / sum(counts)
-            c = np.random.choice(a, p=probs)
-            assert_(c in a)
-            assert_raises(ValueError, np.random.choice, a, p=probs*0.9)
+        # Check that self.module has an attribute named "__f2py_numpy_version__"
+        assert hasattr(self.module, "__f2py_numpy_version__")
 
-    def test_shuffle_of_array_of_different_length_strings(self):
-        # Test that permuting an array of different length strings
-        # will not cause a segfault on garbage collection
-        # Tests gh-7710
-        np.random.seed(1234)
+        # Check that the attribute __f2py_numpy_version__ is a string
+        assert isinstance(self.module.__f2py_numpy_version__, str)
 
-        a = np.array(['a', 'a' * 1000])
+        # Check that __f2py_numpy_version__ has the value numpy.__version__
+        assert np.__version__ == self.module.__f2py_numpy_version__
 
-        for _ in range(100):
-            np.random.shuffle(a)
 
-        # Force Garbage Collection - should not segfault.
-        import gc
-        gc.collect()
+def test_include_path():
+    incdir = np.f2py.get_include()
+    fnames_in_dir = os.listdir(incdir)
+    for fname in ("fortranobject.c", "fortranobject.h"):
+        assert fname in fnames_in_dir
 
-    def test_shuffle_of_array_of_objects(self):
-        # Test that permuting an array of objects will not cause
-        # a segfault on garbage collection.
-        # See gh-7719
-        np.random.seed(1234)
-        a = np.array([np.arange(1), np.arange(4)], dtype=object)
 
-        for _ in range(1000):
-            np.random.shuffle(a)
+class TestIncludeFiles(util.F2PyTest):
+    sources = [util.getpath("tests", "src", "regression", "incfile.f90")]
+    options = [f"-I{util.getpath('tests', 'src', 'regression')}",
+               f"--include-paths {util.getpath('tests', 'src', 'regression')}"]
 
-        # Force Garbage Collection - should not segfault.
-        import gc
-        gc.collect()
+    @pytest.mark.slow
+    def test_gh25344(self):
+        exp = 7.0
+        res = self.module.add(3.0, 4.0)
+        assert  exp == res
 
-    def test_permutation_subclass(self):
-        class N(np.ndarray):
-            pass
+class TestF77Comments(util.F2PyTest):
+    # Check that comments are stripped from F77 continuation lines
+    sources = [util.getpath("tests", "src", "regression", "f77comments.f")]
 
-        np.random.seed(1)
-        orig = np.arange(3).view(N)
-        perm = np.random.permutation(orig)
-        assert_array_equal(perm, np.array([0, 2, 1]))
-        assert_array_equal(orig, np.arange(3).view(N))
+    @pytest.mark.slow
+    def test_gh26148(self):
+        x1 = np.array(3, dtype=np.int32)
+        x2 = np.array(5, dtype=np.int32)
+        res=self.module.testsub(x1, x2)
+        assert(res[0] == 8)
+        assert(res[1] == 15)
 
-        class M:
-            a = np.arange(5)
+    @pytest.mark.slow
+    def test_gh26466(self):
+        # Check that comments after PARAMETER directions are stripped
+        expected = np.arange(1, 11, dtype=np.float32)*2
+        res=self.module.testsub2()
+        npt.assert_allclose(expected, res)
 
-            def __array__(self, dtype=None, copy=None):
-                return self.a
+class TestF90Contiuation(util.F2PyTest):
+    # Check that comments are stripped from F90 continuation lines
+    sources = [util.getpath("tests", "src", "regression", "f90continuation.f90")]
 
-        np.random.seed(1)
-        m = M()
-        perm = np.random.permutation(m)
-        assert_array_equal(perm, np.array([2, 1, 4, 0, 3]))
-        assert_array_equal(m.__array__(), np.arange(5))
+    @pytest.mark.slow
+    def test_gh26148b(self):
+        x1 = np.array(3, dtype=np.int32)
+        x2 = np.array(5, dtype=np.int32)
+        res=self.module.testsub(x1, x2)
+        assert(res[0] == 8)
+        assert(res[1] == 15)
+
+@pytest.mark.slow
+def test_gh26623():
+    # Including libraries with . should not generate an incorrect meson.build
+    try:
+        aa = util.build_module(
+            [util.getpath("tests", "src", "regression", "f90continuation.f90")],
+            ["-lfoo.bar"],
+            module_name="Blah",
+        )
+    except RuntimeError as rerr:
+        assert "lparen got assign" not in str(rerr)
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(platform.system() not in ['Linux', 'Darwin'], reason='Unsupported on this platform for now')
+def test_gh25784():
+    # Compile dubious file using passed flags
+    try:
+        aa = util.build_module(
+            [util.getpath("tests", "src", "regression", "f77fixedform.f95")],
+            options=[
+                # Meson will collect and dedup these to pass to fortran_args:
+                "--f77flags='-ffixed-form -O2'",
+                "--f90flags=\"-ffixed-form -Og\"",
+            ],
+            module_name="Blah",
+        )
+    except ImportError as rerr:
+        assert "unknown_subroutine_" in str(rerr)
