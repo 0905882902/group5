@@ -1,24 +1,38 @@
 """
-Common utilities for testing model selection.
+Common utilities for testing clustering.
+
 """
 
 import numpy as np
 
-from sklearn.model_selection import KFold
+
+###############################################################################
+# Generate sample data
 
 
-class OneTimeSplitter:
-    """A wrapper to make KFold single entry cv iterator"""
+def generate_clustered_data(
+    seed=0, n_clusters=3, n_features=2, n_samples_per_cluster=20, std=0.4
+):
+    prng = np.random.RandomState(seed)
 
-    def __init__(self, n_splits=4, n_samples=99):
-        self.n_splits = n_splits
-        self.n_samples = n_samples
-        self.indices = iter(KFold(n_splits=n_splits).split(np.ones(n_samples)))
+    # the data is voluntary shifted away from zero to check clustering
+    # algorithm robustness with regards to non centered data
+    means = (
+        np.array(
+            [
+                [1, 1, 1, 0],
+                [-1, -1, 0, 1],
+                [1, -1, 1, 1],
+                [-1, 1, 1, 0],
+            ]
+        )
+        + 10
+    )
 
-    def split(self, X=None, y=None, groups=None):
-        """Split can be called only once"""
-        for index in self.indices:
-            yield index
-
-    def get_n_splits(self, X=None, y=None, groups=None):
-        return self.n_splits
+    X = np.empty((0, n_features))
+    for i in range(n_clusters):
+        X = np.r_[
+            X,
+            means[i][:n_features] + std * prng.randn(n_samples_per_cluster, n_features),
+        ]
+    return X
