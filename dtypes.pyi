@@ -1,43 +1,83 @@
-import numpy as np
+from enum import Enum
 
+OFFSET_TO_PERIOD_FREQSTR: dict[str, str]
 
-__all__: list[str]
+def periods_per_day(reso: int = ...) -> int: ...
+def periods_per_second(reso: int) -> int: ...
+def abbrev_to_npy_unit(abbrev: str | None) -> int: ...
+def freq_to_period_freqstr(freq_n: int, freq_name: str) -> str: ...
 
-# Boolean:
-BoolDType = np.dtype[np.bool]
-# Sized integers:
-Int8DType = np.dtype[np.int8]
-UInt8DType = np.dtype[np.uint8]
-Int16DType = np.dtype[np.int16]
-UInt16DType = np.dtype[np.uint16]
-Int32DType = np.dtype[np.int32]
-UInt32DType = np.dtype[np.uint32]
-Int64DType = np.dtype[np.int64]
-UInt64DType = np.dtype[np.uint64]
-# Standard C-named version/alias:
-ByteDType = np.dtype[np.byte]
-UByteDType = np.dtype[np.ubyte]
-ShortDType = np.dtype[np.short]
-UShortDType = np.dtype[np.ushort]
-IntDType = np.dtype[np.intc]
-UIntDType = np.dtype[np.uintc]
-LongDType = np.dtype[np.long]
-ULongDType = np.dtype[np.ulong]
-LongLongDType = np.dtype[np.longlong]
-ULongLongDType = np.dtype[np.ulonglong]
-# Floats
-Float16DType = np.dtype[np.float16]
-Float32DType = np.dtype[np.float32]
-Float64DType = np.dtype[np.float64]
-LongDoubleDType = np.dtype[np.longdouble]
-# Complex:
-Complex64DType = np.dtype[np.complex64]
-Complex128DType = np.dtype[np.complex128]
-CLongDoubleDType = np.dtype[np.clongdouble]
-# Others:
-ObjectDType = np.dtype[np.object_]
-BytesDType = np.dtype[np.bytes_]
-StrDType = np.dtype[np.str_]
-VoidDType = np.dtype[np.void]
-DateTime64DType = np.dtype[np.datetime64]
-TimeDelta64DType = np.dtype[np.timedelta64]
+class PeriodDtypeBase:
+    _dtype_code: int  # PeriodDtypeCode
+    _n: int
+
+    # actually __cinit__
+    def __new__(cls, code: int, n: int): ...
+    @property
+    def _freq_group_code(self) -> int: ...
+    @property
+    def _resolution_obj(self) -> Resolution: ...
+    def _get_to_timestamp_base(self) -> int: ...
+    @property
+    def _freqstr(self) -> str: ...
+    def __hash__(self) -> int: ...
+    def _is_tick_like(self) -> bool: ...
+    @property
+    def _creso(self) -> int: ...
+    @property
+    def _td64_unit(self) -> str: ...
+
+class FreqGroup(Enum):
+    FR_ANN: int
+    FR_QTR: int
+    FR_MTH: int
+    FR_WK: int
+    FR_BUS: int
+    FR_DAY: int
+    FR_HR: int
+    FR_MIN: int
+    FR_SEC: int
+    FR_MS: int
+    FR_US: int
+    FR_NS: int
+    FR_UND: int
+    @staticmethod
+    def from_period_dtype_code(code: int) -> FreqGroup: ...
+
+class Resolution(Enum):
+    RESO_NS: int
+    RESO_US: int
+    RESO_MS: int
+    RESO_SEC: int
+    RESO_MIN: int
+    RESO_HR: int
+    RESO_DAY: int
+    RESO_MTH: int
+    RESO_QTR: int
+    RESO_YR: int
+    def __lt__(self, other: Resolution) -> bool: ...
+    def __ge__(self, other: Resolution) -> bool: ...
+    @property
+    def attrname(self) -> str: ...
+    @classmethod
+    def from_attrname(cls, attrname: str) -> Resolution: ...
+    @classmethod
+    def get_reso_from_freqstr(cls, freq: str) -> Resolution: ...
+    @property
+    def attr_abbrev(self) -> str: ...
+
+class NpyDatetimeUnit(Enum):
+    NPY_FR_Y: int
+    NPY_FR_M: int
+    NPY_FR_W: int
+    NPY_FR_D: int
+    NPY_FR_h: int
+    NPY_FR_m: int
+    NPY_FR_s: int
+    NPY_FR_ms: int
+    NPY_FR_us: int
+    NPY_FR_ns: int
+    NPY_FR_ps: int
+    NPY_FR_fs: int
+    NPY_FR_as: int
+    NPY_FR_GENERIC: int
