@@ -1,1127 +1,1240 @@
 from __future__ import annotations
 
-import datetime as dt
-import operator
-from typing import TYPE_CHECKING
+from collections import abc
+from datetime import date
+from functools import partial
+from itertools import islice
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    TypedDict,
+    Union,
+    cast,
+    overload,
+)
 import warnings
 
 import numpy as np
-import pytz
+
+from pandas._config import using_string_dtype
 
 from pandas._libs import (
-    NaT,
-    Period,
-    Timestamp,
-    index as libindex,
     lib,
+    tslib,
 )
 from pandas._libs.tslibs import (
-    Resolution,
-    Tick,
+    OutOfBoundsDatetime,
     Timedelta,
-    periods_per_day,
-    timezones,
-    to_offset,
+    Timestamp,
+    astype_overflowsafe,
+    is_supported_dtype,
+    timezones as libtimezones,
 )
-from pandas._libs.tslibs.offsets import prefix_mapping
-from pandas.util._decorators import (
-    cache_readonly,
-    doc,
+from pandas._libs.tslibs.conversion import cast_from_unit_vectorized
+from pandas._libs.tslibs.parsing import (
+    DateParseError,
+    guess_datetime_format,
+)
+from pandas._libs.tslibs.strptime import array_strptime
+from pandas._typing import (
+    AnyArrayLike,
+    ArrayLike,
+    DateTimeErrorChoices,
 )
 from pandas.util._exceptions import find_stack_level
 
-from pandas.core.dtypes.common import is_scalar
-from pandas.core.dtypes.dtypes import DatetimeTZDtype
-from pandas.core.dtypes.generic import ABCSeries
-from pandas.core.dtypes.missing import is_valid_na_for_dtype
+from pandas.core.dtypes.common import (
+    ensure_object,
+    is_float,
+    is_integer,
+    is_integer_dtype,
+    is_list_like,
+    is_numeric_dtype,
+)
+from pandas.core.dtypes.dtypes import (
+    ArrowDtype,
+    DatetimeTZDtype,
+)
+from pandas.core.dtypes.generic import (
+    ABCDataFrame,
+    ABCSeries,
+)
 
-from pandas.core.arrays.datetimes import (
+from pandas.arrays import (
     DatetimeArray,
+    IntegerArray,
+    NumpyExtensionArray,
+)
+from pandas.core.algorithms import unique
+from pandas.core.arrays import ArrowExtensionArray
+from pandas.core.arrays.base import ExtensionArray
+from pandas.core.arrays.datetimes import (
+    maybe_convert_dtype,
+    objects_to_datetime64,
     tz_to_dtype,
 )
-import pandas.core.common as com
-from pandas.core.indexes.base import (
-    Index,
-    maybe_extract_name,
-)
-from pandas.core.indexes.datetimelike import DatetimeTimedeltaMixin
-from pandas.core.indexes.extension import inherit_names
-from pandas.core.tools.times import to_time
+from pandas.core.construction import extract_array
+from pandas.core.indexes.base import Index
+from pandas.core.indexes.datetimes import DatetimeIndex
 
 if TYPE_CHECKING:
     from collections.abc import Hashable
 
-    from pandas._typing import (
-        Dtype,
-        DtypeObj,
-        Frequency,
-        IntervalClosedType,
-        Self,
-        TimeAmbiguous,
-        TimeNonexistent,
-        npt,
-    )
+    from pandas._libs.tslibs.nattype import NaTType
+    from pandas._libs.tslibs.timedeltas import UnitChoices
 
-    from pandas.core.api import (
+    from pandas import (
         DataFrame,
-        PeriodIndex,
+        Series,
     )
 
-from pandas._libs.tslibs.dtypes import OFFSET_TO_PERIOD_FREQSTR
+# ---------------------------------------------------------------------
+# types used in annotations
+
+ArrayConvertible = Union[list, tuple, AnyArrayLike]
+Scalar = Union[float, str]
+DatetimeScalar = Union[Scalar, date, np.datetime64]
+
+DatetimeScalarOrArrayConvertible = Union[DatetimeScalar, ArrayConvertible]
+
+DatetimeDictArg = Union[list[Scalar], tuple[Scalar, ...], AnyArrayLike]
 
 
-def _new_DatetimeIndex(cls, d):
+class YearMonthDayDict(TypedDict, total=True):
+    year: DatetimeDictArg
+    month: DatetimeDictArg
+    day: DatetimeDictArg
+
+
+class FulldatetimeDict(YearMonthDayDict, total=False):
+    hour: DatetimeDictArg
+    hours: DatetimeDictArg
+    minute: DatetimeDictArg
+    minutes: DatetimeDictArg
+    second: DatetimeDictArg
+    seconds: DatetimeDictArg
+    ms: DatetimeDictArg
+    us: DatetimeDictArg
+    ns: DatetimeDictArg
+
+
+DictConvertible = Union[FulldatetimeDict, "DataFrame"]
+start_caching_at = 50
+
+
+# ---------------------------------------------------------------------
+
+
+def _guess_datetime_format_for_array(arr, dayfirst: bool | None = False) -> str | None:
+    # Try to guess the format based on the first non-NaN element, return None if can't
+    if (first_non_null := tslib.first_non_null(arr)) != -1:
+        if type(first_non_nan_element := arr[first_non_null]) is str:  # noqa: E721
+            # GH#32264 np.str_ object
+            guessed_format = guess_datetime_format(
+                first_non_nan_element, dayfirst=dayfirst
+            )
+            if guessed_format is not None:
+                return guessed_format
+            # If there are multiple non-null elements, warn about
+            # how parsing might not be consistent
+            if tslib.first_non_null(arr[first_non_null + 1 :]) != -1:
+                warnings.warn(
+                    "Could not infer format, so each element will be parsed "
+                    "individually, falling back to `dateutil`. To ensure parsing is "
+                    "consistent and as-expected, please specify a format.",
+                    UserWarning,
+                    stacklevel=find_stack_level(),
+                )
+    return None
+
+
+def should_cache(
+    arg: ArrayConvertible, unique_share: float = 0.7, check_count: int | None = None
+) -> bool:
     """
-    This is called upon unpickling, rather than the default which doesn't
-    have arguments and breaks __new__
+    Decides whether to do caching.
+
+    If the percent of unique elements among `check_count` elements less
+    than `unique_share * 100` then we can do caching.
+
+    Parameters
+    ----------
+    arg: listlike, tuple, 1-d array, Series
+    unique_share: float, default=0.7, optional
+        0 < unique_share < 1
+    check_count: int, optional
+        0 <= check_count <= len(arg)
+
+    Returns
+    -------
+    do_caching: bool
+
+    Notes
+    -----
+    By default for a sequence of less than 50 items in size, we don't do
+    caching; for the number of elements less than 5000, we take ten percent of
+    all elements to check for a uniqueness share; if the sequence size is more
+    than 5000, then we check only the first 500 elements.
+    All constants were chosen empirically by.
     """
-    if "data" in d and not isinstance(d["data"], DatetimeIndex):
-        # Avoid need to verify integrity by calling simple_new directly
-        data = d.pop("data")
-        if not isinstance(data, DatetimeArray):
-            # For backward compat with older pickles, we may need to construct
-            #  a DatetimeArray to adapt to the newer _simple_new signature
-            tz = d.pop("tz")
-            freq = d.pop("freq")
-            dta = DatetimeArray._simple_new(data, dtype=tz_to_dtype(tz), freq=freq)
+    do_caching = True
+
+    # default realization
+    if check_count is None:
+        # in this case, the gain from caching is negligible
+        if len(arg) <= start_caching_at:
+            return False
+
+        if len(arg) <= 5000:
+            check_count = len(arg) // 10
         else:
-            dta = data
-            for key in ["tz", "freq"]:
-                # These are already stored in our DatetimeArray; if they are
-                #  also in the pickle and don't match, we have a problem.
-                if key in d:
-                    assert d[key] == getattr(dta, key)
-                    d.pop(key)
-        result = cls._simple_new(dta, **d)
+            check_count = 500
     else:
-        with warnings.catch_warnings():
-            # TODO: If we knew what was going in to **d, we might be able to
-            #  go through _simple_new instead
-            warnings.simplefilter("ignore")
-            result = cls.__new__(cls, **d)
+        assert (
+            0 <= check_count <= len(arg)
+        ), "check_count must be in next bounds: [0; len(arg)]"
+        if check_count == 0:
+            return False
 
+    assert 0 < unique_share < 1, "unique_share must be in next bounds: (0; 1)"
+
+    try:
+        # We can't cache if the items are not hashable.
+        unique_elements = set(islice(arg, check_count))
+    except TypeError:
+        return False
+    if len(unique_elements) > check_count * unique_share:
+        do_caching = False
+    return do_caching
+
+
+def _maybe_cache(
+    arg: ArrayConvertible,
+    format: str | None,
+    cache: bool,
+    convert_listlike: Callable,
+) -> Series:
+    """
+    Create a cache of unique dates from an array of dates
+
+    Parameters
+    ----------
+    arg : listlike, tuple, 1-d array, Series
+    format : string
+        Strftime format to parse time
+    cache : bool
+        True attempts to create a cache of converted values
+    convert_listlike : function
+        Conversion function to apply on dates
+
+    Returns
+    -------
+    cache_array : Series
+        Cache of converted, unique dates. Can be empty
+    """
+    from pandas import Series
+
+    cache_array = Series(dtype=object)
+
+    if cache:
+        # Perform a quicker unique check
+        if not should_cache(arg):
+            return cache_array
+
+        if not isinstance(arg, (np.ndarray, ExtensionArray, Index, ABCSeries)):
+            arg = np.array(arg)
+
+        unique_dates = unique(arg)
+        if len(unique_dates) < len(arg):
+            cache_dates = convert_listlike(unique_dates, format)
+            # GH#45319
+            try:
+                cache_array = Series(cache_dates, index=unique_dates, copy=False)
+            except OutOfBoundsDatetime:
+                return cache_array
+            # GH#39882 and GH#35888 in case of None and NaT we get duplicates
+            if not cache_array.index.is_unique:
+                cache_array = cache_array[~cache_array.index.duplicated()]
+    return cache_array
+
+
+def _box_as_indexlike(
+    dt_array: ArrayLike, utc: bool = False, name: Hashable | None = None
+) -> Index:
+    """
+    Properly boxes the ndarray of datetimes to DatetimeIndex
+    if it is possible or to generic Index instead
+
+    Parameters
+    ----------
+    dt_array: 1-d array
+        Array of datetimes to be wrapped in an Index.
+    utc : bool
+        Whether to convert/localize timestamps to UTC.
+    name : string, default None
+        Name for a resulting index
+
+    Returns
+    -------
+    result : datetime of converted dates
+        - DatetimeIndex if convertible to sole datetime64 type
+        - general Index otherwise
+    """
+
+    if lib.is_np_dtype(dt_array.dtype, "M"):
+        tz = "utc" if utc else None
+        return DatetimeIndex(dt_array, tz=tz, name=name)
+    return Index(dt_array, name=name, dtype=dt_array.dtype)
+
+
+def _convert_and_box_cache(
+    arg: DatetimeScalarOrArrayConvertible,
+    cache_array: Series,
+    name: Hashable | None = None,
+) -> Index:
+    """
+    Convert array of dates with a cache and wrap the result in an Index.
+
+    Parameters
+    ----------
+    arg : integer, float, string, datetime, list, tuple, 1-d array, Series
+    cache_array : Series
+        Cache of converted, unique dates
+    name : string, default None
+        Name for a DatetimeIndex
+
+    Returns
+    -------
+    result : Index-like of converted dates
+    """
+    from pandas import Series
+
+    result = Series(arg, dtype=cache_array.index.dtype).map(cache_array)
+    return _box_as_indexlike(result._values, utc=False, name=name)
+
+
+def _convert_listlike_datetimes(
+    arg,
+    format: str | None,
+    name: Hashable | None = None,
+    utc: bool = False,
+    unit: str | None = None,
+    errors: DateTimeErrorChoices = "raise",
+    dayfirst: bool | None = None,
+    yearfirst: bool | None = None,
+    exact: bool = True,
+):
+    """
+    Helper function for to_datetime. Performs the conversions of 1D listlike
+    of dates
+
+    Parameters
+    ----------
+    arg : list, tuple, ndarray, Series, Index
+        date to be parsed
+    name : object
+        None or string for the Index name
+    utc : bool
+        Whether to convert/localize timestamps to UTC.
+    unit : str
+        None or string of the frequency of the passed data
+    errors : str
+        error handing behaviors from to_datetime, 'raise', 'coerce', 'ignore'
+    dayfirst : bool
+        dayfirst parsing behavior from to_datetime
+    yearfirst : bool
+        yearfirst parsing behavior from to_datetime
+    exact : bool, default True
+        exact format matching behavior from to_datetime
+
+    Returns
+    -------
+    Index-like of parsed dates
+    """
+    if isinstance(arg, (list, tuple)):
+        arg = np.array(arg, dtype="O")
+    elif isinstance(arg, NumpyExtensionArray):
+        arg = np.array(arg)
+
+    arg_dtype = getattr(arg, "dtype", None)
+    # these are shortcutable
+    tz = "utc" if utc else None
+    if isinstance(arg_dtype, DatetimeTZDtype):
+        if not isinstance(arg, (DatetimeArray, DatetimeIndex)):
+            return DatetimeIndex(arg, tz=tz, name=name)
+        if utc:
+            arg = arg.tz_convert(None).tz_localize("utc")
+        return arg
+
+    elif isinstance(arg_dtype, ArrowDtype) and arg_dtype.type is Timestamp:
+        # TODO: Combine with above if DTI/DTA supports Arrow timestamps
+        if utc:
+            # pyarrow uses UTC, not lowercase utc
+            if isinstance(arg, Index):
+                arg_array = cast(ArrowExtensionArray, arg.array)
+                if arg_dtype.pyarrow_dtype.tz is not None:
+                    arg_array = arg_array._dt_tz_convert("UTC")
+                else:
+                    arg_array = arg_array._dt_tz_localize("UTC")
+                arg = Index(arg_array)
+            else:
+                # ArrowExtensionArray
+                if arg_dtype.pyarrow_dtype.tz is not None:
+                    arg = arg._dt_tz_convert("UTC")
+                else:
+                    arg = arg._dt_tz_localize("UTC")
+        return arg
+
+    elif lib.is_np_dtype(arg_dtype, "M"):
+        if not is_supported_dtype(arg_dtype):
+            # We go to closest supported reso, i.e. "s"
+            arg = astype_overflowsafe(
+                # TODO: looks like we incorrectly raise with errors=="ignore"
+                np.asarray(arg),
+                np.dtype("M8[s]"),
+                is_coerce=errors == "coerce",
+            )
+
+        if not isinstance(arg, (DatetimeArray, DatetimeIndex)):
+            return DatetimeIndex(arg, tz=tz, name=name)
+        elif utc:
+            # DatetimeArray, DatetimeIndex
+            return arg.tz_localize("utc")
+
+        return arg
+
+    elif unit is not None:
+        if format is not None:
+            raise ValueError("cannot specify both format and unit")
+        return _to_datetime_with_unit(arg, unit, name, utc, errors)
+    elif getattr(arg, "ndim", 1) > 1:
+        raise TypeError(
+            "arg must be a string, datetime, list, tuple, 1-d array, or Series"
+        )
+
+    # warn if passing timedelta64, raise for PeriodDtype
+    # NB: this must come after unit transformation
+    try:
+        arg, _ = maybe_convert_dtype(arg, copy=False, tz=libtimezones.maybe_get_tz(tz))
+    except TypeError:
+        if errors == "coerce":
+            npvalues = np.array(["NaT"], dtype="datetime64[ns]").repeat(len(arg))
+            return DatetimeIndex(npvalues, name=name)
+        elif errors == "ignore":
+            idx = Index(arg, name=name)
+            return idx
+        raise
+
+    arg = ensure_object(arg)
+
+    if format is None:
+        format = _guess_datetime_format_for_array(arg, dayfirst=dayfirst)
+
+    # `format` could be inferred, or user didn't ask for mixed-format parsing.
+    if format is not None and format != "mixed":
+        return _array_strptime_with_fallback(arg, name, utc, format, exact, errors)
+
+    result, tz_parsed = objects_to_datetime64(
+        arg,
+        dayfirst=dayfirst,
+        yearfirst=yearfirst,
+        utc=utc,
+        errors=errors,
+        allow_object=True,
+    )
+
+    if tz_parsed is not None:
+        # We can take a shortcut since the datetime64 numpy array
+        # is in UTC
+        out_unit = np.datetime_data(result.dtype)[0]
+        dtype = cast(DatetimeTZDtype, tz_to_dtype(tz_parsed, out_unit))
+        dt64_values = result.view(f"M8[{dtype.unit}]")
+        dta = DatetimeArray._simple_new(dt64_values, dtype=dtype)
+        return DatetimeIndex._simple_new(dta, name=name)
+
+    return _box_as_indexlike(result, utc=utc, name=name)
+
+
+def _array_strptime_with_fallback(
+    arg,
+    name,
+    utc: bool,
+    fmt: str,
+    exact: bool,
+    errors: str,
+) -> Index:
+    """
+    Call array_strptime, with fallback behavior depending on 'errors'.
+    """
+    result, tz_out = array_strptime(arg, fmt, exact=exact, errors=errors, utc=utc)
+    if tz_out is not None:
+        unit = np.datetime_data(result.dtype)[0]
+        dtype = DatetimeTZDtype(tz=tz_out, unit=unit)
+        dta = DatetimeArray._simple_new(result, dtype=dtype)
+        if utc:
+            dta = dta.tz_convert("UTC")
+        return Index(dta, name=name)
+    elif result.dtype != object and utc:
+        unit = np.datetime_data(result.dtype)[0]
+        res = Index(result, dtype=f"M8[{unit}, UTC]", name=name)
+        return res
+    elif using_string_dtype() and result.dtype == object:
+        if lib.is_string_array(result):
+            return Index(result, dtype="str", name=name)
+    return Index(result, dtype=result.dtype, name=name)
+
+
+def _to_datetime_with_unit(arg, unit, name, utc: bool, errors: str) -> Index:
+    """
+    to_datetime specalized to the case where a 'unit' is passed.
+    """
+    arg = extract_array(arg, extract_numpy=True)
+
+    # GH#30050 pass an ndarray to tslib.array_with_unit_to_datetime
+    # because it expects an ndarray argument
+    if isinstance(arg, IntegerArray):
+        arr = arg.astype(f"datetime64[{unit}]")
+        tz_parsed = None
+    else:
+        arg = np.asarray(arg)
+
+        if arg.dtype.kind in "iu":
+            # Note we can't do "f" here because that could induce unwanted
+            #  rounding GH#14156, GH#20445
+            arr = arg.astype(f"datetime64[{unit}]", copy=False)
+            try:
+                arr = astype_overflowsafe(arr, np.dtype("M8[ns]"), copy=False)
+            except OutOfBoundsDatetime:
+                if errors == "raise":
+                    raise
+                arg = arg.astype(object)
+                return _to_datetime_with_unit(arg, unit, name, utc, errors)
+            tz_parsed = None
+
+        elif arg.dtype.kind == "f":
+            with np.errstate(over="raise"):
+                try:
+                    arr = cast_from_unit_vectorized(arg, unit=unit)
+                except OutOfBoundsDatetime:
+                    if errors != "raise":
+                        return _to_datetime_with_unit(
+                            arg.astype(object), unit, name, utc, errors
+                        )
+                    raise OutOfBoundsDatetime(
+                        f"cannot convert input with unit '{unit}'"
+                    )
+
+            arr = arr.view("M8[ns]")
+            tz_parsed = None
+        else:
+            arg = arg.astype(object, copy=False)
+            arr, tz_parsed = tslib.array_with_unit_to_datetime(arg, unit, errors=errors)
+
+    if errors == "ignore":
+        # Index constructor _may_ infer to DatetimeIndex
+        result = Index._with_infer(arr, name=name)
+    else:
+        result = DatetimeIndex(arr, name=name)
+
+    if not isinstance(result, DatetimeIndex):
+        return result
+
+    # GH#23758: We may still need to localize the result with tz
+    # GH#25546: Apply tz_parsed first (from arg), then tz (from caller)
+    # result will be naive but in UTC
+    result = result.tz_localize("UTC").tz_convert(tz_parsed)
+
+    if utc:
+        if result.tz is None:
+            result = result.tz_localize("utc")
+        else:
+            result = result.tz_convert("utc")
     return result
 
 
-@inherit_names(
-    DatetimeArray._field_ops
-    + [
-        method
-        for method in DatetimeArray._datetimelike_methods
-        if method not in ("tz_localize", "tz_convert", "strftime")
-    ],
-    DatetimeArray,
-    wrap=True,
-)
-@inherit_names(["is_normalized"], DatetimeArray, cache=True)
-@inherit_names(
-    [
-        "tz",
-        "tzinfo",
-        "dtype",
-        "to_pydatetime",
-        "date",
-        "time",
-        "timetz",
-        "std",
-    ]
-    + DatetimeArray._bool_ops,
-    DatetimeArray,
-)
-class DatetimeIndex(DatetimeTimedeltaMixin):
+def _adjust_to_origin(arg, origin, unit):
     """
-    Immutable ndarray-like of datetime64 data.
-
-    Represented internally as int64, and which can be boxed to Timestamp objects
-    that are subclasses of datetime and carry metadata.
-
-    .. versionchanged:: 2.0.0
-        The various numeric date/time attributes (:attr:`~DatetimeIndex.day`,
-        :attr:`~DatetimeIndex.month`, :attr:`~DatetimeIndex.year` etc.) now have dtype
-        ``int32``. Previously they had dtype ``int64``.
+    Helper function for to_datetime.
+    Adjust input argument to the specified origin
 
     Parameters
     ----------
-    data : array-like (1-dimensional)
-        Datetime-like data to construct index with.
-    freq : str or pandas offset object, optional
-        One of pandas date offset strings or corresponding objects. The string
-        'infer' can be passed in order to set the frequency of the index as the
-        inferred frequency upon creation.
-    tz : pytz.timezone or dateutil.tz.tzfile or datetime.tzinfo or str
-        Set the Timezone of the data.
-    normalize : bool, default False
-        Normalize start/end dates to midnight before generating date range.
-
-        .. deprecated:: 2.1.0
-
-    closed : {'left', 'right'}, optional
-        Set whether to include `start` and `end` that are on the
-        boundary. The default includes boundary points on either end.
-
-        .. deprecated:: 2.1.0
-
-    ambiguous : 'infer', bool-ndarray, 'NaT', default 'raise'
-        When clocks moved backward due to DST, ambiguous times may arise.
-        For example in Central European Time (UTC+01), when going from 03:00
-        DST to 02:00 non-DST, 02:30:00 local time occurs both at 00:30:00 UTC
-        and at 01:30:00 UTC. In such a situation, the `ambiguous` parameter
-        dictates how ambiguous times should be handled.
-
-        - 'infer' will attempt to infer fall dst-transition hours based on
-          order
-        - bool-ndarray where True signifies a DST time, False signifies a
-          non-DST time (note that this flag is only applicable for ambiguous
-          times)
-        - 'NaT' will return NaT where there are ambiguous times
-        - 'raise' will raise an AmbiguousTimeError if there are ambiguous times.
-    dayfirst : bool, default False
-        If True, parse dates in `data` with the day first order.
-    yearfirst : bool, default False
-        If True parse dates in `data` with the year first order.
-    dtype : numpy.dtype or DatetimeTZDtype or str, default None
-        Note that the only NumPy dtype allowed is `datetime64[ns]`.
-    copy : bool, default False
-        Make a copy of input ndarray.
-    name : label, default None
-        Name to be stored in the index.
-
-    Attributes
-    ----------
-    year
-    month
-    day
-    hour
-    minute
-    second
-    microsecond
-    nanosecond
-    date
-    time
-    timetz
-    dayofyear
-    day_of_year
-    dayofweek
-    day_of_week
-    weekday
-    quarter
-    tz
-    freq
-    freqstr
-    is_month_start
-    is_month_end
-    is_quarter_start
-    is_quarter_end
-    is_year_start
-    is_year_end
-    is_leap_year
-    inferred_freq
-
-    Methods
-    -------
-    normalize
-    strftime
-    snap
-    tz_convert
-    tz_localize
-    round
-    floor
-    ceil
-    to_period
-    to_pydatetime
-    to_series
-    to_frame
-    month_name
-    day_name
-    mean
-    std
-
-    See Also
-    --------
-    Index : The base pandas Index type.
-    TimedeltaIndex : Index of timedelta64 data.
-    PeriodIndex : Index of Period data.
-    to_datetime : Convert argument to datetime.
-    date_range : Create a fixed-frequency DatetimeIndex.
-
-    Notes
-    -----
-    To learn more about the frequency strings, please see `this link
-    <https://pandas.pydata.org/pandas-docs/stable/user_guide/timeseries.html#offset-aliases>`__.
-
-    Examples
-    --------
-    >>> idx = pd.DatetimeIndex(["1/1/2020 10:00:00+00:00", "2/1/2020 11:00:00+00:00"])
-    >>> idx
-    DatetimeIndex(['2020-01-01 10:00:00+00:00', '2020-02-01 11:00:00+00:00'],
-    dtype='datetime64[ns, UTC]', freq=None)
-    """
-
-    _typ = "datetimeindex"
-
-    _data_cls = DatetimeArray
-    _supports_partial_string_indexing = True
-
-    @property
-    def _engine_type(self) -> type[libindex.DatetimeEngine]:
-        return libindex.DatetimeEngine
-
-    _data: DatetimeArray
-    _values: DatetimeArray
-    tz: dt.tzinfo | None
-
-    # --------------------------------------------------------------------
-    # methods that dispatch to DatetimeArray and wrap result
-
-    @doc(DatetimeArray.strftime)
-    def strftime(self, date_format) -> Index:
-        arr = self._data.strftime(date_format)
-        return Index(arr, name=self.name, dtype=arr.dtype)
-
-    @doc(DatetimeArray.tz_convert)
-    def tz_convert(self, tz) -> Self:
-        arr = self._data.tz_convert(tz)
-        return type(self)._simple_new(arr, name=self.name, refs=self._references)
-
-    @doc(DatetimeArray.tz_localize)
-    def tz_localize(
-        self,
-        tz,
-        ambiguous: TimeAmbiguous = "raise",
-        nonexistent: TimeNonexistent = "raise",
-    ) -> Self:
-        arr = self._data.tz_localize(tz, ambiguous, nonexistent)
-        return type(self)._simple_new(arr, name=self.name)
-
-    @doc(DatetimeArray.to_period)
-    def to_period(self, freq=None) -> PeriodIndex:
-        from pandas.core.indexes.api import PeriodIndex
-
-        arr = self._data.to_period(freq)
-        return PeriodIndex._simple_new(arr, name=self.name)
-
-    @doc(DatetimeArray.to_julian_date)
-    def to_julian_date(self) -> Index:
-        arr = self._data.to_julian_date()
-        return Index._simple_new(arr, name=self.name)
-
-    @doc(DatetimeArray.isocalendar)
-    def isocalendar(self) -> DataFrame:
-        df = self._data.isocalendar()
-        return df.set_index(self)
-
-    @cache_readonly
-    def _resolution_obj(self) -> Resolution:
-        return self._data._resolution_obj
-
-    # --------------------------------------------------------------------
-    # Constructors
-
-    def __new__(
-        cls,
-        data=None,
-        freq: Frequency | lib.NoDefault = lib.no_default,
-        tz=lib.no_default,
-        normalize: bool | lib.NoDefault = lib.no_default,
-        closed=lib.no_default,
-        ambiguous: TimeAmbiguous = "raise",
-        dayfirst: bool = False,
-        yearfirst: bool = False,
-        dtype: Dtype | None = None,
-        copy: bool = False,
-        name: Hashable | None = None,
-    ) -> Self:
-        if closed is not lib.no_default:
-            # GH#52628
-            warnings.warn(
-                f"The 'closed' keyword in {cls.__name__} construction is "
-                "deprecated and will be removed in a future version.",
-                FutureWarning,
-                stacklevel=find_stack_level(),
-            )
-        if normalize is not lib.no_default:
-            # GH#52628
-            warnings.warn(
-                f"The 'normalize' keyword in {cls.__name__} construction is "
-                "deprecated and will be removed in a future version.",
-                FutureWarning,
-                stacklevel=find_stack_level(),
-            )
-
-        if is_scalar(data):
-            cls._raise_scalar_data_error(data)
-
-        # - Cases checked above all return/raise before reaching here - #
-
-        name = maybe_extract_name(name, data, cls)
-
-        if (
-            isinstance(data, DatetimeArray)
-            and freq is lib.no_default
-            and tz is lib.no_default
-            and dtype is None
-        ):
-            # fastpath, similar logic in TimedeltaIndex.__new__;
-            # Note in this particular case we retain non-nano.
-            if copy:
-                data = data.copy()
-            return cls._simple_new(data, name=name)
-
-        dtarr = DatetimeArray._from_sequence_not_strict(
-            data,
-            dtype=dtype,
-            copy=copy,
-            tz=tz,
-            freq=freq,
-            dayfirst=dayfirst,
-            yearfirst=yearfirst,
-            ambiguous=ambiguous,
-        )
-        refs = None
-        if not copy and isinstance(data, (Index, ABCSeries)):
-            refs = data._references
-
-        subarr = cls._simple_new(dtarr, name=name, refs=refs)
-        return subarr
-
-    # --------------------------------------------------------------------
-
-    @cache_readonly
-    def _is_dates_only(self) -> bool:
-        """
-        Return a boolean if we are only dates (and don't have a timezone)
-
-        Returns
-        -------
-        bool
-        """
-        if isinstance(self.freq, Tick):
-            delta = Timedelta(self.freq)
-
-            if delta % dt.timedelta(days=1) != dt.timedelta(days=0):
-                return False
-
-        return self._values._is_dates_only
-
-    def __reduce__(self):
-        d = {"data": self._data, "name": self.name}
-        return _new_DatetimeIndex, (type(self), d), None
-
-    def _is_comparable_dtype(self, dtype: DtypeObj) -> bool:
-        """
-        Can we compare values of the given dtype to our own?
-        """
-        if self.tz is not None:
-            # If we have tz, we can compare to tzaware
-            return isinstance(dtype, DatetimeTZDtype)
-        # if we dont have tz, we can only compare to tznaive
-        return lib.is_np_dtype(dtype, "M")
-
-    # --------------------------------------------------------------------
-    # Rendering Methods
-
-    @cache_readonly
-    def _formatter_func(self):
-        # Note this is equivalent to the DatetimeIndexOpsMixin method but
-        #  uses the maybe-cached self._is_dates_only instead of re-computing it.
-        from pandas.io.formats.format import get_format_datetime64
-
-        formatter = get_format_datetime64(is_dates_only=self._is_dates_only)
-        return lambda x: f"'{formatter(x)}'"
-
-    # --------------------------------------------------------------------
-    # Set Operation Methods
-
-    def _can_range_setop(self, other) -> bool:
-        # GH 46702: If self or other have non-UTC tzs, DST transitions prevent
-        # range representation due to no singular step
-        if (
-            self.tz is not None
-            and not timezones.is_utc(self.tz)
-            and not timezones.is_fixed_offset(self.tz)
-        ):
-            return False
-        if (
-            other.tz is not None
-            and not timezones.is_utc(other.tz)
-            and not timezones.is_fixed_offset(other.tz)
-        ):
-            return False
-        return super()._can_range_setop(other)
-
-    # --------------------------------------------------------------------
-
-    def _get_time_micros(self) -> npt.NDArray[np.int64]:
-        """
-        Return the number of microseconds since midnight.
-
-        Returns
-        -------
-        ndarray[int64_t]
-        """
-        values = self._data._local_timestamps()
-
-        ppd = periods_per_day(self._data._creso)
-
-        frac = values % ppd
-        if self.unit == "ns":
-            micros = frac // 1000
-        elif self.unit == "us":
-            micros = frac
-        elif self.unit == "ms":
-            micros = frac * 1000
-        elif self.unit == "s":
-            micros = frac * 1_000_000
-        else:  # pragma: no cover
-            raise NotImplementedError(self.unit)
-
-        micros[self._isnan] = -1
-        return micros
-
-    def snap(self, freq: Frequency = "S") -> DatetimeIndex:
-        """
-        Snap time stamps to nearest occurring frequency.
-
-        Returns
-        -------
-        DatetimeIndex
-
-        Examples
-        --------
-        >>> idx = pd.DatetimeIndex(['2023-01-01', '2023-01-02',
-        ...                        '2023-02-01', '2023-02-02'])
-        >>> idx
-        DatetimeIndex(['2023-01-01', '2023-01-02', '2023-02-01', '2023-02-02'],
-        dtype='datetime64[ns]', freq=None)
-        >>> idx.snap('MS')
-        DatetimeIndex(['2023-01-01', '2023-01-01', '2023-02-01', '2023-02-01'],
-        dtype='datetime64[ns]', freq=None)
-        """
-        # Superdumb, punting on any optimizing
-        freq = to_offset(freq)
-
-        dta = self._data.copy()
-
-        for i, v in enumerate(self):
-            s = v
-            if not freq.is_on_offset(s):
-                t0 = freq.rollback(s)
-                t1 = freq.rollforward(s)
-                if abs(s - t0) < abs(t1 - s):
-                    s = t0
-                else:
-                    s = t1
-            dta[i] = s
-
-        return DatetimeIndex._simple_new(dta, name=self.name)
-
-    # --------------------------------------------------------------------
-    # Indexing Methods
-
-    def _parsed_string_to_bounds(self, reso: Resolution, parsed: dt.datetime):
-        """
-        Calculate datetime bounds for parsed time string and its resolution.
-
-        Parameters
-        ----------
-        reso : Resolution
-            Resolution provided by parsed string.
-        parsed : datetime
-            Datetime from parsed string.
-
-        Returns
-        -------
-        lower, upper: pd.Timestamp
-        """
-        freq = OFFSET_TO_PERIOD_FREQSTR.get(reso.attr_abbrev, reso.attr_abbrev)
-        per = Period(parsed, freq=freq)
-        start, end = per.start_time, per.end_time
-
-        # GH 24076
-        # If an incoming date string contained a UTC offset, need to localize
-        # the parsed date to this offset first before aligning with the index's
-        # timezone
-        start = start.tz_localize(parsed.tzinfo)
-        end = end.tz_localize(parsed.tzinfo)
-
-        if parsed.tzinfo is not None:
-            if self.tz is None:
-                raise ValueError(
-                    "The index must be timezone aware when indexing "
-                    "with a date string with a UTC offset"
-                )
-        # The flipped case with parsed.tz is None and self.tz is not None
-        #  is ruled out bc parsed and reso are produced by _parse_with_reso,
-        #  which localizes parsed.
-        return start, end
-
-    def _parse_with_reso(self, label: str):
-        parsed, reso = super()._parse_with_reso(label)
-
-        parsed = Timestamp(parsed)
-
-        if self.tz is not None and parsed.tzinfo is None:
-            # we special-case timezone-naive strings and timezone-aware
-            #  DatetimeIndex
-            # https://github.com/pandas-dev/pandas/pull/36148#issuecomment-687883081
-            parsed = parsed.tz_localize(self.tz)
-
-        return parsed, reso
-
-    def _disallow_mismatched_indexing(self, key) -> None:
-        """
-        Check for mismatched-tzawareness indexing and re-raise as KeyError.
-        """
-        # we get here with isinstance(key, self._data._recognized_scalars)
-        try:
-            # GH#36148
-            self._data._assert_tzawareness_compat(key)
-        except TypeError as err:
-            raise KeyError(key) from err
-
-    def get_loc(self, key):
-        """
-        Get integer location for requested label
-
-        Returns
-        -------
-        loc : int
-        """
-        self._check_indexing_error(key)
-
-        orig_key = key
-        if is_valid_na_for_dtype(key, self.dtype):
-            key = NaT
-
-        if isinstance(key, self._data._recognized_scalars):
-            # needed to localize naive datetimes
-            self._disallow_mismatched_indexing(key)
-            key = Timestamp(key)
-
-        elif isinstance(key, str):
-            try:
-                parsed, reso = self._parse_with_reso(key)
-            except (ValueError, pytz.NonExistentTimeError) as err:
-                raise KeyError(key) from err
-            self._disallow_mismatched_indexing(parsed)
-
-            if self._can_partial_date_slice(reso):
-                try:
-                    return self._partial_date_slice(reso, parsed)
-                except KeyError as err:
-                    raise KeyError(key) from err
-
-            key = parsed
-
-        elif isinstance(key, dt.timedelta):
-            # GH#20464
-            raise TypeError(
-                f"Cannot index {type(self).__name__} with {type(key).__name__}"
-            )
-
-        elif isinstance(key, dt.time):
-            return self.indexer_at_time(key)
-
-        else:
-            # unrecognized type
-            raise KeyError(key)
-
-        try:
-            return Index.get_loc(self, key)
-        except KeyError as err:
-            raise KeyError(orig_key) from err
-
-    @doc(DatetimeTimedeltaMixin._maybe_cast_slice_bound)
-    def _maybe_cast_slice_bound(self, label, side: str):
-        # GH#42855 handle date here instead of get_slice_bound
-        if isinstance(label, dt.date) and not isinstance(label, dt.datetime):
-            # Pandas supports slicing with dates, treated as datetimes at midnight.
-            # https://github.com/pandas-dev/pandas/issues/31501
-            label = Timestamp(label).to_pydatetime()
-
-        label = super()._maybe_cast_slice_bound(label, side)
-        self._data._assert_tzawareness_compat(label)
-        return Timestamp(label)
-
-    def slice_indexer(self, start=None, end=None, step=None):
-        """
-        Return indexer for specified label slice.
-        Index.slice_indexer, customized to handle time slicing.
-
-        In addition to functionality provided by Index.slice_indexer, does the
-        following:
-
-        - if both `start` and `end` are instances of `datetime.time`, it
-          invokes `indexer_between_time`
-        - if `start` and `end` are both either string or None perform
-          value-based selection in non-monotonic cases.
-
-        """
-        # For historical reasons DatetimeIndex supports slices between two
-        # instances of datetime.time as if it were applying a slice mask to
-        # an array of (self.hour, self.minute, self.seconds, self.microsecond).
-        if isinstance(start, dt.time) and isinstance(end, dt.time):
-            if step is not None and step != 1:
-                raise ValueError("Must have step size of 1 with time slices")
-            return self.indexer_between_time(start, end)
-
-        if isinstance(start, dt.time) or isinstance(end, dt.time):
-            raise KeyError("Cannot mix time and non-time slice keys")
-
-        def check_str_or_none(point) -> bool:
-            return point is not None and not isinstance(point, str)
-
-        # GH#33146 if start and end are combinations of str and None and Index is not
-        # monotonic, we can not use Index.slice_indexer because it does not honor the
-        # actual elements, is only searching for start and end
-        if (
-            check_str_or_none(start)
-            or check_str_or_none(end)
-            or self.is_monotonic_increasing
-        ):
-            return Index.slice_indexer(self, start, end, step)
-
-        mask = np.array(True)
-        in_index = True
-        if start is not None:
-            start_casted = self._maybe_cast_slice_bound(start, "left")
-            mask = start_casted <= self
-            in_index &= (start_casted == self).any()
-
-        if end is not None:
-            end_casted = self._maybe_cast_slice_bound(end, "right")
-            mask = (self <= end_casted) & mask
-            in_index &= (end_casted == self).any()
-
-        if not in_index:
-            raise KeyError(
-                "Value based partial slicing on non-monotonic DatetimeIndexes "
-                "with non-existing keys is not allowed.",
-            )
-        indexer = mask.nonzero()[0][::step]
-        if len(indexer) == len(self):
-            return slice(None)
-        else:
-            return indexer
-
-    # --------------------------------------------------------------------
-
-    @property
-    def inferred_type(self) -> str:
-        # b/c datetime is represented as microseconds since the epoch, make
-        # sure we can't have ambiguous indexing
-        return "datetime64"
-
-    def indexer_at_time(self, time, asof: bool = False) -> npt.NDArray[np.intp]:
-        """
-        Return index locations of values at particular time of day.
-
-        Parameters
-        ----------
-        time : datetime.time or str
-            Time passed in either as object (datetime.time) or as string in
-            appropriate format ("%H:%M", "%H%M", "%I:%M%p", "%I%M%p",
-            "%H:%M:%S", "%H%M%S", "%I:%M:%S%p", "%I%M%S%p").
-
-        Returns
-        -------
-        np.ndarray[np.intp]
-
-        See Also
-        --------
-        indexer_between_time : Get index locations of values between particular
-            times of day.
-        DataFrame.at_time : Select values at particular time of day.
-
-        Examples
-        --------
-        >>> idx = pd.DatetimeIndex(["1/1/2020 10:00", "2/1/2020 11:00",
-        ...                         "3/1/2020 10:00"])
-        >>> idx.indexer_at_time("10:00")
-        array([0, 2])
-        """
-        if asof:
-            raise NotImplementedError("'asof' argument is not supported")
-
-        if isinstance(time, str):
-            from dateutil.parser import parse
-
-            time = parse(time).time()
-
-        if time.tzinfo:
-            if self.tz is None:
-                raise ValueError("Index must be timezone aware.")
-            time_micros = self.tz_convert(time.tzinfo)._get_time_micros()
-        else:
-            time_micros = self._get_time_micros()
-        micros = _time_to_micros(time)
-        return (time_micros == micros).nonzero()[0]
-
-    def indexer_between_time(
-        self, start_time, end_time, include_start: bool = True, include_end: bool = True
-    ) -> npt.NDArray[np.intp]:
-        """
-        Return index locations of values between particular times of day.
-
-        Parameters
-        ----------
-        start_time, end_time : datetime.time, str
-            Time passed either as object (datetime.time) or as string in
-            appropriate format ("%H:%M", "%H%M", "%I:%M%p", "%I%M%p",
-            "%H:%M:%S", "%H%M%S", "%I:%M:%S%p","%I%M%S%p").
-        include_start : bool, default True
-        include_end : bool, default True
-
-        Returns
-        -------
-        np.ndarray[np.intp]
-
-        See Also
-        --------
-        indexer_at_time : Get index locations of values at particular time of day.
-        DataFrame.between_time : Select values between particular times of day.
-
-        Examples
-        --------
-        >>> idx = pd.date_range("2023-01-01", periods=4, freq="h")
-        >>> idx
-        DatetimeIndex(['2023-01-01 00:00:00', '2023-01-01 01:00:00',
-                           '2023-01-01 02:00:00', '2023-01-01 03:00:00'],
-                          dtype='datetime64[ns]', freq='h')
-        >>> idx.indexer_between_time("00:00", "2:00", include_end=False)
-        array([0, 1])
-        """
-        start_time = to_time(start_time)
-        end_time = to_time(end_time)
-        time_micros = self._get_time_micros()
-        start_micros = _time_to_micros(start_time)
-        end_micros = _time_to_micros(end_time)
-
-        if include_start and include_end:
-            lop = rop = operator.le
-        elif include_start:
-            lop = operator.le
-            rop = operator.lt
-        elif include_end:
-            lop = operator.lt
-            rop = operator.le
-        else:
-            lop = rop = operator.lt
-
-        if start_time <= end_time:
-            join_op = operator.and_
-        else:
-            join_op = operator.or_
-
-        mask = join_op(lop(start_micros, time_micros), rop(time_micros, end_micros))
-
-        return mask.nonzero()[0]
-
-
-def date_range(
-    start=None,
-    end=None,
-    periods=None,
-    freq=None,
-    tz=None,
-    normalize: bool = False,
-    name: Hashable | None = None,
-    inclusive: IntervalClosedType = "both",
-    *,
-    unit: str | None = None,
-    **kwargs,
-) -> DatetimeIndex:
-    """
-    Return a fixed frequency DatetimeIndex.
-
-    Returns the range of equally spaced time points (where the difference between any
-    two adjacent points is specified by the given frequency) such that they all
-    satisfy `start <[=] x <[=] end`, where the first one and the last one are, resp.,
-    the first and last time points in that range that fall on the boundary of ``freq``
-    (if given as a frequency string) or that are valid for ``freq`` (if given as a
-    :class:`pandas.tseries.offsets.DateOffset`). (If exactly one of ``start``,
-    ``end``, or ``freq`` is *not* specified, this missing parameter can be computed
-    given ``periods``, the number of timesteps in the range. See the note below.)
-
-    Parameters
-    ----------
-    start : str or datetime-like, optional
-        Left bound for generating dates.
-    end : str or datetime-like, optional
-        Right bound for generating dates.
-    periods : int, optional
-        Number of periods to generate.
-    freq : str, Timedelta, datetime.timedelta, or DateOffset, default 'D'
-        Frequency strings can have multiples, e.g. '5h'. See
-        :ref:`here <timeseries.offset_aliases>` for a list of
-        frequency aliases.
-    tz : str or tzinfo, optional
-        Time zone name for returning localized DatetimeIndex, for example
-        'Asia/Hong_Kong'. By default, the resulting DatetimeIndex is
-        timezone-naive unless timezone-aware datetime-likes are passed.
-    normalize : bool, default False
-        Normalize start/end dates to midnight before generating date range.
-    name : str, default None
-        Name of the resulting DatetimeIndex.
-    inclusive : {"both", "neither", "left", "right"}, default "both"
-        Include boundaries; Whether to set each bound as closed or open.
-
-        .. versionadded:: 1.4.0
-    unit : str, default None
-        Specify the desired resolution of the result.
-
-        .. versionadded:: 2.0.0
-    **kwargs
-        For compatibility. Has no effect on the result.
+    arg : list, tuple, ndarray, Series, Index
+        date to be adjusted
+    origin : 'julian' or Timestamp
+        origin offset for the arg
+    unit : str
+        passed unit from to_datetime, must be 'D'
 
     Returns
     -------
-    DatetimeIndex
+    ndarray or scalar of adjusted date(s)
+    """
+    if origin == "julian":
+        original = arg
+        j0 = Timestamp(0).to_julian_date()
+        if unit != "D":
+            raise ValueError("unit must be 'D' for origin='julian'")
+        try:
+            arg = arg - j0
+        except TypeError as err:
+            raise ValueError(
+                "incompatible 'arg' type for given 'origin'='julian'"
+            ) from err
+
+        # preemptively check this for a nice range
+        j_max = Timestamp.max.to_julian_date() - j0
+        j_min = Timestamp.min.to_julian_date() - j0
+        if np.any(arg > j_max) or np.any(arg < j_min):
+            raise OutOfBoundsDatetime(
+                f"{original} is Out of Bounds for origin='julian'"
+            )
+    else:
+        # arg must be numeric
+        if not (
+            (is_integer(arg) or is_float(arg)) or is_numeric_dtype(np.asarray(arg))
+        ):
+            raise ValueError(
+                f"'{arg}' is not compatible with origin='{origin}'; "
+                "it must be numeric with a unit specified"
+            )
+
+        # we are going to offset back to unix / epoch time
+        try:
+            offset = Timestamp(origin, unit=unit)
+        except OutOfBoundsDatetime as err:
+            raise OutOfBoundsDatetime(f"origin {origin} is Out of Bounds") from err
+        except ValueError as err:
+            raise ValueError(
+                f"origin {origin} cannot be converted to a Timestamp"
+            ) from err
+
+        if offset.tz is not None:
+            raise ValueError(f"origin offset {offset} must be tz-naive")
+        td_offset = offset - Timestamp(0)
+
+        # convert the offset to the unit of the arg
+        # this should be lossless in terms of precision
+        ioffset = td_offset // Timedelta(1, unit=unit)
+
+        # scalars & ndarray-like can handle the addition
+        if is_list_like(arg) and not isinstance(arg, (ABCSeries, Index, np.ndarray)):
+            arg = np.asarray(arg)
+        arg = arg + ioffset
+    return arg
+
+
+@overload
+def to_datetime(
+    arg: DatetimeScalar,
+    errors: DateTimeErrorChoices = ...,
+    dayfirst: bool = ...,
+    yearfirst: bool = ...,
+    utc: bool = ...,
+    format: str | None = ...,
+    exact: bool = ...,
+    unit: str | None = ...,
+    infer_datetime_format: bool = ...,
+    origin=...,
+    cache: bool = ...,
+) -> Timestamp:
+    ...
+
+
+@overload
+def to_datetime(
+    arg: Series | DictConvertible,
+    errors: DateTimeErrorChoices = ...,
+    dayfirst: bool = ...,
+    yearfirst: bool = ...,
+    utc: bool = ...,
+    format: str | None = ...,
+    exact: bool = ...,
+    unit: str | None = ...,
+    infer_datetime_format: bool = ...,
+    origin=...,
+    cache: bool = ...,
+) -> Series:
+    ...
+
+
+@overload
+def to_datetime(
+    arg: list | tuple | Index | ArrayLike,
+    errors: DateTimeErrorChoices = ...,
+    dayfirst: bool = ...,
+    yearfirst: bool = ...,
+    utc: bool = ...,
+    format: str | None = ...,
+    exact: bool = ...,
+    unit: str | None = ...,
+    infer_datetime_format: bool = ...,
+    origin=...,
+    cache: bool = ...,
+) -> DatetimeIndex:
+    ...
+
+
+def to_datetime(
+    arg: DatetimeScalarOrArrayConvertible | DictConvertible,
+    errors: DateTimeErrorChoices = "raise",
+    dayfirst: bool = False,
+    yearfirst: bool = False,
+    utc: bool = False,
+    format: str | None = None,
+    exact: bool | lib.NoDefault = lib.no_default,
+    unit: str | None = None,
+    infer_datetime_format: lib.NoDefault | bool = lib.no_default,
+    origin: str = "unix",
+    cache: bool = True,
+) -> DatetimeIndex | Series | DatetimeScalar | NaTType | None:
+    """
+    Convert argument to datetime.
+
+    This function converts a scalar, array-like, :class:`Series` or
+    :class:`DataFrame`/dict-like to a pandas datetime object.
+
+    Parameters
+    ----------
+    arg : int, float, str, datetime, list, tuple, 1-d array, Series, DataFrame/dict-like
+        The object to convert to a datetime. If a :class:`DataFrame` is provided, the
+        method expects minimally the following columns: :const:`"year"`,
+        :const:`"month"`, :const:`"day"`. The column "year"
+        must be specified in 4-digit format.
+    errors : {'ignore', 'raise', 'coerce'}, default 'raise'
+        - If :const:`'raise'`, then invalid parsing will raise an exception.
+        - If :const:`'coerce'`, then invalid parsing will be set as :const:`NaT`.
+        - If :const:`'ignore'`, then invalid parsing will return the input.
+    dayfirst : bool, default False
+        Specify a date parse order if `arg` is str or is list-like.
+        If :const:`True`, parses dates with the day first, e.g. :const:`"10/11/12"`
+        is parsed as :const:`2012-11-10`.
+
+        .. warning::
+
+            ``dayfirst=True`` is not strict, but will prefer to parse
+            with day first.
+
+    yearfirst : bool, default False
+        Specify a date parse order if `arg` is str or is list-like.
+
+        - If :const:`True` parses dates with the year first, e.g.
+          :const:`"10/11/12"` is parsed as :const:`2010-11-12`.
+        - If both `dayfirst` and `yearfirst` are :const:`True`, `yearfirst` is
+          preceded (same as :mod:`dateutil`).
+
+        .. warning::
+
+            ``yearfirst=True`` is not strict, but will prefer to parse
+            with year first.
+
+    utc : bool, default False
+        Control timezone-related parsing, localization and conversion.
+
+        - If :const:`True`, the function *always* returns a timezone-aware
+          UTC-localized :class:`Timestamp`, :class:`Series` or
+          :class:`DatetimeIndex`. To do this, timezone-naive inputs are
+          *localized* as UTC, while timezone-aware inputs are *converted* to UTC.
+
+        - If :const:`False` (default), inputs will not be coerced to UTC.
+          Timezone-naive inputs will remain naive, while timezone-aware ones
+          will keep their time offsets. Limitations exist for mixed
+          offsets (typically, daylight savings), see :ref:`Examples
+          <to_datetime_tz_examples>` section for details.
+
+        .. warning::
+
+            In a future version of pandas, parsing datetimes with mixed time
+            zones will raise an error unless `utc=True`.
+            Please specify `utc=True` to opt in to the new behaviour
+            and silence this warning. To create a `Series` with mixed offsets and
+            `object` dtype, please use `apply` and `datetime.datetime.strptime`.
+
+        See also: pandas general documentation about `timezone conversion and
+        localization
+        <https://pandas.pydata.org/pandas-docs/stable/user_guide/timeseries.html
+        #time-zone-handling>`_.
+
+    format : str, default None
+        The strftime to parse time, e.g. :const:`"%d/%m/%Y"`. See
+        `strftime documentation
+        <https://docs.python.org/3/library/datetime.html
+        #strftime-and-strptime-behavior>`_ for more information on choices, though
+        note that :const:`"%f"` will parse all the way up to nanoseconds.
+        You can also pass:
+
+        - "ISO8601", to parse any `ISO8601 <https://en.wikipedia.org/wiki/ISO_8601>`_
+          time string (not necessarily in exactly the same format);
+        - "mixed", to infer the format for each element individually. This is risky,
+          and you should probably use it along with `dayfirst`.
+
+        .. note::
+
+            If a :class:`DataFrame` is passed, then `format` has no effect.
+
+    exact : bool, default True
+        Control how `format` is used:
+
+        - If :const:`True`, require an exact `format` match.
+        - If :const:`False`, allow the `format` to match anywhere in the target
+          string.
+
+        Cannot be used alongside ``format='ISO8601'`` or ``format='mixed'``.
+    unit : str, default 'ns'
+        The unit of the arg (D,s,ms,us,ns) denote the unit, which is an
+        integer or float number. This will be based off the origin.
+        Example, with ``unit='ms'`` and ``origin='unix'``, this would calculate
+        the number of milliseconds to the unix epoch start.
+    infer_datetime_format : bool, default False
+        If :const:`True` and no `format` is given, attempt to infer the format
+        of the datetime strings based on the first non-NaN element,
+        and if it can be inferred, switch to a faster method of parsing them.
+        In some cases this can increase the parsing speed by ~5-10x.
+
+        .. deprecated:: 2.0.0
+            A strict version of this argument is now the default, passing it has
+            no effect.
+
+    origin : scalar, default 'unix'
+        Define the reference date. The numeric values would be parsed as number
+        of units (defined by `unit`) since this reference date.
+
+        - If :const:`'unix'` (or POSIX) time; origin is set to 1970-01-01.
+        - If :const:`'julian'`, unit must be :const:`'D'`, and origin is set to
+          beginning of Julian Calendar. Julian day number :const:`0` is assigned
+          to the day starting at noon on January 1, 4713 BC.
+        - If Timestamp convertible (Timestamp, dt.datetime, np.datetimt64 or date
+          string), origin is set to Timestamp identified by origin.
+        - If a float or integer, origin is the difference
+          (in units determined by the ``unit`` argument) relative to 1970-01-01.
+    cache : bool, default True
+        If :const:`True`, use a cache of unique, converted dates to apply the
+        datetime conversion. May produce significant speed-up when parsing
+        duplicate date strings, especially ones with timezone offsets. The cache
+        is only used when there are at least 50 values. The presence of
+        out-of-bounds values will render the cache unusable and may slow down
+        parsing.
+
+    Returns
+    -------
+    datetime
+        If parsing succeeded.
+        Return type depends on input (types in parenthesis correspond to
+        fallback in case of unsuccessful timezone or out-of-range timestamp
+        parsing):
+
+        - scalar: :class:`Timestamp` (or :class:`datetime.datetime`)
+        - array-like: :class:`DatetimeIndex` (or :class:`Series` with
+          :class:`object` dtype containing :class:`datetime.datetime`)
+        - Series: :class:`Series` of :class:`datetime64` dtype (or
+          :class:`Series` of :class:`object` dtype containing
+          :class:`datetime.datetime`)
+        - DataFrame: :class:`Series` of :class:`datetime64` dtype (or
+          :class:`Series` of :class:`object` dtype containing
+          :class:`datetime.datetime`)
+
+    Raises
+    ------
+    ParserError
+        When parsing a date from string fails.
+    ValueError
+        When another datetime conversion error happens. For example when one
+        of 'year', 'month', day' columns is missing in a :class:`DataFrame`, or
+        when a Timezone-aware :class:`datetime.datetime` is found in an array-like
+        of mixed time offsets, and ``utc=False``.
 
     See Also
     --------
-    DatetimeIndex : An immutable container for datetimes.
-    timedelta_range : Return a fixed frequency TimedeltaIndex.
-    period_range : Return a fixed frequency PeriodIndex.
-    interval_range : Return a fixed frequency IntervalIndex.
+    DataFrame.astype : Cast argument to a specified dtype.
+    to_timedelta : Convert argument to timedelta.
+    convert_dtypes : Convert dtypes.
 
     Notes
     -----
-    Of the four parameters ``start``, ``end``, ``periods``, and ``freq``,
-    exactly three must be specified. If ``freq`` is omitted, the resulting
-    ``DatetimeIndex`` will have ``periods`` linearly spaced elements between
-    ``start`` and ``end`` (closed on both sides).
 
-    To learn more about the frequency strings, please see `this link
-    <https://pandas.pydata.org/pandas-docs/stable/user_guide/timeseries.html#offset-aliases>`__.
+    Many input types are supported, and lead to different output types:
+
+    - **scalars** can be int, float, str, datetime object (from stdlib :mod:`datetime`
+      module or :mod:`numpy`). They are converted to :class:`Timestamp` when
+      possible, otherwise they are converted to :class:`datetime.datetime`.
+      None/NaN/null scalars are converted to :const:`NaT`.
+
+    - **array-like** can contain int, float, str, datetime objects. They are
+      converted to :class:`DatetimeIndex` when possible, otherwise they are
+      converted to :class:`Index` with :class:`object` dtype, containing
+      :class:`datetime.datetime`. None/NaN/null entries are converted to
+      :const:`NaT` in both cases.
+
+    - **Series** are converted to :class:`Series` with :class:`datetime64`
+      dtype when possible, otherwise they are converted to :class:`Series` with
+      :class:`object` dtype, containing :class:`datetime.datetime`. None/NaN/null
+      entries are converted to :const:`NaT` in both cases.
+
+    - **DataFrame/dict-like** are converted to :class:`Series` with
+      :class:`datetime64` dtype. For each row a datetime is created from assembling
+      the various dataframe columns. Column keys can be common abbreviations
+      like ['year', 'month', 'day', 'minute', 'second', 'ms', 'us', 'ns']) or
+      plurals of the same.
+
+    The following causes are responsible for :class:`datetime.datetime` objects
+    being returned (possibly inside an :class:`Index` or a :class:`Series` with
+    :class:`object` dtype) instead of a proper pandas designated type
+    (:class:`Timestamp`, :class:`DatetimeIndex` or :class:`Series`
+    with :class:`datetime64` dtype):
+
+    - when any input element is before :const:`Timestamp.min` or after
+      :const:`Timestamp.max`, see `timestamp limitations
+      <https://pandas.pydata.org/pandas-docs/stable/user_guide/timeseries.html
+      #timeseries-timestamp-limits>`_.
+
+    - when ``utc=False`` (default) and the input is an array-like or
+      :class:`Series` containing mixed naive/aware datetime, or aware with mixed
+      time offsets. Note that this happens in the (quite frequent) situation when
+      the timezone has a daylight savings policy. In that case you may wish to
+      use ``utc=True``.
 
     Examples
     --------
-    **Specifying the values**
 
-    The next four examples generate the same `DatetimeIndex`, but vary
-    the combination of `start`, `end` and `periods`.
+    **Handling various input formats**
 
-    Specify `start` and `end`, with the default daily frequency.
+    Assembling a datetime from multiple columns of a :class:`DataFrame`. The keys
+    can be common abbreviations like ['year', 'month', 'day', 'minute', 'second',
+    'ms', 'us', 'ns']) or plurals of the same
 
-    >>> pd.date_range(start='1/1/2018', end='1/08/2018')
-    DatetimeIndex(['2018-01-01', '2018-01-02', '2018-01-03', '2018-01-04',
-                   '2018-01-05', '2018-01-06', '2018-01-07', '2018-01-08'],
-                  dtype='datetime64[ns]', freq='D')
+    >>> df = pd.DataFrame({'year': [2015, 2016],
+    ...                    'month': [2, 3],
+    ...                    'day': [4, 5]})
+    >>> pd.to_datetime(df)
+    0   2015-02-04
+    1   2016-03-05
+    dtype: datetime64[ns]
 
-    Specify timezone-aware `start` and `end`, with the default daily frequency.
+    Using a unix epoch time
 
-    >>> pd.date_range(
-    ...     start=pd.to_datetime("1/1/2018").tz_localize("Europe/Berlin"),
-    ...     end=pd.to_datetime("1/08/2018").tz_localize("Europe/Berlin"),
-    ... )
-    DatetimeIndex(['2018-01-01 00:00:00+01:00', '2018-01-02 00:00:00+01:00',
-                   '2018-01-03 00:00:00+01:00', '2018-01-04 00:00:00+01:00',
-                   '2018-01-05 00:00:00+01:00', '2018-01-06 00:00:00+01:00',
-                   '2018-01-07 00:00:00+01:00', '2018-01-08 00:00:00+01:00'],
-                  dtype='datetime64[ns, Europe/Berlin]', freq='D')
+    >>> pd.to_datetime(1490195805, unit='s')
+    Timestamp('2017-03-22 15:16:45')
+    >>> pd.to_datetime(1490195805433502912, unit='ns')
+    Timestamp('2017-03-22 15:16:45.433502912')
 
-    Specify `start` and `periods`, the number of periods (days).
+    .. warning:: For float arg, precision rounding might happen. To prevent
+        unexpected behavior use a fixed-width exact type.
 
-    >>> pd.date_range(start='1/1/2018', periods=8)
-    DatetimeIndex(['2018-01-01', '2018-01-02', '2018-01-03', '2018-01-04',
-                   '2018-01-05', '2018-01-06', '2018-01-07', '2018-01-08'],
-                  dtype='datetime64[ns]', freq='D')
+    Using a non-unix epoch origin
 
-    Specify `end` and `periods`, the number of periods (days).
-
-    >>> pd.date_range(end='1/1/2018', periods=8)
-    DatetimeIndex(['2017-12-25', '2017-12-26', '2017-12-27', '2017-12-28',
-                   '2017-12-29', '2017-12-30', '2017-12-31', '2018-01-01'],
-                  dtype='datetime64[ns]', freq='D')
-
-    Specify `start`, `end`, and `periods`; the frequency is generated
-    automatically (linearly spaced).
-
-    >>> pd.date_range(start='2018-04-24', end='2018-04-27', periods=3)
-    DatetimeIndex(['2018-04-24 00:00:00', '2018-04-25 12:00:00',
-                   '2018-04-27 00:00:00'],
+    >>> pd.to_datetime([1, 2, 3], unit='D',
+    ...                origin=pd.Timestamp('1960-01-01'))
+    DatetimeIndex(['1960-01-02', '1960-01-03', '1960-01-04'],
                   dtype='datetime64[ns]', freq=None)
 
-    **Other Parameters**
+    **Differences with strptime behavior**
 
-    Changed the `freq` (frequency) to ``'ME'`` (month end frequency).
+    :const:`"%f"` will parse all the way up to nanoseconds.
 
-    >>> pd.date_range(start='1/1/2018', periods=5, freq='ME')
-    DatetimeIndex(['2018-01-31', '2018-02-28', '2018-03-31', '2018-04-30',
-                   '2018-05-31'],
-                  dtype='datetime64[ns]', freq='ME')
+    >>> pd.to_datetime('2018-10-26 12:00:00.0000000011',
+    ...                format='%Y-%m-%d %H:%M:%S.%f')
+    Timestamp('2018-10-26 12:00:00.000000001')
 
-    Multiples are allowed
+    **Non-convertible date/times**
 
-    >>> pd.date_range(start='1/1/2018', periods=5, freq='3ME')
-    DatetimeIndex(['2018-01-31', '2018-04-30', '2018-07-31', '2018-10-31',
-                   '2019-01-31'],
-                  dtype='datetime64[ns]', freq='3ME')
+    Passing ``errors='coerce'`` will force an out-of-bounds date to :const:`NaT`,
+    in addition to forcing non-dates (or non-parseable dates) to :const:`NaT`.
 
-    `freq` can also be specified as an Offset object.
+    >>> pd.to_datetime('13000101', format='%Y%m%d', errors='coerce')
+    NaT
 
-    >>> pd.date_range(start='1/1/2018', periods=5, freq=pd.offsets.MonthEnd(3))
-    DatetimeIndex(['2018-01-31', '2018-04-30', '2018-07-31', '2018-10-31',
-                   '2019-01-31'],
-                  dtype='datetime64[ns]', freq='3ME')
+    .. _to_datetime_tz_examples:
 
-    Specify `tz` to set the timezone.
+    **Timezones and time offsets**
 
-    >>> pd.date_range(start='1/1/2018', periods=5, tz='Asia/Tokyo')
-    DatetimeIndex(['2018-01-01 00:00:00+09:00', '2018-01-02 00:00:00+09:00',
-                   '2018-01-03 00:00:00+09:00', '2018-01-04 00:00:00+09:00',
-                   '2018-01-05 00:00:00+09:00'],
-                  dtype='datetime64[ns, Asia/Tokyo]', freq='D')
+    The default behaviour (``utc=False``) is as follows:
 
-    `inclusive` controls whether to include `start` and `end` that are on the
-    boundary. The default, "both", includes boundary points on either end.
+    - Timezone-naive inputs are converted to timezone-naive :class:`DatetimeIndex`:
 
-    >>> pd.date_range(start='2017-01-01', end='2017-01-04', inclusive="both")
-    DatetimeIndex(['2017-01-01', '2017-01-02', '2017-01-03', '2017-01-04'],
-                  dtype='datetime64[ns]', freq='D')
+    >>> pd.to_datetime(['2018-10-26 12:00:00', '2018-10-26 13:00:15'])
+    DatetimeIndex(['2018-10-26 12:00:00', '2018-10-26 13:00:15'],
+                  dtype='datetime64[ns]', freq=None)
 
-    Use ``inclusive='left'`` to exclude `end` if it falls on the boundary.
+    - Timezone-aware inputs *with constant time offset* are converted to
+      timezone-aware :class:`DatetimeIndex`:
 
-    >>> pd.date_range(start='2017-01-01', end='2017-01-04', inclusive='left')
-    DatetimeIndex(['2017-01-01', '2017-01-02', '2017-01-03'],
-                  dtype='datetime64[ns]', freq='D')
+    >>> pd.to_datetime(['2018-10-26 12:00 -0500', '2018-10-26 13:00 -0500'])
+    DatetimeIndex(['2018-10-26 12:00:00-05:00', '2018-10-26 13:00:00-05:00'],
+                  dtype='datetime64[ns, UTC-05:00]', freq=None)
 
-    Use ``inclusive='right'`` to exclude `start` if it falls on the boundary, and
-    similarly ``inclusive='neither'`` will exclude both `start` and `end`.
+    - However, timezone-aware inputs *with mixed time offsets* (for example
+      issued from a timezone with daylight savings, such as Europe/Paris)
+      are **not successfully converted** to a :class:`DatetimeIndex`.
+      Parsing datetimes with mixed time zones will show a warning unless
+      `utc=True`. If you specify `utc=False` the warning below will be shown
+      and a simple :class:`Index` containing :class:`datetime.datetime`
+      objects will be returned:
 
-    >>> pd.date_range(start='2017-01-01', end='2017-01-04', inclusive='right')
-    DatetimeIndex(['2017-01-02', '2017-01-03', '2017-01-04'],
-                  dtype='datetime64[ns]', freq='D')
+    >>> pd.to_datetime(['2020-10-25 02:00 +0200',
+    ...                 '2020-10-25 04:00 +0100'])  # doctest: +SKIP
+    FutureWarning: In a future version of pandas, parsing datetimes with mixed
+    time zones will raise an error unless `utc=True`. Please specify `utc=True`
+    to opt in to the new behaviour and silence this warning. To create a `Series`
+    with mixed offsets and `object` dtype, please use `apply` and
+    `datetime.datetime.strptime`.
+    Index([2020-10-25 02:00:00+02:00, 2020-10-25 04:00:00+01:00],
+          dtype='object')
 
-    **Specify a unit**
+    - A mix of timezone-aware and timezone-naive inputs is also converted to
+      a simple :class:`Index` containing :class:`datetime.datetime` objects:
 
-    >>> pd.date_range(start="2017-01-01", periods=10, freq="100YS", unit="s")
-    DatetimeIndex(['2017-01-01', '2117-01-01', '2217-01-01', '2317-01-01',
-                   '2417-01-01', '2517-01-01', '2617-01-01', '2717-01-01',
-                   '2817-01-01', '2917-01-01'],
-                  dtype='datetime64[s]', freq='100YS-JAN')
+    >>> from datetime import datetime
+    >>> pd.to_datetime(["2020-01-01 01:00:00-01:00",
+    ...                 datetime(2020, 1, 1, 3, 0)])  # doctest: +SKIP
+    FutureWarning: In a future version of pandas, parsing datetimes with mixed
+    time zones will raise an error unless `utc=True`. Please specify `utc=True`
+    to opt in to the new behaviour and silence this warning. To create a `Series`
+    with mixed offsets and `object` dtype, please use `apply` and
+    `datetime.datetime.strptime`.
+    Index([2020-01-01 01:00:00-01:00, 2020-01-01 03:00:00], dtype='object')
+
+    |
+
+    Setting ``utc=True`` solves most of the above issues:
+
+    - Timezone-naive inputs are *localized* as UTC
+
+    >>> pd.to_datetime(['2018-10-26 12:00', '2018-10-26 13:00'], utc=True)
+    DatetimeIndex(['2018-10-26 12:00:00+00:00', '2018-10-26 13:00:00+00:00'],
+                  dtype='datetime64[ns, UTC]', freq=None)
+
+    - Timezone-aware inputs are *converted* to UTC (the output represents the
+      exact same datetime, but viewed from the UTC time offset `+00:00`).
+
+    >>> pd.to_datetime(['2018-10-26 12:00 -0530', '2018-10-26 12:00 -0500'],
+    ...                utc=True)
+    DatetimeIndex(['2018-10-26 17:30:00+00:00', '2018-10-26 17:00:00+00:00'],
+                  dtype='datetime64[ns, UTC]', freq=None)
+
+    - Inputs can contain both string or datetime, the above
+      rules still apply
+
+    >>> pd.to_datetime(['2018-10-26 12:00', datetime(2020, 1, 1, 18)], utc=True)
+    DatetimeIndex(['2018-10-26 12:00:00+00:00', '2020-01-01 18:00:00+00:00'],
+                  dtype='datetime64[ns, UTC]', freq=None)
     """
-    if freq is None and com.any_none(periods, start, end):
-        freq = "D"
+    if exact is not lib.no_default and format in {"mixed", "ISO8601"}:
+        raise ValueError("Cannot use 'exact' when 'format' is 'mixed' or 'ISO8601'")
+    if infer_datetime_format is not lib.no_default:
+        warnings.warn(
+            "The argument 'infer_datetime_format' is deprecated and will "
+            "be removed in a future version. "
+            "A strict version of it is now the default, see "
+            "https://pandas.pydata.org/pdeps/0004-consistent-to-datetime-parsing.html. "
+            "You can safely remove this argument.",
+            stacklevel=find_stack_level(),
+        )
+    if errors == "ignore":
+        # GH#54467
+        warnings.warn(
+            "errors='ignore' is deprecated and will raise in a future version. "
+            "Use to_datetime without passing `errors` and catch exceptions "
+            "explicitly instead",
+            FutureWarning,
+            stacklevel=find_stack_level(),
+        )
 
-    dtarr = DatetimeArray._generate_range(
-        start=start,
-        end=end,
-        periods=periods,
-        freq=freq,
-        tz=tz,
-        normalize=normalize,
-        inclusive=inclusive,
+    if arg is None:
+        return None
+
+    if origin != "unix":
+        arg = _adjust_to_origin(arg, origin, unit)
+
+    convert_listlike = partial(
+        _convert_listlike_datetimes,
+        utc=utc,
         unit=unit,
-        **kwargs,
+        dayfirst=dayfirst,
+        yearfirst=yearfirst,
+        errors=errors,
+        exact=exact,
     )
-    return DatetimeIndex._simple_new(dtarr, name=name)
+    # pylint: disable-next=used-before-assignment
+    result: Timestamp | NaTType | Series | Index
+
+    if isinstance(arg, Timestamp):
+        result = arg
+        if utc:
+            if arg.tz is not None:
+                result = arg.tz_convert("utc")
+            else:
+                result = arg.tz_localize("utc")
+    elif isinstance(arg, ABCSeries):
+        cache_array = _maybe_cache(arg, format, cache, convert_listlike)
+        if not cache_array.empty:
+            result = arg.map(cache_array)
+        else:
+            values = convert_listlike(arg._values, format)
+            result = arg._constructor(values, index=arg.index, name=arg.name)
+    elif isinstance(arg, (ABCDataFrame, abc.MutableMapping)):
+        result = _assemble_from_unit_mappings(arg, errors, utc)
+    elif isinstance(arg, Index):
+        cache_array = _maybe_cache(arg, format, cache, convert_listlike)
+        if not cache_array.empty:
+            result = _convert_and_box_cache(arg, cache_array, name=arg.name)
+        else:
+            result = convert_listlike(arg, format, name=arg.name)
+    elif is_list_like(arg):
+        try:
+            # error: Argument 1 to "_maybe_cache" has incompatible type
+            # "Union[float, str, datetime, List[Any], Tuple[Any, ...], ExtensionArray,
+            # ndarray[Any, Any], Series]"; expected "Union[List[Any], Tuple[Any, ...],
+            # Union[Union[ExtensionArray, ndarray[Any, Any]], Index, Series], Series]"
+            argc = cast(
+                Union[list, tuple, ExtensionArray, np.ndarray, "Series", Index], arg
+            )
+            cache_array = _maybe_cache(argc, format, cache, convert_listlike)
+        except OutOfBoundsDatetime:
+            # caching attempts to create a DatetimeIndex, which may raise
+            # an OOB. If that's the desired behavior, then just reraise...
+            if errors == "raise":
+                raise
+            # ... otherwise, continue without the cache.
+            from pandas import Series
+
+            cache_array = Series([], dtype=object)  # just an empty array
+        if not cache_array.empty:
+            result = _convert_and_box_cache(argc, cache_array)
+        else:
+            result = convert_listlike(argc, format)
+    else:
+        result = convert_listlike(np.array([arg]), format)[0]
+        if isinstance(arg, bool) and isinstance(result, np.bool_):
+            result = bool(result)  # TODO: avoid this kludge.
+
+    #  error: Incompatible return value type (got "Union[Timestamp, NaTType,
+    # Series, Index]", expected "Union[DatetimeIndex, Series, float, str,
+    # NaTType, None]")
+    return result  # type: ignore[return-value]
 
 
-def bdate_range(
-    start=None,
-    end=None,
-    periods: int | None = None,
-    freq: Frequency | dt.timedelta = "B",
-    tz=None,
-    normalize: bool = True,
-    name: Hashable | None = None,
-    weekmask=None,
-    holidays=None,
-    inclusive: IntervalClosedType = "both",
-    **kwargs,
-) -> DatetimeIndex:
+# mappings for assembling units
+_unit_map = {
+    "year": "year",
+    "years": "year",
+    "month": "month",
+    "months": "month",
+    "day": "day",
+    "days": "day",
+    "hour": "h",
+    "hours": "h",
+    "minute": "m",
+    "minutes": "m",
+    "second": "s",
+    "seconds": "s",
+    "ms": "ms",
+    "millisecond": "ms",
+    "milliseconds": "ms",
+    "us": "us",
+    "microsecond": "us",
+    "microseconds": "us",
+    "ns": "ns",
+    "nanosecond": "ns",
+    "nanoseconds": "ns",
+}
+
+
+def _assemble_from_unit_mappings(arg, errors: DateTimeErrorChoices, utc: bool):
     """
-    Return a fixed frequency DatetimeIndex with business day as the default.
+    assemble the unit specified fields from the arg (DataFrame)
+    Return a Series for actual parsing
 
     Parameters
     ----------
-    start : str or datetime-like, default None
-        Left bound for generating dates.
-    end : str or datetime-like, default None
-        Right bound for generating dates.
-    periods : int, default None
-        Number of periods to generate.
-    freq : str, Timedelta, datetime.timedelta, or DateOffset, default 'B'
-        Frequency strings can have multiples, e.g. '5h'. The default is
-        business daily ('B').
-    tz : str or None
-        Time zone name for returning localized DatetimeIndex, for example
-        Asia/Beijing.
-    normalize : bool, default False
-        Normalize start/end dates to midnight before generating date range.
-    name : str, default None
-        Name of the resulting DatetimeIndex.
-    weekmask : str or None, default None
-        Weekmask of valid business days, passed to ``numpy.busdaycalendar``,
-        only used when custom frequency strings are passed.  The default
-        value None is equivalent to 'Mon Tue Wed Thu Fri'.
-    holidays : list-like or None, default None
-        Dates to exclude from the set of valid business days, passed to
-        ``numpy.busdaycalendar``, only used when custom frequency strings
-        are passed.
-    inclusive : {"both", "neither", "left", "right"}, default "both"
-        Include boundaries; Whether to set each bound as closed or open.
+    arg : DataFrame
+    errors : {'ignore', 'raise', 'coerce'}, default 'raise'
 
-        .. versionadded:: 1.4.0
-    **kwargs
-        For compatibility. Has no effect on the result.
+        - If :const:`'raise'`, then invalid parsing will raise an exception
+        - If :const:`'coerce'`, then invalid parsing will be set as :const:`NaT`
+        - If :const:`'ignore'`, then invalid parsing will return the input
+    utc : bool
+        Whether to convert/localize timestamps to UTC.
 
     Returns
     -------
-    DatetimeIndex
-
-    Notes
-    -----
-    Of the four parameters: ``start``, ``end``, ``periods``, and ``freq``,
-    exactly three must be specified.  Specifying ``freq`` is a requirement
-    for ``bdate_range``.  Use ``date_range`` if specifying ``freq`` is not
-    desired.
-
-    To learn more about the frequency strings, please see `this link
-    <https://pandas.pydata.org/pandas-docs/stable/user_guide/timeseries.html#offset-aliases>`__.
-
-    Examples
-    --------
-    Note how the two weekend days are skipped in the result.
-
-    >>> pd.bdate_range(start='1/1/2018', end='1/08/2018')
-    DatetimeIndex(['2018-01-01', '2018-01-02', '2018-01-03', '2018-01-04',
-               '2018-01-05', '2018-01-08'],
-              dtype='datetime64[ns]', freq='B')
+    Series
     """
-    if freq is None:
-        msg = "freq must be specified for bdate_range; use date_range instead"
-        raise TypeError(msg)
-
-    if isinstance(freq, str) and freq.startswith("C"):
-        try:
-            weekmask = weekmask or "Mon Tue Wed Thu Fri"
-            freq = prefix_mapping[freq](holidays=holidays, weekmask=weekmask)
-        except (KeyError, TypeError) as err:
-            msg = f"invalid custom frequency string: {freq}"
-            raise ValueError(msg) from err
-    elif holidays or weekmask:
-        msg = (
-            "a custom frequency string is required when holidays or "
-            f"weekmask are passed, got frequency {freq}"
-        )
-        raise ValueError(msg)
-
-    return date_range(
-        start=start,
-        end=end,
-        periods=periods,
-        freq=freq,
-        tz=tz,
-        normalize=normalize,
-        name=name,
-        inclusive=inclusive,
-        **kwargs,
+    from pandas import (
+        DataFrame,
+        to_numeric,
+        to_timedelta,
     )
 
+    arg = DataFrame(arg)
+    if not arg.columns.is_unique:
+        raise ValueError("cannot assemble with duplicate keys")
 
-def _time_to_micros(time_obj: dt.time) -> int:
-    seconds = time_obj.hour * 60 * 60 + 60 * time_obj.minute + time_obj.second
-    return 1_000_000 * seconds + time_obj.microsecond
+    # replace passed unit with _unit_map
+    def f(value):
+        if value in _unit_map:
+            return _unit_map[value]
+
+        # m is case significant
+        if value.lower() in _unit_map:
+            return _unit_map[value.lower()]
+
+        return value
+
+    unit = {k: f(k) for k in arg.keys()}
+    unit_rev = {v: k for k, v in unit.items()}
+
+    # we require at least Ymd
+    required = ["year", "month", "day"]
+    req = sorted(set(required) - set(unit_rev.keys()))
+    if len(req):
+        _required = ",".join(req)
+        raise ValueError(
+            "to assemble mappings requires at least that "
+            f"[year, month, day] be specified: [{_required}] is missing"
+        )
+
+    # keys we don't recognize
+    excess = sorted(set(unit_rev.keys()) - set(_unit_map.values()))
+    if len(excess):
+        _excess = ",".join(excess)
+        raise ValueError(
+            f"extra keys have been passed to the datetime assemblage: [{_excess}]"
+        )
+
+    def coerce(values):
+        # we allow coercion to if errors allows
+        values = to_numeric(values, errors=errors)
+
+        # prevent overflow in case of int8 or int16
+        if is_integer_dtype(values.dtype):
+            values = values.astype("int64", copy=False)
+        return values
+
+    values = (
+        coerce(arg[unit_rev["year"]]) * 10000
+        + coerce(arg[unit_rev["month"]]) * 100
+        + coerce(arg[unit_rev["day"]])
+    )
+    try:
+        values = to_datetime(values, format="%Y%m%d", errors=errors, utc=utc)
+    except (TypeError, ValueError) as err:
+        raise ValueError(f"cannot assemble the datetimes: {err}") from err
+
+    units: list[UnitChoices] = ["h", "m", "s", "ms", "us", "ns"]
+    for u in units:
+        value = unit_rev.get(u)
+        if value is not None and value in arg:
+            try:
+                values += to_timedelta(coerce(arg[value]), unit=u, errors=errors)
+            except (TypeError, ValueError) as err:
+                raise ValueError(
+                    f"cannot assemble the datetimes [{value}]: {err}"
+                ) from err
+    return values
+
+
+__all__ = [
+    "DateParseError",
+    "should_cache",
+    "to_datetime",
+]

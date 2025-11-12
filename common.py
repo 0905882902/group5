@@ -1,146 +1,169 @@
-"""
-Boilerplate functions used in defining binary operations.
-"""
+"""Common utility functions for rolling operations"""
 from __future__ import annotations
 
-from functools import wraps
-from typing import (
-    TYPE_CHECKING,
-    Callable,
-)
+from collections import defaultdict
+from typing import cast
 
-from pandas._libs.lib import item_from_zerodim
-from pandas._libs.missing import is_matching_na
+import numpy as np
 
 from pandas.core.dtypes.generic import (
-    ABCIndex,
+    ABCDataFrame,
     ABCSeries,
 )
 
-if TYPE_CHECKING:
-    from pandas._typing import F
+from pandas.core.indexes.api import MultiIndex
 
 
-def unpack_zerodim_and_defer(name: str) -> Callable[[F], F]:
-    """
-    Boilerplate for pandas conventions in arithmetic and comparison methods.
+def flex_binary_moment(arg1, arg2, f, pairwise: bool = False):
+    if isinstance(arg1, ABCSeries) and isinstance(arg2, ABCSeries):
+        X, Y = prep_binary(arg1, arg2)
+        return f(X, Y)
 
-    Parameters
-    ----------
-    name : str
+    elif isinstance(arg1, ABCDataFrame):
+        from pandas import DataFrame
 
-    Returns
-    -------
-    decorator
-    """
-
-    def wrapper(method: F) -> F:
-        return _unpack_zerodim_and_defer(method, name)
-
-    return wrapper
-
-
-def _unpack_zerodim_and_defer(method, name: str):
-    """
-    Boilerplate for pandas conventions in arithmetic and comparison methods.
-
-    Ensure method returns NotImplemented when operating against "senior"
-    classes.  Ensure zero-dimensional ndarrays are always unpacked.
-
-    Parameters
-    ----------
-    method : binary method
-    name : str
-
-    Returns
-    -------
-    method
-    """
-    stripped_name = name.removeprefix("__").removesuffix("__")
-    is_cmp = stripped_name in {"eq", "ne", "lt", "le", "gt", "ge"}
-
-    @wraps(method)
-    def new_method(self, other):
-        if is_cmp and isinstance(self, ABCIndex) and isinstance(other, ABCSeries):
-            # For comparison ops, Index does *not* defer to Series
-            pass
-        else:
-            prio = getattr(other, "__pandas_priority__", None)
-            if prio is not None:
-                if prio > self.__pandas_priority__:
-                    # e.g. other is DataFrame while self is Index/Series/EA
-                    return NotImplemented
-
-        other = item_from_zerodim(other)
-
-        return method(self, other)
-
-    return new_method
-
-
-def get_op_result_name(left, right):
-    """
-    Find the appropriate name to pin to an operation result.  This result
-    should always be either an Index or a Series.
-
-    Parameters
-    ----------
-    left : {Series, Index}
-    right : object
-
-    Returns
-    -------
-    name : object
-        Usually a string
-    """
-    if isinstance(right, (ABCSeries, ABCIndex)):
-        name = _maybe_match_name(left, right)
-    else:
-        name = left.name
-    return name
-
-
-def _maybe_match_name(a, b):
-    """
-    Try to find a name to attach to the result of an operation between
-    a and b.  If only one of these has a `name` attribute, return that
-    name.  Otherwise return a consensus name if they match or None if
-    they have different names.
-
-    Parameters
-    ----------
-    a : object
-    b : object
-
-    Returns
-    -------
-    name : str or None
-
-    See Also
-    --------
-    pandas.core.common.consensus_name_attr
-    """
-    a_has = hasattr(a, "name")
-    b_has = hasattr(b, "name")
-    if a_has and b_has:
-        try:
-            if a.name == b.name:
-                return a.name
-            elif is_matching_na(a.name, b.name):
-                # e.g. both are np.nan
-                return a.name
+        def dataframe_from_int_dict(data, frame_template) -> DataFrame:
+            result = DataFrame(data, index=frame_template.index)
+            if len(result.columns) > 0:
+                result.columns = frame_template.columns[result.columns]
             else:
-                return None
-        except TypeError:
-            # pd.NA
-            if is_matching_na(a.name, b.name):
-                return a.name
-            return None
-        except ValueError:
-            # e.g. np.int64(1) vs (np.int64(1), np.int64(2))
-            return None
-    elif a_has:
-        return a.name
-    elif b_has:
-        return b.name
-    return None
+                result.columns = frame_template.columns.copy()
+            return result
+
+        results = {}
+        if isinstance(arg2, ABCDataFrame):
+            if pairwise is False:
+                if arg1 is arg2:
+                    # special case in order to handle duplicate column names
+                    for i in range(len(arg1.columns)):
+                        results[i] = f(arg1.iloc[:, i], arg2.iloc[:, i])
+                    return dataframe_from_int_dict(results, arg1)
+                else:
+                    if not arg1.columns.is_unique:
+                        raise ValueError("'arg1' columns are not unique")
+                    if not arg2.columns.is_unique:
+                        raise ValueError("'arg2' columns are not unique")
+                    X, Y = arg1.align(arg2, join="outer")
+                    X, Y = prep_binary(X, Y)
+                    res_columns = arg1.columns.union(arg2.columns)
+                    for col in res_columns:
+                        if col in X and col in Y:
+                            results[col] = f(X[col], Y[col])
+                    return DataFrame(results, index=X.index, columns=res_columns)
+            elif pairwise is True:
+                results = defaultdict(dict)
+                for i in range(len(arg1.columns)):
+                    for j in range(len(arg2.columns)):
+                        if j < i and arg2 is arg1:
+                            # Symmetric case
+                            results[i][j] = results[j][i]
+                        else:
+                            results[i][j] = f(
+                                *prep_binary(arg1.iloc[:, i], arg2.iloc[:, j])
+                            )
+
+                from pandas import concat
+
+                result_index = arg1.index.union(arg2.index)
+                if len(result_index):
+                    # construct result frame
+                    result = concat(
+                        [
+                            concat(
+                                [results[i][j] for j in range(len(arg2.columns))],
+                                ignore_index=True,
+                            )
+                            for i in range(len(arg1.columns))
+                        ],
+                        ignore_index=True,
+                        axis=1,
+                    )
+                    result.columns = arg1.columns
+
+                    # set the index and reorder
+                    if arg2.columns.nlevels > 1:
+                        # mypy needs to know columns is a MultiIndex, Index doesn't
+                        # have levels attribute
+                        arg2.columns = cast(MultiIndex, arg2.columns)
+                        # GH 21157: Equivalent to MultiIndex.from_product(
+                        #  [result_index], <unique combinations of arg2.columns.levels>,
+                        # )
+                        # A normal MultiIndex.from_product will produce too many
+                        # combinations.
+                        result_level = np.tile(
+                            result_index, len(result) // len(result_index)
+                        )
+                        arg2_levels = (
+                            np.repeat(
+                                arg2.columns.get_level_values(i),
+                                len(result) // len(arg2.columns),
+                            )
+                            for i in range(arg2.columns.nlevels)
+                        )
+                        result_names = list(arg2.columns.names) + [result_index.name]
+                        result.index = MultiIndex.from_arrays(
+                            [*arg2_levels, result_level], names=result_names
+                        )
+                        # GH 34440
+                        num_levels = len(result.index.levels)
+                        new_order = [num_levels - 1] + list(range(num_levels - 1))
+                        result = result.reorder_levels(new_order).sort_index()
+                    else:
+                        result.index = MultiIndex.from_product(
+                            [range(len(arg2.columns)), range(len(result_index))]
+                        )
+                        result = result.swaplevel(1, 0).sort_index()
+                        result.index = MultiIndex.from_product(
+                            [result_index] + [arg2.columns]
+                        )
+                else:
+                    # empty result
+                    result = DataFrame(
+                        index=MultiIndex(
+                            levels=[arg1.index, arg2.columns], codes=[[], []]
+                        ),
+                        columns=arg2.columns,
+                        dtype="float64",
+                    )
+
+                # reset our index names to arg1 names
+                # reset our column names to arg2 names
+                # careful not to mutate the original names
+                result.columns = result.columns.set_names(arg1.columns.names)
+                result.index = result.index.set_names(
+                    result_index.names + arg2.columns.names
+                )
+
+                return result
+        else:
+            results = {
+                i: f(*prep_binary(arg1.iloc[:, i], arg2))
+                for i in range(len(arg1.columns))
+            }
+            return dataframe_from_int_dict(results, arg1)
+
+    else:
+        return flex_binary_moment(arg2, arg1, f)
+
+
+def zsqrt(x):
+    with np.errstate(all="ignore"):
+        result = np.sqrt(x)
+        mask = x < 0
+
+    if isinstance(x, ABCDataFrame):
+        if mask._values.any():
+            result[mask] = 0
+    else:
+        if mask.any():
+            result[mask] = 0
+
+    return result
+
+
+def prep_binary(arg1, arg2):
+    # mask out values, this also makes a common index...
+    X = arg1 + 0 * arg2
+    Y = arg2 + 0 * arg1
+
+    return X, Y

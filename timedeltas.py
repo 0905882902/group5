@@ -1,356 +1,283 @@
-""" implement the TimedeltaIndex """
+"""
+timedelta support tools
+"""
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import (
+    TYPE_CHECKING,
+    overload,
+)
 import warnings
 
-from pandas._libs import (
-    index as libindex,
-    lib,
-)
+import numpy as np
+
+from pandas._libs import lib
 from pandas._libs.tslibs import (
-    Resolution,
-    Timedelta,
-    to_offset,
+    NaT,
+    NaTType,
 )
-from pandas._libs.tslibs.timedeltas import disallow_ambiguous_unit
+from pandas._libs.tslibs.timedeltas import (
+    Timedelta,
+    disallow_ambiguous_unit,
+    parse_timedelta_unit,
+)
 from pandas.util._exceptions import find_stack_level
 
-from pandas.core.dtypes.common import (
-    is_scalar,
-    pandas_dtype,
+from pandas.core.dtypes.common import is_list_like
+from pandas.core.dtypes.dtypes import ArrowDtype
+from pandas.core.dtypes.generic import (
+    ABCIndex,
+    ABCSeries,
 )
-from pandas.core.dtypes.generic import ABCSeries
 
-from pandas.core.arrays.timedeltas import TimedeltaArray
-import pandas.core.common as com
-from pandas.core.indexes.base import (
-    Index,
-    maybe_extract_name,
-)
-from pandas.core.indexes.datetimelike import DatetimeTimedeltaMixin
-from pandas.core.indexes.extension import inherit_names
+from pandas.core.arrays.timedeltas import sequence_to_td64ns
 
 if TYPE_CHECKING:
-    from pandas._typing import DtypeObj
+    from collections.abc import Hashable
+    from datetime import timedelta
+
+    from pandas._libs.tslibs.timedeltas import UnitChoices
+    from pandas._typing import (
+        ArrayLike,
+        DateTimeErrorChoices,
+    )
+
+    from pandas import (
+        Index,
+        Series,
+        TimedeltaIndex,
+    )
 
 
-@inherit_names(
-    ["__neg__", "__pos__", "__abs__", "total_seconds", "round", "floor", "ceil"]
-    + TimedeltaArray._field_ops,
-    TimedeltaArray,
-    wrap=True,
-)
-@inherit_names(
-    [
-        "components",
-        "to_pytimedelta",
-        "sum",
-        "std",
-        "median",
-    ],
-    TimedeltaArray,
-)
-class TimedeltaIndex(DatetimeTimedeltaMixin):
+@overload
+def to_timedelta(
+    arg: str | float | timedelta,
+    unit: UnitChoices | None = ...,
+    errors: DateTimeErrorChoices = ...,
+) -> Timedelta:
+    ...
+
+
+@overload
+def to_timedelta(
+    arg: Series,
+    unit: UnitChoices | None = ...,
+    errors: DateTimeErrorChoices = ...,
+) -> Series:
+    ...
+
+
+@overload
+def to_timedelta(
+    arg: list | tuple | range | ArrayLike | Index,
+    unit: UnitChoices | None = ...,
+    errors: DateTimeErrorChoices = ...,
+) -> TimedeltaIndex:
+    ...
+
+
+def to_timedelta(
+    arg: str
+    | int
+    | float
+    | timedelta
+    | list
+    | tuple
+    | range
+    | ArrayLike
+    | Index
+    | Series,
+    unit: UnitChoices | None = None,
+    errors: DateTimeErrorChoices = "raise",
+) -> Timedelta | TimedeltaIndex | Series:
     """
-    Immutable Index of timedelta64 data.
+    Convert argument to timedelta.
 
-    Represented internally as int64, and scalars returned Timedelta objects.
+    Timedeltas are absolute differences in times, expressed in difference
+    units (e.g. days, hours, minutes, seconds). This method converts
+    an argument from a recognized timedelta format / value into
+    a Timedelta type.
 
     Parameters
     ----------
-    data : array-like (1-dimensional), optional
-        Optional timedelta-like data to construct index with.
-    unit : {'D', 'h', 'm', 's', 'ms', 'us', 'ns'}, optional
-        The unit of ``data``.
+    arg : str, timedelta, list-like or Series
+        The data to be converted to timedelta.
+
+        .. versionchanged:: 2.0
+            Strings with units 'M', 'Y' and 'y' do not represent
+            unambiguous timedelta values and will raise an exception.
+
+    unit : str, optional
+        Denotes the unit of the arg for numeric `arg`. Defaults to ``"ns"``.
+
+        Possible values:
+
+        * 'W'
+        * 'D' / 'days' / 'day'
+        * 'hours' / 'hour' / 'hr' / 'h' / 'H'
+        * 'm' / 'minute' / 'min' / 'minutes' / 'T'
+        * 's' / 'seconds' / 'sec' / 'second' / 'S'
+        * 'ms' / 'milliseconds' / 'millisecond' / 'milli' / 'millis' / 'L'
+        * 'us' / 'microseconds' / 'microsecond' / 'micro' / 'micros' / 'U'
+        * 'ns' / 'nanoseconds' / 'nano' / 'nanos' / 'nanosecond' / 'N'
+
+        Must not be specified when `arg` contains strings and ``errors="raise"``.
 
         .. deprecated:: 2.2.0
-         Use ``pd.to_timedelta`` instead.
+            Units 'H', 'T', 'S', 'L', 'U' and 'N' are deprecated and will be removed
+            in a future version. Please use 'h', 'min', 's', 'ms', 'us', and 'ns'
+            instead of 'H', 'T', 'S', 'L', 'U' and 'N'.
 
-    freq : str or pandas offset object, optional
-        One of pandas date offset strings or corresponding objects. The string
-        ``'infer'`` can be passed in order to set the frequency of the index as
-        the inferred frequency upon creation.
-    dtype : numpy.dtype or str, default None
-        Valid ``numpy`` dtypes are ``timedelta64[ns]``, ``timedelta64[us]``,
-        ``timedelta64[ms]``, and ``timedelta64[s]``.
-    copy : bool
-        Make a copy of input array.
-    name : object
-        Name to be stored in the index.
-
-    Attributes
-    ----------
-    days
-    seconds
-    microseconds
-    nanoseconds
-    components
-    inferred_freq
-
-    Methods
-    -------
-    to_pytimedelta
-    to_series
-    round
-    floor
-    ceil
-    to_frame
-    mean
-
-    See Also
-    --------
-    Index : The base pandas Index type.
-    Timedelta : Represents a duration between two dates or times.
-    DatetimeIndex : Index of datetime64 data.
-    PeriodIndex : Index of Period data.
-    timedelta_range : Create a fixed-frequency TimedeltaIndex.
-
-    Notes
-    -----
-    To learn more about the frequency strings, please see `this link
-    <https://pandas.pydata.org/pandas-docs/stable/user_guide/timeseries.html#offset-aliases>`__.
-
-    Examples
-    --------
-    >>> pd.TimedeltaIndex(['0 days', '1 days', '2 days', '3 days', '4 days'])
-    TimedeltaIndex(['0 days', '1 days', '2 days', '3 days', '4 days'],
-                   dtype='timedelta64[ns]', freq=None)
-
-    We can also let pandas infer the frequency when possible.
-
-    >>> pd.TimedeltaIndex(np.arange(5) * 24 * 3600 * 1e9, freq='infer')
-    TimedeltaIndex(['0 days', '1 days', '2 days', '3 days', '4 days'],
-                   dtype='timedelta64[ns]', freq='D')
-    """
-
-    _typ = "timedeltaindex"
-
-    _data_cls = TimedeltaArray
-
-    @property
-    def _engine_type(self) -> type[libindex.TimedeltaEngine]:
-        return libindex.TimedeltaEngine
-
-    _data: TimedeltaArray
-
-    # Use base class method instead of DatetimeTimedeltaMixin._get_string_slice
-    _get_string_slice = Index._get_string_slice
-
-    # error: Signature of "_resolution_obj" incompatible with supertype
-    # "DatetimeIndexOpsMixin"
-    @property
-    def _resolution_obj(self) -> Resolution | None:  # type: ignore[override]
-        return self._data._resolution_obj
-
-    # -------------------------------------------------------------------
-    # Constructors
-
-    def __new__(
-        cls,
-        data=None,
-        unit=lib.no_default,
-        freq=lib.no_default,
-        closed=lib.no_default,
-        dtype=None,
-        copy: bool = False,
-        name=None,
-    ):
-        if closed is not lib.no_default:
-            # GH#52628
-            warnings.warn(
-                f"The 'closed' keyword in {cls.__name__} construction is "
-                "deprecated and will be removed in a future version.",
-                FutureWarning,
-                stacklevel=find_stack_level(),
-            )
-
-        if unit is not lib.no_default:
-            # GH#55499
-            warnings.warn(
-                f"The 'unit' keyword in {cls.__name__} construction is "
-                "deprecated and will be removed in a future version. "
-                "Use pd.to_timedelta instead.",
-                FutureWarning,
-                stacklevel=find_stack_level(),
-            )
-        else:
-            unit = None
-
-        name = maybe_extract_name(name, data, cls)
-
-        if is_scalar(data):
-            cls._raise_scalar_data_error(data)
-
-        disallow_ambiguous_unit(unit)
-        if dtype is not None:
-            dtype = pandas_dtype(dtype)
-
-        if (
-            isinstance(data, TimedeltaArray)
-            and freq is lib.no_default
-            and (dtype is None or dtype == data.dtype)
-        ):
-            if copy:
-                data = data.copy()
-            return cls._simple_new(data, name=name)
-
-        if (
-            isinstance(data, TimedeltaIndex)
-            and freq is lib.no_default
-            and name is None
-            and (dtype is None or dtype == data.dtype)
-        ):
-            if copy:
-                return data.copy()
-            else:
-                return data._view()
-
-        # - Cases checked above all return/raise before reaching here - #
-
-        tdarr = TimedeltaArray._from_sequence_not_strict(
-            data, freq=freq, unit=unit, dtype=dtype, copy=copy
-        )
-        refs = None
-        if not copy and isinstance(data, (ABCSeries, Index)):
-            refs = data._references
-
-        return cls._simple_new(tdarr, name=name, refs=refs)
-
-    # -------------------------------------------------------------------
-
-    def _is_comparable_dtype(self, dtype: DtypeObj) -> bool:
-        """
-        Can we compare values of the given dtype to our own?
-        """
-        return lib.is_np_dtype(dtype, "m")  # aka self._data._is_recognized_dtype
-
-    # -------------------------------------------------------------------
-    # Indexing Methods
-
-    def get_loc(self, key):
-        """
-        Get integer location for requested label
-
-        Returns
-        -------
-        loc : int, slice, or ndarray[int]
-        """
-        self._check_indexing_error(key)
-
-        try:
-            key = self._data._validate_scalar(key, unbox=False)
-        except TypeError as err:
-            raise KeyError(key) from err
-
-        return Index.get_loc(self, key)
-
-    def _parse_with_reso(self, label: str):
-        # the "with_reso" is a no-op for TimedeltaIndex
-        parsed = Timedelta(label)
-        return parsed, None
-
-    def _parsed_string_to_bounds(self, reso, parsed: Timedelta):
-        # reso is unused, included to match signature of DTI/PI
-        lbound = parsed.round(parsed.resolution_string)
-        rbound = lbound + to_offset(parsed.resolution_string) - Timedelta(1, "ns")
-        return lbound, rbound
-
-    # -------------------------------------------------------------------
-
-    @property
-    def inferred_type(self) -> str:
-        return "timedelta64"
-
-
-def timedelta_range(
-    start=None,
-    end=None,
-    periods: int | None = None,
-    freq=None,
-    name=None,
-    closed=None,
-    *,
-    unit: str | None = None,
-) -> TimedeltaIndex:
-    """
-    Return a fixed frequency TimedeltaIndex with day as the default.
-
-    Parameters
-    ----------
-    start : str or timedelta-like, default None
-        Left bound for generating timedeltas.
-    end : str or timedelta-like, default None
-        Right bound for generating timedeltas.
-    periods : int, default None
-        Number of periods to generate.
-    freq : str, Timedelta, datetime.timedelta, or DateOffset, default 'D'
-        Frequency strings can have multiples, e.g. '5h'.
-    name : str, default None
-        Name of the resulting TimedeltaIndex.
-    closed : str, default None
-        Make the interval closed with respect to the given frequency to
-        the 'left', 'right', or both sides (None).
-    unit : str, default None
-        Specify the desired resolution of the result.
-
-        .. versionadded:: 2.0.0
+    errors : {'ignore', 'raise', 'coerce'}, default 'raise'
+        - If 'raise', then invalid parsing will raise an exception.
+        - If 'coerce', then invalid parsing will be set as NaT.
+        - If 'ignore', then invalid parsing will return the input.
 
     Returns
     -------
-    TimedeltaIndex
+    timedelta
+        If parsing succeeded.
+        Return type depends on input:
+
+        - list-like: TimedeltaIndex of timedelta64 dtype
+        - Series: Series of timedelta64 dtype
+        - scalar: Timedelta
+
+    See Also
+    --------
+    DataFrame.astype : Cast argument to a specified dtype.
+    to_datetime : Convert argument to datetime.
+    convert_dtypes : Convert dtypes.
 
     Notes
     -----
-    Of the four parameters ``start``, ``end``, ``periods``, and ``freq``,
-    exactly three must be specified. If ``freq`` is omitted, the resulting
-    ``TimedeltaIndex`` will have ``periods`` linearly spaced elements between
-    ``start`` and ``end`` (closed on both sides).
-
-    To learn more about the frequency strings, please see `this link
-    <https://pandas.pydata.org/pandas-docs/stable/user_guide/timeseries.html#offset-aliases>`__.
+    If the precision is higher than nanoseconds, the precision of the duration is
+    truncated to nanoseconds for string inputs.
 
     Examples
     --------
-    >>> pd.timedelta_range(start='1 day', periods=4)
-    TimedeltaIndex(['1 days', '2 days', '3 days', '4 days'],
-                   dtype='timedelta64[ns]', freq='D')
+    Parsing a single string to a Timedelta:
 
-    The ``closed`` parameter specifies which endpoint is included.  The default
-    behavior is to include both endpoints.
+    >>> pd.to_timedelta('1 days 06:05:01.00003')
+    Timedelta('1 days 06:05:01.000030')
+    >>> pd.to_timedelta('15.5us')
+    Timedelta('0 days 00:00:00.000015500')
 
-    >>> pd.timedelta_range(start='1 day', periods=4, closed='right')
-    TimedeltaIndex(['2 days', '3 days', '4 days'],
-                   dtype='timedelta64[ns]', freq='D')
+    Parsing a list or array of strings:
 
-    The ``freq`` parameter specifies the frequency of the TimedeltaIndex.
-    Only fixed frequencies can be passed, non-fixed frequencies such as
-    'M' (month end) will raise.
-
-    >>> pd.timedelta_range(start='1 day', end='2 days', freq='6h')
-    TimedeltaIndex(['1 days 00:00:00', '1 days 06:00:00', '1 days 12:00:00',
-                    '1 days 18:00:00', '2 days 00:00:00'],
-                   dtype='timedelta64[ns]', freq='6h')
-
-    Specify ``start``, ``end``, and ``periods``; the frequency is generated
-    automatically (linearly spaced).
-
-    >>> pd.timedelta_range(start='1 day', end='5 days', periods=4)
-    TimedeltaIndex(['1 days 00:00:00', '2 days 08:00:00', '3 days 16:00:00',
-                    '5 days 00:00:00'],
+    >>> pd.to_timedelta(['1 days 06:05:01.00003', '15.5us', 'nan'])
+    TimedeltaIndex(['1 days 06:05:01.000030', '0 days 00:00:00.000015500', NaT],
                    dtype='timedelta64[ns]', freq=None)
 
-    **Specify a unit**
+    Converting numbers by specifying the `unit` keyword argument:
 
-    >>> pd.timedelta_range("1 Day", periods=3, freq="100000D", unit="s")
-    TimedeltaIndex(['1 days', '100001 days', '200001 days'],
-                   dtype='timedelta64[s]', freq='100000D')
+    >>> pd.to_timedelta(np.arange(5), unit='s')
+    TimedeltaIndex(['0 days 00:00:00', '0 days 00:00:01', '0 days 00:00:02',
+                    '0 days 00:00:03', '0 days 00:00:04'],
+                   dtype='timedelta64[ns]', freq=None)
+    >>> pd.to_timedelta(np.arange(5), unit='d')
+    TimedeltaIndex(['0 days', '1 days', '2 days', '3 days', '4 days'],
+                   dtype='timedelta64[ns]', freq=None)
     """
-    if freq is None and com.any_none(periods, start, end):
-        freq = "D"
+    if unit is not None:
+        unit = parse_timedelta_unit(unit)
+        disallow_ambiguous_unit(unit)
 
-    freq = to_offset(freq)
-    tdarr = TimedeltaArray._generate_range(
-        start, end, periods, freq, closed=closed, unit=unit
-    )
-    return TimedeltaIndex._simple_new(tdarr, name=name)
+    if errors not in ("ignore", "raise", "coerce"):
+        raise ValueError("errors must be one of 'ignore', 'raise', or 'coerce'.")
+    if errors == "ignore":
+        # GH#54467
+        warnings.warn(
+            "errors='ignore' is deprecated and will raise in a future version. "
+            "Use to_timedelta without passing `errors` and catch exceptions "
+            "explicitly instead",
+            FutureWarning,
+            stacklevel=find_stack_level(),
+        )
+
+    if arg is None:
+        return arg
+    elif isinstance(arg, ABCSeries):
+        values = _convert_listlike(arg._values, unit=unit, errors=errors)
+        return arg._constructor(values, index=arg.index, name=arg.name)
+    elif isinstance(arg, ABCIndex):
+        return _convert_listlike(arg, unit=unit, errors=errors, name=arg.name)
+    elif isinstance(arg, np.ndarray) and arg.ndim == 0:
+        # extract array scalar and process below
+        # error: Incompatible types in assignment (expression has type "object",
+        # variable has type "Union[str, int, float, timedelta, List[Any],
+        # Tuple[Any, ...], Union[Union[ExtensionArray, ndarray[Any, Any]], Index,
+        # Series]]")  [assignment]
+        arg = lib.item_from_zerodim(arg)  # type: ignore[assignment]
+    elif is_list_like(arg) and getattr(arg, "ndim", 1) == 1:
+        return _convert_listlike(arg, unit=unit, errors=errors)
+    elif getattr(arg, "ndim", 1) > 1:
+        raise TypeError(
+            "arg must be a string, timedelta, list, tuple, 1-d array, or Series"
+        )
+
+    if isinstance(arg, str) and unit is not None:
+        raise ValueError("unit must not be specified if the input is/contains a str")
+
+    # ...so it must be a scalar value. Return scalar.
+    return _coerce_scalar_to_timedelta_type(arg, unit=unit, errors=errors)
+
+
+def _coerce_scalar_to_timedelta_type(
+    r, unit: UnitChoices | None = "ns", errors: DateTimeErrorChoices = "raise"
+):
+    """Convert string 'r' to a timedelta object."""
+    result: Timedelta | NaTType
+
+    try:
+        result = Timedelta(r, unit)
+    except ValueError:
+        if errors == "raise":
+            raise
+        if errors == "ignore":
+            return r
+
+        # coerce
+        result = NaT
+
+    return result
+
+
+def _convert_listlike(
+    arg,
+    unit: UnitChoices | None = None,
+    errors: DateTimeErrorChoices = "raise",
+    name: Hashable | None = None,
+):
+    """Convert a list of objects to a timedelta index object."""
+    arg_dtype = getattr(arg, "dtype", None)
+    if isinstance(arg, (list, tuple)) or arg_dtype is None:
+        # This is needed only to ensure that in the case where we end up
+        #  returning arg (errors == "ignore"), and where the input is a
+        #  generator, we return a useful list-like instead of a
+        #  used-up generator
+        if not hasattr(arg, "__array__"):
+            arg = list(arg)
+        arg = np.array(arg, dtype=object)
+    elif isinstance(arg_dtype, ArrowDtype) and arg_dtype.kind == "m":
+        return arg
+
+    try:
+        td64arr = sequence_to_td64ns(arg, unit=unit, errors=errors, copy=False)[0]
+    except ValueError:
+        if errors == "ignore":
+            return arg
+        else:
+            # This else-block accounts for the cases when errors='raise'
+            # and errors='coerce'. If errors == 'raise', these errors
+            # should be raised. If errors == 'coerce', we shouldn't
+            # expect any errors to be raised, since all parsing errors
+            # cause coercion to pd.NaT. However, if an error / bug is
+            # introduced that causes an Exception to be raised, we would
+            # like to surface it.
+            raise
+
+    from pandas import TimedeltaIndex
+
+    value = TimedeltaIndex(td64arr, name=name)
+    return value

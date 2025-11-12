@@ -1,407 +1,266 @@
-"""
-Base class for the internal managers. Both BlockManager and ArrayManager
-inherit from this class.
-"""
 from __future__ import annotations
 
+import abc
 from typing import (
     TYPE_CHECKING,
-    Any,
+    Callable,
     Literal,
-    cast,
-    final,
 )
 
-import numpy as np
-
-from pandas._config import (
-    using_copy_on_write,
-    warn_copy_on_write,
-)
-
-from pandas._libs import (
-    algos as libalgos,
-    lib,
-)
-from pandas.errors import AbstractMethodError
-from pandas.util._validators import validate_bool_kwarg
-
-from pandas.core.dtypes.cast import (
-    find_common_type,
-    np_can_hold_element,
-)
-from pandas.core.dtypes.dtypes import (
-    ExtensionDtype,
-    SparseDtype,
-)
-
-from pandas.core.base import PandasObject
-from pandas.core.construction import extract_array
-from pandas.core.indexes.api import (
-    Index,
-    default_index,
-)
+from pandas._libs import lib
 
 if TYPE_CHECKING:
-    from pandas._typing import (
-        ArrayLike,
-        AxisInt,
-        DtypeObj,
-        Self,
-        Shape,
-    )
+    from collections.abc import Sequence
+    import re
+
+    from pandas._typing import Scalar
+
+    from pandas import Series
 
 
-class _AlreadyWarned:
-    def __init__(self):
-        # This class is used on the manager level to the block level to
-        # ensure that we warn only once. The block method can update the
-        # warned_already option without returning a value to keep the
-        # interface consistent. This is only a temporary solution for
-        # CoW warnings.
-        self.warned_already = False
-
-
-class DataManager(PandasObject):
-    # TODO share more methods/attributes
-
-    axes: list[Index]
-
-    @property
-    def items(self) -> Index:
-        raise AbstractMethodError(self)
-
-    @final
-    def __len__(self) -> int:
-        return len(self.items)
-
-    @property
-    def ndim(self) -> int:
-        return len(self.axes)
-
-    @property
-    def shape(self) -> Shape:
-        return tuple(len(ax) for ax in self.axes)
-
-    @final
-    def _validate_set_axis(self, axis: AxisInt, new_labels: Index) -> None:
-        # Caller is responsible for ensuring we have an Index object.
-        old_len = len(self.axes[axis])
-        new_len = len(new_labels)
-
-        if axis == 1 and len(self.items) == 0:
-            # If we are setting the index on a DataFrame with no columns,
-            #  it is OK to change the length.
-            pass
-
-        elif new_len != old_len:
-            raise ValueError(
-                f"Length mismatch: Expected axis has {old_len} elements, new "
-                f"values have {new_len} elements"
-            )
-
-    def reindex_indexer(
-        self,
-        new_axis,
-        indexer,
-        axis: AxisInt,
-        fill_value=None,
-        allow_dups: bool = False,
-        copy: bool = True,
-        only_slice: bool = False,
-    ) -> Self:
-        raise AbstractMethodError(self)
-
-    @final
-    def reindex_axis(
-        self,
-        new_index: Index,
-        axis: AxisInt,
-        fill_value=None,
-        only_slice: bool = False,
-    ) -> Self:
-        """
-        Conform data manager to new index.
-        """
-        new_index, indexer = self.axes[axis].reindex(new_index)
-
-        return self.reindex_indexer(
-            new_index,
-            indexer,
-            axis=axis,
-            fill_value=fill_value,
-            copy=False,
-            only_slice=only_slice,
-        )
-
-    def _equal_values(self, other: Self) -> bool:
-        """
-        To be implemented by the subclasses. Only check the column values
-        assuming shape and indexes have already been checked.
-        """
-        raise AbstractMethodError(self)
-
-    @final
-    def equals(self, other: object) -> bool:
-        """
-        Implementation for DataFrame.equals
-        """
-        if not isinstance(other, type(self)):
-            return False
-
-        self_axes, other_axes = self.axes, other.axes
-        if len(self_axes) != len(other_axes):
-            return False
-        if not all(ax1.equals(ax2) for ax1, ax2 in zip(self_axes, other_axes)):
-            return False
-
-        return self._equal_values(other)
-
-    def apply(
-        self,
-        f,
-        align_keys: list[str] | None = None,
-        **kwargs,
-    ) -> Self:
-        raise AbstractMethodError(self)
-
-    def apply_with_block(
-        self,
-        f,
-        align_keys: list[str] | None = None,
-        **kwargs,
-    ) -> Self:
-        raise AbstractMethodError(self)
-
-    @final
-    def isna(self, func) -> Self:
-        return self.apply("apply", func=func)
-
-    @final
-    def fillna(self, value, limit: int | None, inplace: bool, downcast) -> Self:
-        if limit is not None:
-            # Do this validation even if we go through one of the no-op paths
-            limit = libalgos.validate_limit(None, limit=limit)
-
-        return self.apply_with_block(
-            "fillna",
-            value=value,
-            limit=limit,
-            inplace=inplace,
-            downcast=downcast,
-            using_cow=using_copy_on_write(),
-            already_warned=_AlreadyWarned(),
-        )
-
-    @final
-    def where(self, other, cond, align: bool) -> Self:
-        if align:
-            align_keys = ["other", "cond"]
-        else:
-            align_keys = ["cond"]
-            other = extract_array(other, extract_numpy=True)
-
-        return self.apply_with_block(
-            "where",
-            align_keys=align_keys,
-            other=other,
-            cond=cond,
-            using_cow=using_copy_on_write(),
-        )
-
-    @final
-    def putmask(self, mask, new, align: bool = True, warn: bool = True) -> Self:
-        if align:
-            align_keys = ["new", "mask"]
-        else:
-            align_keys = ["mask"]
-            new = extract_array(new, extract_numpy=True)
-
-        already_warned = None
-        if warn_copy_on_write():
-            already_warned = _AlreadyWarned()
-            if not warn:
-                already_warned.warned_already = True
-
-        return self.apply_with_block(
-            "putmask",
-            align_keys=align_keys,
-            mask=mask,
-            new=new,
-            using_cow=using_copy_on_write(),
-            already_warned=already_warned,
-        )
-
-    @final
-    def round(self, decimals: int, using_cow: bool = False) -> Self:
-        return self.apply_with_block(
-            "round",
-            decimals=decimals,
-            using_cow=using_cow,
-        )
-
-    @final
-    def replace(self, to_replace, value, inplace: bool) -> Self:
-        inplace = validate_bool_kwarg(inplace, "inplace")
-        # NDFrame.replace ensures the not-is_list_likes here
-        assert not lib.is_list_like(to_replace)
-        assert not lib.is_list_like(value)
-        return self.apply_with_block(
-            "replace",
-            to_replace=to_replace,
-            value=value,
-            inplace=inplace,
-            using_cow=using_copy_on_write(),
-            already_warned=_AlreadyWarned(),
-        )
-
-    @final
-    def replace_regex(self, **kwargs) -> Self:
-        return self.apply_with_block(
-            "_replace_regex",
-            **kwargs,
-            using_cow=using_copy_on_write(),
-            already_warned=_AlreadyWarned(),
-        )
-
-    @final
-    def replace_list(
-        self,
-        src_list: list[Any],
-        dest_list: list[Any],
-        inplace: bool = False,
-        regex: bool = False,
-    ) -> Self:
-        """do a list replace"""
-        inplace = validate_bool_kwarg(inplace, "inplace")
-
-        bm = self.apply_with_block(
-            "replace_list",
-            src_list=src_list,
-            dest_list=dest_list,
-            inplace=inplace,
-            regex=regex,
-            using_cow=using_copy_on_write(),
-            already_warned=_AlreadyWarned(),
-        )
-        bm._consolidate_inplace()
-        return bm
-
-    def interpolate(self, inplace: bool, **kwargs) -> Self:
-        return self.apply_with_block(
-            "interpolate",
-            inplace=inplace,
-            **kwargs,
-            using_cow=using_copy_on_write(),
-            already_warned=_AlreadyWarned(),
-        )
-
-    def pad_or_backfill(self, inplace: bool, **kwargs) -> Self:
-        return self.apply_with_block(
-            "pad_or_backfill",
-            inplace=inplace,
-            **kwargs,
-            using_cow=using_copy_on_write(),
-            already_warned=_AlreadyWarned(),
-        )
-
-    def shift(self, periods: int, fill_value) -> Self:
-        if fill_value is lib.no_default:
-            fill_value = None
-
-        return self.apply_with_block("shift", periods=periods, fill_value=fill_value)
-
-    # --------------------------------------------------------------------
-    # Consolidation: No-ops for all but BlockManager
-
-    def is_consolidated(self) -> bool:
-        return True
-
-    def consolidate(self) -> Self:
-        return self
-
-    def _consolidate_inplace(self) -> None:
-        return
-
-
-class SingleDataManager(DataManager):
-    @property
-    def ndim(self) -> Literal[1]:
-        return 1
-
-    @final
-    @property
-    def array(self) -> ArrayLike:
-        """
-        Quick access to the backing array of the Block or SingleArrayManager.
-        """
-        # error: "SingleDataManager" has no attribute "arrays"; maybe "array"
-        return self.arrays[0]  # type: ignore[attr-defined]
-
-    def setitem_inplace(self, indexer, value, warn: bool = True) -> None:
-        """
-        Set values with indexer.
-
-        For Single[Block/Array]Manager, this backs s[indexer] = value
-
-        This is an inplace version of `setitem()`, mutating the manager/values
-        in place, not returning a new Manager (and Block), and thus never changing
-        the dtype.
-        """
-        arr = self.array
-
-        # EAs will do this validation in their own __setitem__ methods.
-        if isinstance(arr, np.ndarray):
-            # Note: checking for ndarray instead of np.dtype means we exclude
-            #  dt64/td64, which do their own validation.
-            value = np_can_hold_element(arr.dtype, value)
-
-        if isinstance(value, np.ndarray) and value.ndim == 1 and len(value) == 1:
-            # NumPy 1.25 deprecation: https://github.com/numpy/numpy/pull/10615
-            value = value[0, ...]
-
-        arr[indexer] = value
-
-    def grouped_reduce(self, func):
-        arr = self.array
-        res = func(arr)
-        index = default_index(len(res))
-
-        mgr = type(self).from_array(res, index)
-        return mgr
-
-    @classmethod
-    def from_array(cls, arr: ArrayLike, index: Index):
-        raise AbstractMethodError(cls)
-
-
-def interleaved_dtype(dtypes: list[DtypeObj]) -> DtypeObj | None:
+class BaseStringArrayMethods(abc.ABC):
     """
-    Find the common dtype for `blocks`.
+    Base class for extension arrays implementing string methods.
 
-    Parameters
-    ----------
-    blocks : List[DtypeObj]
+    This is where our ExtensionArrays can override the implementation of
+    Series.str.<method>. We don't expect this to work with
+    3rd-party extension arrays.
 
-    Returns
-    -------
-    dtype : np.dtype, ExtensionDtype, or None
-        None is returned when `blocks` is empty.
+    * User calls Series.str.<method>
+    * pandas extracts the extension array from the Series
+    * pandas calls ``extension_array._str_<method>(*args, **kwargs)``
+    * pandas wraps the result, to return to the user.
+
+    See :ref:`Series.str` for the docstring of each method.
     """
-    if not len(dtypes):
-        return None
 
-    return find_common_type(dtypes)
+    def _str_getitem(self, key):
+        if isinstance(key, slice):
+            return self._str_slice(start=key.start, stop=key.stop, step=key.step)
+        else:
+            return self._str_get(key)
 
+    @abc.abstractmethod
+    def _str_count(self, pat, flags: int = 0):
+        pass
 
-def ensure_np_dtype(dtype: DtypeObj) -> np.dtype:
-    # TODO: https://github.com/pandas-dev/pandas/issues/22791
-    # Give EAs some input on what happens here. Sparse needs this.
-    if isinstance(dtype, SparseDtype):
-        dtype = dtype.subtype
-        dtype = cast(np.dtype, dtype)
-    elif isinstance(dtype, ExtensionDtype):
-        dtype = np.dtype("object")
-    elif dtype == np.dtype(str):
-        dtype = np.dtype("object")
-    return dtype
+    @abc.abstractmethod
+    def _str_pad(
+        self,
+        width: int,
+        side: Literal["left", "right", "both"] = "left",
+        fillchar: str = " ",
+    ):
+        pass
+
+    @abc.abstractmethod
+    def _str_contains(
+        self, pat, case: bool = True, flags: int = 0, na=None, regex: bool = True
+    ):
+        pass
+
+    @abc.abstractmethod
+    def _str_startswith(self, pat, na=None):
+        pass
+
+    @abc.abstractmethod
+    def _str_endswith(self, pat, na=None):
+        pass
+
+    @abc.abstractmethod
+    def _str_replace(
+        self,
+        pat: str | re.Pattern,
+        repl: str | Callable,
+        n: int = -1,
+        case: bool = True,
+        flags: int = 0,
+        regex: bool = True,
+    ):
+        pass
+
+    @abc.abstractmethod
+    def _str_repeat(self, repeats: int | Sequence[int]):
+        pass
+
+    @abc.abstractmethod
+    def _str_match(
+        self,
+        pat: str,
+        case: bool = True,
+        flags: int = 0,
+        na: Scalar | lib.NoDefault = lib.no_default,
+    ):
+        pass
+
+    @abc.abstractmethod
+    def _str_fullmatch(
+        self,
+        pat: str | re.Pattern,
+        case: bool = True,
+        flags: int = 0,
+        na: Scalar | lib.NoDefault = lib.no_default,
+    ):
+        pass
+
+    @abc.abstractmethod
+    def _str_encode(self, encoding, errors: str = "strict"):
+        pass
+
+    @abc.abstractmethod
+    def _str_find(self, sub, start: int = 0, end=None):
+        pass
+
+    @abc.abstractmethod
+    def _str_rfind(self, sub, start: int = 0, end=None):
+        pass
+
+    @abc.abstractmethod
+    def _str_findall(self, pat, flags: int = 0):
+        pass
+
+    @abc.abstractmethod
+    def _str_get(self, i):
+        pass
+
+    @abc.abstractmethod
+    def _str_index(self, sub, start: int = 0, end=None):
+        pass
+
+    @abc.abstractmethod
+    def _str_rindex(self, sub, start: int = 0, end=None):
+        pass
+
+    @abc.abstractmethod
+    def _str_join(self, sep: str):
+        pass
+
+    @abc.abstractmethod
+    def _str_partition(self, sep: str, expand):
+        pass
+
+    @abc.abstractmethod
+    def _str_rpartition(self, sep: str, expand):
+        pass
+
+    @abc.abstractmethod
+    def _str_len(self):
+        pass
+
+    @abc.abstractmethod
+    def _str_slice(self, start=None, stop=None, step=None):
+        pass
+
+    @abc.abstractmethod
+    def _str_slice_replace(self, start=None, stop=None, repl=None):
+        pass
+
+    @abc.abstractmethod
+    def _str_translate(self, table):
+        pass
+
+    @abc.abstractmethod
+    def _str_wrap(self, width: int, **kwargs):
+        pass
+
+    @abc.abstractmethod
+    def _str_get_dummies(self, sep: str = "|"):
+        pass
+
+    @abc.abstractmethod
+    def _str_isalnum(self):
+        pass
+
+    @abc.abstractmethod
+    def _str_isalpha(self):
+        pass
+
+    @abc.abstractmethod
+    def _str_isdecimal(self):
+        pass
+
+    @abc.abstractmethod
+    def _str_isdigit(self):
+        pass
+
+    @abc.abstractmethod
+    def _str_islower(self):
+        pass
+
+    @abc.abstractmethod
+    def _str_isnumeric(self):
+        pass
+
+    @abc.abstractmethod
+    def _str_isspace(self):
+        pass
+
+    @abc.abstractmethod
+    def _str_istitle(self):
+        pass
+
+    @abc.abstractmethod
+    def _str_isupper(self):
+        pass
+
+    @abc.abstractmethod
+    def _str_capitalize(self):
+        pass
+
+    @abc.abstractmethod
+    def _str_casefold(self):
+        pass
+
+    @abc.abstractmethod
+    def _str_title(self):
+        pass
+
+    @abc.abstractmethod
+    def _str_swapcase(self):
+        pass
+
+    @abc.abstractmethod
+    def _str_lower(self):
+        pass
+
+    @abc.abstractmethod
+    def _str_upper(self):
+        pass
+
+    @abc.abstractmethod
+    def _str_normalize(self, form):
+        pass
+
+    @abc.abstractmethod
+    def _str_strip(self, to_strip=None):
+        pass
+
+    @abc.abstractmethod
+    def _str_lstrip(self, to_strip=None):
+        pass
+
+    @abc.abstractmethod
+    def _str_rstrip(self, to_strip=None):
+        pass
+
+    @abc.abstractmethod
+    def _str_removeprefix(self, prefix: str) -> Series:
+        pass
+
+    @abc.abstractmethod
+    def _str_removesuffix(self, suffix: str) -> Series:
+        pass
+
+    @abc.abstractmethod
+    def _str_split(
+        self, pat=None, n=-1, expand: bool = False, regex: bool | None = None
+    ):
+        pass
+
+    @abc.abstractmethod
+    def _str_rsplit(self, pat=None, n=-1):
+        pass
+
+    @abc.abstractmethod
+    def _str_extract(self, pat: str, flags: int = 0, expand: bool = True):
+        pass

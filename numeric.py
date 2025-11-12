@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import numbers
 from typing import (
     TYPE_CHECKING,
-    Any,
-    Callable,
+    Literal,
 )
+import warnings
 
 import numpy as np
 
@@ -13,274 +12,321 @@ from pandas._libs import (
     lib,
     missing as libmissing,
 )
-from pandas.errors import AbstractMethodError
-from pandas.util._decorators import cache_readonly
+from pandas.util._exceptions import find_stack_level
+from pandas.util._validators import check_dtype_backend
 
+from pandas.core.dtypes.cast import maybe_downcast_numeric
 from pandas.core.dtypes.common import (
+    ensure_object,
+    is_bool_dtype,
+    is_decimal,
     is_integer_dtype,
+    is_number,
+    is_numeric_dtype,
+    is_scalar,
     is_string_dtype,
-    pandas_dtype,
+    needs_i8_conversion,
+)
+from pandas.core.dtypes.dtypes import ArrowDtype
+from pandas.core.dtypes.generic import (
+    ABCIndex,
+    ABCSeries,
 )
 
-from pandas.core.arrays.masked import (
-    BaseMaskedArray,
-    BaseMaskedDtype,
-)
+from pandas.core.arrays import BaseMaskedArray
+from pandas.core.arrays.string_ import StringDtype
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
-
-    import pyarrow
-
     from pandas._typing import (
-        Dtype,
-        DtypeObj,
-        Self,
+        DateTimeErrorChoices,
+        DtypeBackend,
         npt,
     )
 
 
-class NumericDtype(BaseMaskedDtype):
-    _default_np_dtype: np.dtype
-    _checker: Callable[[Any], bool]  # is_foo_dtype
-
-    def __repr__(self) -> str:
-        return f"{self.name}Dtype()"
-
-    @cache_readonly
-    def is_signed_integer(self) -> bool:
-        return self.kind == "i"
-
-    @cache_readonly
-    def is_unsigned_integer(self) -> bool:
-        return self.kind == "u"
-
-    @property
-    def _is_numeric(self) -> bool:
-        return True
-
-    def __from_arrow__(
-        self, array: pyarrow.Array | pyarrow.ChunkedArray
-    ) -> BaseMaskedArray:
-        """
-        Construct IntegerArray/FloatingArray from pyarrow Array/ChunkedArray.
-        """
-        import pyarrow
-
-        from pandas.core.arrays.arrow._arrow_utils import (
-            pyarrow_array_to_numpy_and_mask,
-        )
-
-        array_class = self.construct_array_type()
-
-        pyarrow_type = pyarrow.from_numpy_dtype(self.type)
-        if not array.type.equals(pyarrow_type) and not pyarrow.types.is_null(
-            array.type
-        ):
-            # test_from_arrow_type_error raise for string, but allow
-            #  through itemsize conversion GH#31896
-            rt_dtype = pandas_dtype(array.type.to_pandas_dtype())
-            if rt_dtype.kind not in "iuf":
-                # Could allow "c" or potentially disallow float<->int conversion,
-                #  but at the moment we specifically test that uint<->int works
-                raise TypeError(
-                    f"Expected array of {self} type, got {array.type} instead"
-                )
-
-            array = array.cast(pyarrow_type)
-
-        if isinstance(array, pyarrow.ChunkedArray):
-            # TODO this "if" can be removed when requiring pyarrow >= 10.0, which fixed
-            # combine_chunks for empty arrays https://github.com/apache/arrow/pull/13757
-            if array.num_chunks == 0:
-                array = pyarrow.array([], type=array.type)
-            else:
-                array = array.combine_chunks()
-
-        data, mask = pyarrow_array_to_numpy_and_mask(array, dtype=self.numpy_dtype)
-        return array_class(data.copy(), ~mask, copy=False)
-
-    @classmethod
-    def _get_dtype_mapping(cls) -> Mapping[np.dtype, NumericDtype]:
-        raise AbstractMethodError(cls)
-
-    @classmethod
-    def _standardize_dtype(cls, dtype: NumericDtype | str | np.dtype) -> NumericDtype:
-        """
-        Convert a string representation or a numpy dtype to NumericDtype.
-        """
-        if isinstance(dtype, str) and (dtype.startswith(("Int", "UInt", "Float"))):
-            # Avoid DeprecationWarning from NumPy about np.dtype("Int64")
-            # https://github.com/numpy/numpy/pull/7476
-            dtype = dtype.lower()
-
-        if not isinstance(dtype, NumericDtype):
-            mapping = cls._get_dtype_mapping()
-            try:
-                dtype = mapping[np.dtype(dtype)]
-            except KeyError as err:
-                raise ValueError(f"invalid dtype specified {dtype}") from err
-        return dtype
-
-    @classmethod
-    def _safe_cast(cls, values: np.ndarray, dtype: np.dtype, copy: bool) -> np.ndarray:
-        """
-        Safely cast the values to the given dtype.
-
-        "safe" in this context means the casting is lossless.
-        """
-        raise AbstractMethodError(cls)
-
-
-def _coerce_to_data_and_mask(
-    values, dtype, copy: bool, dtype_cls: type[NumericDtype], default_dtype: np.dtype
+def to_numeric(
+    arg,
+    errors: DateTimeErrorChoices = "raise",
+    downcast: Literal["integer", "signed", "unsigned", "float"] | None = None,
+    dtype_backend: DtypeBackend | lib.NoDefault = lib.no_default,
 ):
-    checker = dtype_cls._checker
-
-    mask = None
-    inferred_type = None
-
-    if dtype is None and hasattr(values, "dtype"):
-        if checker(values.dtype):
-            dtype = values.dtype
-
-    if dtype is not None:
-        dtype = dtype_cls._standardize_dtype(dtype)
-
-    cls = dtype_cls.construct_array_type()
-    if isinstance(values, cls):
-        values, mask = values._data, values._mask
-        if dtype is not None:
-            values = values.astype(dtype.numpy_dtype, copy=False)
-
-        if copy:
-            values = values.copy()
-            mask = mask.copy()
-        return values, mask, dtype, inferred_type
-
-    original = values
-    if not copy:
-        values = np.asarray(values)
-    else:
-        values = np.array(values, copy=copy)
-    inferred_type = None
-    if values.dtype == object or is_string_dtype(values.dtype):
-        inferred_type = lib.infer_dtype(values, skipna=True)
-        if inferred_type == "boolean" and dtype is None:
-            name = dtype_cls.__name__.strip("_")
-            raise TypeError(f"{values.dtype} cannot be converted to {name}")
-
-    elif values.dtype.kind == "b" and checker(dtype):
-        if not copy:
-            values = np.asarray(values, dtype=default_dtype)
-        else:
-            values = np.array(values, dtype=default_dtype, copy=copy)
-
-    elif values.dtype.kind not in "iuf":
-        name = dtype_cls.__name__.strip("_")
-        raise TypeError(f"{values.dtype} cannot be converted to {name}")
-
-    if values.ndim != 1:
-        raise TypeError("values must be a 1D list-like")
-
-    if mask is None:
-        if values.dtype.kind in "iu":
-            # fastpath
-            mask = np.zeros(len(values), dtype=np.bool_)
-        else:
-            mask = libmissing.is_numeric_na(values)
-    else:
-        assert len(mask) == len(values)
-
-    if mask.ndim != 1:
-        raise TypeError("mask must be a 1D list-like")
-
-    # infer dtype if needed
-    if dtype is None:
-        dtype = default_dtype
-    else:
-        dtype = dtype.numpy_dtype
-
-    if is_integer_dtype(dtype) and values.dtype.kind == "f" and len(values) > 0:
-        if mask.all():
-            values = np.ones(values.shape, dtype=dtype)
-        else:
-            idx = np.nanargmax(values)
-            if int(values[idx]) != original[idx]:
-                # We have ints that lost precision during the cast.
-                inferred_type = lib.infer_dtype(original, skipna=True)
-                if (
-                    inferred_type not in ["floating", "mixed-integer-float"]
-                    and not mask.any()
-                ):
-                    values = np.asarray(original, dtype=dtype)
-                else:
-                    values = np.asarray(original, dtype="object")
-
-    # we copy as need to coerce here
-    if mask.any():
-        values = values.copy()
-        values[mask] = cls._internal_fill_value
-    if inferred_type in ("string", "unicode"):
-        # casts from str are always safe since they raise
-        # a ValueError if the str cannot be parsed into a float
-        values = values.astype(dtype, copy=copy)
-    else:
-        values = dtype_cls._safe_cast(values, dtype, copy=False)
-
-    return values, mask, dtype, inferred_type
-
-
-class NumericArray(BaseMaskedArray):
     """
-    Base class for IntegerArray and FloatingArray.
+    Convert argument to a numeric type.
+
+    The default return dtype is `float64` or `int64`
+    depending on the data supplied. Use the `downcast` parameter
+    to obtain other dtypes.
+
+    Please note that precision loss may occur if really large numbers
+    are passed in. Due to the internal limitations of `ndarray`, if
+    numbers smaller than `-9223372036854775808` (np.iinfo(np.int64).min)
+    or larger than `18446744073709551615` (np.iinfo(np.uint64).max) are
+    passed in, it is very likely they will be converted to float so that
+    they can be stored in an `ndarray`. These warnings apply similarly to
+    `Series` since it internally leverages `ndarray`.
+
+    Parameters
+    ----------
+    arg : scalar, list, tuple, 1-d array, or Series
+        Argument to be converted.
+    errors : {'ignore', 'raise', 'coerce'}, default 'raise'
+        - If 'raise', then invalid parsing will raise an exception.
+        - If 'coerce', then invalid parsing will be set as NaN.
+        - If 'ignore', then invalid parsing will return the input.
+
+        .. versionchanged:: 2.2
+
+        "ignore" is deprecated. Catch exceptions explicitly instead.
+
+    downcast : str, default None
+        Can be 'integer', 'signed', 'unsigned', or 'float'.
+        If not None, and if the data has been successfully cast to a
+        numerical dtype (or if the data was numeric to begin with),
+        downcast that resulting data to the smallest numerical dtype
+        possible according to the following rules:
+
+        - 'integer' or 'signed': smallest signed int dtype (min.: np.int8)
+        - 'unsigned': smallest unsigned int dtype (min.: np.uint8)
+        - 'float': smallest float dtype (min.: np.float32)
+
+        As this behaviour is separate from the core conversion to
+        numeric values, any errors raised during the downcasting
+        will be surfaced regardless of the value of the 'errors' input.
+
+        In addition, downcasting will only occur if the size
+        of the resulting data's dtype is strictly larger than
+        the dtype it is to be cast to, so if none of the dtypes
+        checked satisfy that specification, no downcasting will be
+        performed on the data.
+    dtype_backend : {'numpy_nullable', 'pyarrow'}, default 'numpy_nullable'
+        Back-end data type applied to the resultant :class:`DataFrame`
+        (still experimental). Behaviour is as follows:
+
+        * ``"numpy_nullable"``: returns nullable-dtype-backed :class:`DataFrame`
+          (default).
+        * ``"pyarrow"``: returns pyarrow-backed nullable :class:`ArrowDtype`
+          DataFrame.
+
+        .. versionadded:: 2.0
+
+    Returns
+    -------
+    ret
+        Numeric if parsing succeeded.
+        Return type depends on input.  Series if Series, otherwise ndarray.
+
+    See Also
+    --------
+    DataFrame.astype : Cast argument to a specified dtype.
+    to_datetime : Convert argument to datetime.
+    to_timedelta : Convert argument to timedelta.
+    numpy.ndarray.astype : Cast a numpy array to a specified type.
+    DataFrame.convert_dtypes : Convert dtypes.
+
+    Examples
+    --------
+    Take separate series and convert to numeric, coercing when told to
+
+    >>> s = pd.Series(['1.0', '2', -3])
+    >>> pd.to_numeric(s)
+    0    1.0
+    1    2.0
+    2   -3.0
+    dtype: float64
+    >>> pd.to_numeric(s, downcast='float')
+    0    1.0
+    1    2.0
+    2   -3.0
+    dtype: float32
+    >>> pd.to_numeric(s, downcast='signed')
+    0    1
+    1    2
+    2   -3
+    dtype: int8
+    >>> s = pd.Series(['apple', '1.0', '2', -3])
+    >>> pd.to_numeric(s, errors='coerce')
+    0    NaN
+    1    1.0
+    2    2.0
+    3   -3.0
+    dtype: float64
+
+    Downcasting of nullable integer and floating dtypes is supported:
+
+    >>> s = pd.Series([1, 2, 3], dtype="Int64")
+    >>> pd.to_numeric(s, downcast="integer")
+    0    1
+    1    2
+    2    3
+    dtype: Int8
+    >>> s = pd.Series([1.0, 2.1, 3.0], dtype="Float64")
+    >>> pd.to_numeric(s, downcast="float")
+    0    1.0
+    1    2.1
+    2    3.0
+    dtype: Float32
     """
+    if downcast not in (None, "integer", "signed", "unsigned", "float"):
+        raise ValueError("invalid downcasting method provided")
 
-    _dtype_cls: type[NumericDtype]
-
-    def __init__(
-        self, values: np.ndarray, mask: npt.NDArray[np.bool_], copy: bool = False
-    ) -> None:
-        checker = self._dtype_cls._checker
-        if not (isinstance(values, np.ndarray) and checker(values.dtype)):
-            descr = (
-                "floating"
-                if self._dtype_cls.kind == "f"  # type: ignore[comparison-overlap]
-                else "integer"
-            )
-            raise TypeError(
-                f"values should be {descr} numpy array. Use "
-                "the 'pd.array' function instead"
-            )
-        if values.dtype == np.float16:
-            # If we don't raise here, then accessing self.dtype would raise
-            raise TypeError("FloatingArray does not support np.float16 dtype.")
-
-        super().__init__(values, mask, copy=copy)
-
-    @cache_readonly
-    def dtype(self) -> NumericDtype:
-        mapping = self._dtype_cls._get_dtype_mapping()
-        return mapping[self._data.dtype]
-
-    @classmethod
-    def _coerce_to_array(
-        cls, value, *, dtype: DtypeObj, copy: bool = False
-    ) -> tuple[np.ndarray, np.ndarray]:
-        dtype_cls = cls._dtype_cls
-        default_dtype = dtype_cls._default_np_dtype
-        values, mask, _, _ = _coerce_to_data_and_mask(
-            value, dtype, copy, dtype_cls, default_dtype
+    if errors not in ("ignore", "raise", "coerce"):
+        raise ValueError("invalid error value specified")
+    if errors == "ignore":
+        # GH#54467
+        warnings.warn(
+            "errors='ignore' is deprecated and will raise in a future version. "
+            "Use to_numeric without passing `errors` and catch exceptions "
+            "explicitly instead",
+            FutureWarning,
+            stacklevel=find_stack_level(),
         )
-        return values, mask
 
-    @classmethod
-    def _from_sequence_of_strings(
-        cls, strings, *, dtype: Dtype | None = None, copy: bool = False
-    ) -> Self:
-        from pandas.core.tools.numeric import to_numeric
+    check_dtype_backend(dtype_backend)
 
-        scalars = to_numeric(strings, errors="raise", dtype_backend="numpy_nullable")
-        return cls._from_sequence(scalars, dtype=dtype, copy=copy)
+    is_series = False
+    is_index = False
+    is_scalars = False
 
-    _HANDLED_TYPES = (np.ndarray, numbers.Number)
+    if isinstance(arg, ABCSeries):
+        is_series = True
+        values = arg.values
+    elif isinstance(arg, ABCIndex):
+        is_index = True
+        if needs_i8_conversion(arg.dtype):
+            values = arg.view("i8")
+        else:
+            values = arg.values
+    elif isinstance(arg, (list, tuple)):
+        values = np.array(arg, dtype="O")
+    elif is_scalar(arg):
+        if is_decimal(arg):
+            return float(arg)
+        if is_number(arg):
+            return arg
+        is_scalars = True
+        values = np.array([arg], dtype="O")
+    elif getattr(arg, "ndim", 1) > 1:
+        raise TypeError("arg must be a list, tuple, 1-d array, or Series")
+    else:
+        values = arg
+
+    orig_values = values
+
+    # GH33013: for IntegerArray & FloatingArray extract non-null values for casting
+    # save mask to reconstruct the full array after casting
+    mask: npt.NDArray[np.bool_] | None = None
+    if isinstance(values, BaseMaskedArray):
+        mask = values._mask
+        values = values._data[~mask]
+
+    values_dtype = getattr(values, "dtype", None)
+    if isinstance(values_dtype, ArrowDtype):
+        mask = values.isna()
+        values = values.dropna().to_numpy()
+    new_mask: np.ndarray | None = None
+    if is_numeric_dtype(values_dtype):
+        pass
+    elif lib.is_np_dtype(values_dtype, "mM"):
+        values = values.view(np.int64)
+    else:
+        values = ensure_object(values)
+        coerce_numeric = errors not in ("ignore", "raise")
+        try:
+            values, new_mask = lib.maybe_convert_numeric(  # type: ignore[call-overload]
+                values,
+                set(),
+                coerce_numeric=coerce_numeric,
+                convert_to_masked_nullable=dtype_backend is not lib.no_default
+                or isinstance(values_dtype, StringDtype)
+                and values_dtype.na_value is libmissing.NA,
+            )
+        except (ValueError, TypeError):
+            if errors == "raise":
+                raise
+            values = orig_values
+
+    if new_mask is not None:
+        # Remove unnecessary values, is expected later anyway and enables
+        # downcasting
+        values = values[~new_mask]
+    elif (
+        dtype_backend is not lib.no_default
+        and new_mask is None
+        or isinstance(values_dtype, StringDtype)
+        and values_dtype.na_value is libmissing.NA
+    ):
+        new_mask = np.zeros(values.shape, dtype=np.bool_)
+
+    # attempt downcast only if the data has been successfully converted
+    # to a numerical dtype and if a downcast method has been specified
+    if downcast is not None and is_numeric_dtype(values.dtype):
+        typecodes: str | None = None
+
+        if downcast in ("integer", "signed"):
+            typecodes = np.typecodes["Integer"]
+        elif downcast == "unsigned" and (not len(values) or np.min(values) >= 0):
+            typecodes = np.typecodes["UnsignedInteger"]
+        elif downcast == "float":
+            typecodes = np.typecodes["Float"]
+
+            # pandas support goes only to np.float32,
+            # as float dtypes smaller than that are
+            # extremely rare and not well supported
+            float_32_char = np.dtype(np.float32).char
+            float_32_ind = typecodes.index(float_32_char)
+            typecodes = typecodes[float_32_ind:]
+
+        if typecodes is not None:
+            # from smallest to largest
+            for typecode in typecodes:
+                dtype = np.dtype(typecode)
+                if dtype.itemsize <= values.dtype.itemsize:
+                    values = maybe_downcast_numeric(values, dtype)
+
+                    # successful conversion
+                    if values.dtype == dtype:
+                        break
+
+    # GH33013: for IntegerArray, BooleanArray & FloatingArray need to reconstruct
+    # masked array
+    if (mask is not None or new_mask is not None) and not is_string_dtype(values.dtype):
+        if mask is None or (new_mask is not None and new_mask.shape == mask.shape):
+            # GH 52588
+            mask = new_mask
+        else:
+            mask = mask.copy()
+        assert isinstance(mask, np.ndarray)
+        data = np.zeros(mask.shape, dtype=values.dtype)
+        data[~mask] = values
+
+        from pandas.core.arrays import (
+            ArrowExtensionArray,
+            BooleanArray,
+            FloatingArray,
+            IntegerArray,
+        )
+
+        klass: type[IntegerArray | BooleanArray | FloatingArray]
+        if is_integer_dtype(data.dtype):
+            klass = IntegerArray
+        elif is_bool_dtype(data.dtype):
+            klass = BooleanArray
+        else:
+            klass = FloatingArray
+        values = klass(data, mask)
+
+        if dtype_backend == "pyarrow" or isinstance(values_dtype, ArrowDtype):
+            values = ArrowExtensionArray(values.__arrow_array__())
+
+    if is_series:
+        return arg._constructor(values, index=arg.index, name=arg.name)
+    elif is_index:
+        # because we want to coerce to numeric if possible,
+        # do not use _shallow_copy
+        from pandas import Index
+
+        return Index(values, name=arg.name)
+    elif is_scalars:
+        return values[0]
+    else:
+        return values
