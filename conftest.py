@@ -1,10 +1,7 @@
-import pytest
+# Do not collect any tests in externals. This is more robust than using
+# --ignore because --ignore needs a path and it is not convenient to pass in
+# the externals path (very long install-dependent path in site-packages) when
+# using --pyargs
+def pytest_ignore_collect(path, config):
+    return True
 
-import sklearn
-
-
-@pytest.fixture
-def print_changed_only_false():
-    sklearn.set_config(print_changed_only=False)
-    yield
-    sklearn.set_config(print_changed_only=True)  # reset to default
