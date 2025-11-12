@@ -1,7 +1,17 @@
-# Do not collect any tests in externals. This is more robust than using
-# --ignore because --ignore needs a path and it is not convenient to pass in
-# the externals path (very long install-dependent path in site-packages) when
-# using --pyargs
-def pytest_ignore_collect(path, config):
-    return True
+""" Network tests are only run, if data is already locally available,
+or if download is specifically requested by environment variable."""
+import builtins
+import pytest
 
+
+@pytest.fixture
+def hide_available_pandas(monkeypatch):
+    """Pretend pandas was not installed."""
+    import_orig = builtins.__import__
+
+    def mocked_import(name, *args, **kwargs):
+        if name == "pandas":
+            raise ImportError()
+        return import_orig(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", mocked_import)
