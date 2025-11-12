@@ -1,236 +1,180 @@
-==================================
-A guide to masked arrays in NumPy
-==================================
+================
+Vendoring Policy
+================
 
-.. Contents::
+* Vendored libraries **MUST** not be modified except as required to
+  successfully vendor them.
+* Vendored libraries **MUST** be released copies of libraries available on
+  PyPI.
+* Vendored libraries **MUST** be available under a license that allows
+  them to be integrated into ``pip``, which is released under the MIT license.
+* Vendored libraries **MUST** be accompanied with LICENSE files.
+* The versions of libraries vendored in pip **MUST** be reflected in
+  ``pip/_vendor/vendor.txt``.
+* Vendored libraries **MUST** function without any build steps such as ``2to3``
+  or compilation of C code, practically this limits to single source 2.x/3.x and
+  pure Python.
+* Any modifications made to libraries **MUST** be noted in
+  ``pip/_vendor/README.rst`` and their corresponding patches **MUST** be
+  included ``tools/vendoring/patches``.
+* Vendored libraries should have corresponding ``vendored()`` entries in
+  ``pip/_vendor/__init__.py``.
 
-See http://www.scipy.org/scipy/numpy/wiki/MaskedArray (dead link)
-for updates of this document.
+Rationale
+=========
 
+Historically pip has not had any dependencies except for ``setuptools`` itself,
+choosing instead to implement any functionality it needed to prevent needing
+a dependency. However, starting with pip 1.5, we began to replace code that was
+implemented inside of pip with reusable libraries from PyPI. This brought the
+typical benefits of reusing libraries instead of reinventing the wheel like
+higher quality and more battle tested code, centralization of bug fixes
+(particularly security sensitive ones), and better/more features for less work.
 
-History
--------
+However, there are several issues with having dependencies in the traditional
+way (via ``install_requires``) for pip. These issues are:
 
-As a regular user of MaskedArray, I (Pierre G.F. Gerard-Marchant) became
-increasingly frustrated with the subclassing of masked arrays (even if
-I can only blame my inexperience). I needed to develop a class of arrays
-that could store some additional information along with numerical values,
-while keeping the possibility for missing data (picture storing a series
-of dates along with measurements, what would later become the `TimeSeries
-Scikit <http://projects.scipy.org/scipy/scikits/wiki/TimeSeries>`__
-(dead link).
+**Fragility**
+   When pip depends on another library to function then if for whatever reason
+   that library either isn't installed or an incompatible version is installed
+   then pip ceases to function. This is of course true for all Python
+   applications, however for every application *except* for pip the way you fix
+   it is by re-running pip. Obviously, when pip can't run, you can't use pip to
+   fix pip, so you're left having to manually resolve dependencies and
+   installing them by hand.
 
-I started to implement such a class, but then quickly realized that
-any additional information disappeared when processing these subarrays
-(for example, adding a constant value to a subarray would erase its
-dates). I ended up writing the equivalent of *numpy.core.ma* for my
-particular class, ufuncs included. Everything went fine until I needed to
-subclass my new class, when more problems showed up: some attributes of
-the new subclass were lost during processing. I identified the culprit as
-MaskedArray, which returns masked ndarrays when I expected masked
-arrays of my class. I was preparing myself to rewrite *numpy.core.ma*
-when I forced myself to learn how to subclass ndarrays. As I became more
-familiar with the *__new__* and *__array_finalize__* methods,
-I started to wonder why masked arrays were objects, and not ndarrays,
-and whether it wouldn't be more convenient for subclassing if they did
-behave like regular ndarrays.
+**Making other libraries uninstallable**
+   One of pip's current dependencies is the ``requests`` library, for which pip
+   requires a fairly recent version to run.  If pip depended on ``requests`` in
+   the traditional manner, then we'd either have to maintain compatibility with
+   every ``requests`` version that has ever existed (and ever will), OR allow
+   pip to render certain versions of ``requests`` uninstallable. (The second
+   issue, although technically true for any Python application, is magnified by
+   pip's ubiquity; pip is installed by default in Python, in ``pyvenv``, and in
+   ``virtualenv``.)
 
-The new *maskedarray* is what I eventually come up with. The
-main differences with the initial *numpy.core.ma* package are
-that MaskedArray is now a subclass of *ndarray* and that the
-*_data* section can now be any subclass of *ndarray*. Apart from a
-couple of issues listed below, the behavior of the new MaskedArray
-class reproduces the old one. Initially the *maskedarray*
-implementation was marginally slower than *numpy.ma* in some areas,
-but work is underway to speed it up; the expectation is that it can be
-made substantially faster than the present *numpy.ma*.
+**Security**
+   This might seem puzzling at first glance, since vendoring has a tendency to
+   complicate updating dependencies for security updates, and that holds true
+   for pip. However, given the *other* reasons for avoiding dependencies, the
+   alternative is for pip to reinvent the wheel itself.  This is what pip did
+   historically. It forced pip to re-implement its own HTTPS verification
+   routines as a workaround for the Python standard library's lack of SSL
+   validation, which resulted in similar bugs in the validation routine in
+   ``requests`` and ``urllib3``, except that they had to be discovered and
+   fixed independently. Even though we're vendoring, reusing libraries keeps
+   pip more secure by relying on the great work of our dependencies, *and*
+   allowing for faster, easier security fixes by simply pulling in newer
+   versions of dependencies.
 
+**Bootstrapping**
+   Currently most popular methods of installing pip rely on pip's
+   self-contained nature to install pip itself. These tools work by bundling a
+   copy of pip, adding it to ``sys.path``, and then executing that copy of pip.
+   This is done instead of implementing a "mini installer" (to reduce
+   duplication); pip already knows how to install a Python package, and is far
+   more battle-tested than any "mini installer" could ever possibly be.
 
-Note that if the subclass has some special methods and
-attributes, they are not propagated to the masked version:
-this would require a modification of the *__getattribute__*
-method (first trying *ndarray.__getattribute__*, then trying
-*self._data.__getattribute__* if an exception is raised in the first
-place), which really slows things down.
+Many downstream redistributors have policies against this kind of bundling, and
+instead opt to patch the software they distribute to debundle it and make it
+rely on the global versions of the software that they already have packaged
+(which may have its own patches applied to it). We (the pip team) would prefer
+it if pip was *not* debundled in this manner due to the above reasons and
+instead we would prefer it if pip would be left intact as it is now.
 
-Main differences
-----------------
-
- * The *_data* part of the masked array can be any subclass of ndarray (but not recarray, cf below).
- * *fill_value* is now a property, not a function.
- * in the majority of cases, the mask is forced to *nomask* when no value is actually masked. A notable exception is when a masked array (with no masked values) has just been unpickled.
- * I got rid of the *share_mask* flag, I never understood its purpose.
- * *put*, *putmask* and *take* now mimic the ndarray methods, to avoid unpleasant surprises. Moreover, *put* and *putmask* both update the mask when needed.  * if *a* is a masked array, *bool(a)* raises a *ValueError*, as it does with ndarrays.
- * in the same way, the comparison of two masked arrays is a masked array, not a boolean
- * *filled(a)* returns an array of the same subclass as *a._data*, and no test is performed on whether it is contiguous or not.
- * the mask is always printed, even if it's *nomask*, which makes things easy (for me at least) to remember that a masked array is used.
- * *cumsum* works as if the *_data* array was filled with 0. The mask is preserved, but not updated.
- * *cumprod* works as if the *_data* array was filled with 1. The mask is preserved, but not updated.
-
-New features
-------------
-
-This list is non-exhaustive...
-
- * the *mr_* function mimics *r_* for masked arrays.
- * the *anom* method returns the anomalies (deviations from the average)
-
-Using the new package with numpy.core.ma
-----------------------------------------
-
-I tried to make sure that the new package can understand old masked
-arrays. Unfortunately, there's no upward compatibility.
-
-For example:
-
->>> import numpy.core.ma as old_ma
->>> import maskedarray as new_ma
->>> x = old_ma.array([1,2,3,4,5], mask=[0,0,1,0,0])
->>> x
-array(data =
- [     1      2 999999      4      5],
-      mask =
- [False False True False False],
-      fill_value=999999)
->>> y = new_ma.array([1,2,3,4,5], mask=[0,0,1,0,0])
->>> y
-array(data = [1 2 -- 4 5],
-      mask = [False False True False False],
-      fill_value=999999)
->>> x==y
-array(data =
- [True True True True True],
-      mask =
- [False False True False False],
-      fill_value=?)
->>> old_ma.getmask(x) == new_ma.getmask(x)
-array([True, True, True, True, True])
->>> old_ma.getmask(y) == new_ma.getmask(y)
-array([True, True, False, True, True])
->>> old_ma.getmask(y)
-False
+In the longer term, if someone has a *portable* solution to the above problems,
+other than the bundling method we currently use, that doesn't add additional
+problems that are unreasonable then we would be happy to consider, and possibly
+switch to said method. This solution must function correctly across all of the
+situation that we expect pip to be used and not mandate some external mechanism
+such as OS packages.
 
 
-Using maskedarray with matplotlib
----------------------------------
+Modifications
+=============
 
-Starting with matplotlib 0.91.2, the masked array importing will work with
-the maskedarray branch) as well as with earlier versions.
+* ``setuptools`` is completely stripped to only keep ``pkg_resources``.
+* ``pkg_resources`` has been modified to import its dependencies from
+  ``pip._vendor``, and to use the vendored copy of ``platformdirs``
+  rather than ``appdirs``.
+* ``packaging`` has been modified to import its dependencies from
+  ``pip._vendor``.
+* ``CacheControl`` has been modified to import its dependencies from
+  ``pip._vendor``.
+* ``requests`` has been modified to import its other dependencies from
+  ``pip._vendor`` and to *not* load ``simplejson`` (all platforms) and
+  ``pyopenssl`` (Windows).
+* ``platformdirs`` has been modified to import its submodules from ``pip._vendor.platformdirs``.
 
-By default matplotlib still uses numpy.ma, but there is an rcParams setting
-that you can use to select maskedarray instead.  In the matplotlibrc file
-you will find::
+Automatic Vendoring
+===================
 
-  #maskedarray : False       # True to use external maskedarray module
-                             # instead of numpy.ma; this is a temporary #
-                             setting for testing maskedarray.
+Vendoring is automated via the `vendoring <https://pypi.org/project/vendoring/>`_ tool from the content of
+``pip/_vendor/vendor.txt`` and the different patches in
+``tools/vendoring/patches``.
+Launch it via ``vendoring sync . -v`` (requires ``vendoring>=0.2.2``).
+Tool configuration is done via ``pyproject.toml``.
 
+To update the vendored library versions, we have a session defined in ``nox``.
+The command to upgrade everything is::
 
-Uncomment and set to True to select maskedarray everywhere.
-Alternatively, you can test a script with maskedarray by using a
-command-line option, e.g.::
+    nox -s vendoring -- --upgrade-all --skip urllib3 --skip setuptools
 
-  python simple_plot.py --maskedarray
-
-
-Masked records
---------------
-
-Like *numpy.ma.core*, the *ndarray*-based implementation
-of MaskedArray is limited when working with records: you can
-mask any record of the array, but not a field in a record. If you
-need this feature, you may want to give the *mrecords* package
-a try (available in the *maskedarray* directory in the scipy
-sandbox). This module defines a new class, *MaskedRecord*. An
-instance of this class accepts a *recarray* as data, and uses two
-masks: the *fieldmask* has as many entries as records in the array,
-each entry with the same fields as a record, but of boolean types:
-they indicate whether the field is masked or not; a record entry
-is flagged as masked in the *mask* array if all the fields are
-masked. A few examples in the file should give you an idea of what
-can be done. Note that *mrecords* is still experimental...
-
-Optimizing maskedarray
-----------------------
-
-Should masked arrays be filled before processing or not?
---------------------------------------------------------
-
-In the current implementation, most operations on masked arrays involve
-the following steps:
-
- * the input arrays are filled
- * the operation is performed on the filled arrays
- * the mask is set for the results, from the combination of the input masks and the mask corresponding to the domain of the operation.
-
-For example, consider the division of two masked arrays::
-
-  import numpy
-  import maskedarray as ma
-  x = ma.array([1,2,3,4],mask=[1,0,0,0], dtype=numpy.float64)
-  y = ma.array([-1,0,1,2], mask=[0,0,0,1], dtype=numpy.float64)
-
-The division of x by y is then computed as::
-
-  d1 = x.filled(0) # d1 = array([0., 2., 3., 4.])
-  d2 = y.filled(1) # array([-1.,  0.,  1.,  1.])
-  m = ma.mask_or(ma.getmask(x), ma.getmask(y)) # m =
-  array([True,False,False,True])
-  dm = ma.divide.domain(d1,d2) # array([False,  True, False, False])
-  result = (d1/d2).view(MaskedArray) # masked_array([-0. inf, 3., 4.])
-  result._mask = logical_or(m, dm)
-
-Note that a division by zero takes place. To avoid it, we can consider
-to fill the input arrays, taking the domain mask into account, so that::
-
-  d1 = x._data.copy() # d1 = array([1., 2., 3., 4.])
-  d2 = y._data.copy() # array([-1.,  0.,  1.,  2.])
-  dm = ma.divide.domain(d1,d2) # array([False,  True, False, False])
-  numpy.putmask(d2, dm, 1) # d2 = array([-1.,  1.,  1.,  2.])
-  m = ma.mask_or(ma.getmask(x), ma.getmask(y)) # m =
-  array([True,False,False,True])
-  result = (d1/d2).view(MaskedArray) # masked_array([-1. 0., 3., 2.])
-  result._mask = logical_or(m, dm)
-
-Note that the *.copy()* is required to avoid updating the inputs with
-*putmask*.  The *.filled()* method also involves a *.copy()*.
-
-A third possibility consists in avoid filling the arrays::
-
-  d1 = x._data # d1 = array([1., 2., 3., 4.])
-  d2 = y._data # array([-1.,  0.,  1.,  2.])
-  dm = ma.divide.domain(d1,d2) # array([False,  True, False, False])
-  m = ma.mask_or(ma.getmask(x), ma.getmask(y)) # m =
-  array([True,False,False,True])
-  result = (d1/d2).view(MaskedArray) # masked_array([-1. inf, 3., 2.])
-  result._mask = logical_or(m, dm)
-
-Note that here again the division by zero takes place.
-
-A quick benchmark gives the following results:
-
- * *numpy.ma.divide*  : 2.69 ms per loop
- * classical division     : 2.21 ms per loop
- * division w/ prefilling : 2.34 ms per loop
- * division w/o filling   : 1.55 ms per loop
-
-So, is it worth filling the arrays beforehand ? Yes, if we are interested
-in avoiding floating-point exceptions that may fill the result with infs
-and nans. No, if we are only interested into speed...
+At the time of writing (April 2025) we do not upgrade ``urllib3`` because the
+next version is a major upgrade and will be handled as an independent PR. We also
+do not upgrade ``setuptools``, because we only rely on ``pkg_resources``, and
+tracking every ``setuptools`` change is unnecessary for our needs.
 
 
-Thanks
-------
+Managing Local Patches
+======================
 
-I'd like to thank Paul Dubois, Travis Oliphant and Sasha for the
-original masked array package: without you, I would never have started
-that (it might be argued that I shouldn't have anyway, but that's
-another story...).  I also wish to extend these thanks to Reggie Dugard
-and Eric Firing for their suggestions and numerous improvements.
+The ``vendoring`` tool automatically applies our local patches, but updating,
+the patches sometimes no longer apply cleanly. In that case, the update will
+fail. To resolve this, take the following steps:
+
+1. Revert any incomplete changes in the revendoring branch, to ensure you have
+   a clean starting point.
+2. Run the revendoring of the library with a problem again: ``nox -s vendoring
+   -- --upgrade <library_name>``.
+3. This will fail again, but you will have the original source in your working
+   directory. Review the existing patch against the source, and modify the patch
+   to reflect the new version of the source. If you ``git add`` the changes the
+   vendoring made, you can modify the source to reflect the patch file and then
+   generate a new patch with ``git diff``.
+4. Now, revert everything *except* the patch file changes. Leave the modified
+   patch file unstaged but saved in the working tree.
+5. Re-run the vendoring. This time, it should pick up the changed patch file
+   and apply it cleanly. The patch file changes will be committed along with the
+   revendoring, so the new commit should be ready to test and publish as a PR.
 
 
-Revision notes
---------------
+Debundling
+==========
 
-  * 08/25/2007 : Creation of this page
-  * 01/23/2007 : The package has been moved to the SciPy sandbox, and is regularly updated: please check out your SVN version!
+As mentioned in the rationale, we, the pip team, would prefer it if pip was not
+debundled (other than optionally ``pip/_vendor/requests/cacert.pem``) and that
+pip was left intact. However, if you insist on doing so, we have a
+semi-supported method (that we don't test in our CI) and requires a bit of
+extra work on your end in order to solve the problems described above.
+
+1. Delete everything in ``pip/_vendor/`` **except** for
+   ``pip/_vendor/__init__.py`` and ``pip/_vendor/vendor.txt``.
+2. Generate wheels for each of pip's dependencies (and any of their
+   dependencies) using your patched copies of these libraries. These must be
+   placed somewhere on the filesystem that pip can access (``pip/_vendor`` is
+   the default assumption).
+3. Modify ``pip/_vendor/__init__.py`` so that the ``DEBUNDLED`` variable is
+   ``True``.
+4. Upon installation, the ``INSTALLER`` file in pip's own ``dist-info``
+   directory should be set to something other than ``pip``, so that pip
+   can detect that it wasn't installed using itself.
+5. *(optional)* If you've placed the wheels in a location other than
+   ``pip/_vendor/``, then modify ``pip/_vendor/__init__.py`` so that the
+   ``WHEEL_DIR`` variable points to the location you've placed them.
+6. *(optional)* Update the ``pip_self_version_check`` logic to use the
+   appropriate logic for determining the latest available version of pip and
+   prompt the user with the correct upgrade message.
+
+Note that partial debundling is **NOT** supported. You need to prepare wheels
+for all dependencies for successful debundling.
