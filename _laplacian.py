@@ -1,18 +1,11 @@
 """
-This file is a copy of the scipy.sparse.csgraph._laplacian module from SciPy 1.12
-
-scipy.sparse.csgraph.laplacian supports sparse arrays only starting from Scipy 1.12,
-see https://github.com/scipy/scipy/pull/19156. This vendored file can be removed as
-soon as Scipy 1.12 becomes the minimum supported version.
-
 Laplacian of a compressed-sparse graph
 """
-
-# License: BSD 3 clause
 
 import numpy as np
 from scipy.sparse import issparse
 from scipy.sparse.linalg import LinearOperator
+from scipy.sparse._sputils import convert_pydata_sparse_to_scipy, is_pydata_spmatrix
 
 
 ###############################################################################
@@ -34,7 +27,7 @@ def laplacian(
     Parameters
     ----------
     csgraph : array_like or sparse matrix, 2 dimensions
-        Compressed-sparse graph, with shape (N, N).
+        compressed-sparse graph, with shape (N, N).
     normed : bool, optional
         If True, then compute symmetrically normalized Laplacian.
         Default: False.
@@ -45,11 +38,11 @@ def laplacian(
         If True, then use out-degree instead of in-degree.
         This distinction matters only if the graph is asymmetric.
         Default: False.
-    copy : bool, optional
+    copy: bool, optional
         If False, then change `csgraph` in place if possible,
         avoiding doubling the memory use.
         Default: True, for backward compatibility.
-    form : 'array', or 'function', or 'lo'
+    form: 'array', or 'function', or 'lo'
         Determines the format of the output Laplacian:
 
         * 'array' is a numpy array;
@@ -60,14 +53,14 @@ def laplacian(
         Choosing 'function' or 'lo' always avoids doubling
         the memory use, ignoring `copy` value.
         Default: 'array', for backward compatibility.
-    dtype : None or one of numeric numpy dtypes, optional
+    dtype: None or one of numeric numpy dtypes, optional
         The dtype of the output. If ``dtype=None``, the dtype of the
         output matches the dtype of the input csgraph, except for
         the case ``normed=True`` and integer-like csgraph, where
         the output dtype is 'float' allowing accurate normalization,
         but dramatically increasing the memory use.
         Default: None, for backward compatibility.
-    symmetrized : bool, optional
+    symmetrized: bool, optional
         If True, then the output Laplacian is symmetric/Hermitian.
         The symmetrization is done by ``csgraph + csgraph.T.conj``
         without dividing by 2 to preserve integer dtypes if possible
@@ -337,8 +330,12 @@ def laplacian(
     in the middle by deleting a single edge.
     Both determined partitions are optimal.
     """
+    is_pydata_sparse = is_pydata_spmatrix(csgraph)
+    if is_pydata_sparse:
+        pydata_sparse_cls = csgraph.__class__
+        csgraph = convert_pydata_sparse_to_scipy(csgraph)
     if csgraph.ndim != 2 or csgraph.shape[0] != csgraph.shape[1]:
-        raise ValueError("csgraph must be a square matrix or array")
+        raise ValueError('csgraph must be a square matrix or array')
 
     if normed and (
         np.issubdtype(csgraph.dtype, np.signedinteger)
@@ -347,10 +344,14 @@ def laplacian(
         csgraph = csgraph.astype(np.float64)
 
     if form == "array":
-        create_lap = _laplacian_sparse if issparse(csgraph) else _laplacian_dense
+        create_lap = (
+            _laplacian_sparse if issparse(csgraph) else _laplacian_dense
+        )
     else:
         create_lap = (
-            _laplacian_sparse_flo if issparse(csgraph) else _laplacian_dense_flo
+            _laplacian_sparse_flo
+            if issparse(csgraph)
+            else _laplacian_dense_flo
         )
 
     degree_axis = 1 if use_out_degree else 0
@@ -364,6 +365,8 @@ def laplacian(
         dtype=dtype,
         symmetrized=symmetrized,
     )
+    if is_pydata_sparse:
+        lap = pydata_sparse_cls.from_scipy_sparse(lap)
     if return_diag:
         return lap, d
     return lap
@@ -450,7 +453,7 @@ def _laplacian_sparse(graph, normed, axis, copy, form, dtype, symmetrized):
         dtype = graph.dtype
 
     needs_copy = False
-    if graph.format in ("lil", "dok"):
+    if graph.format in ('lil', 'dok'):
         m = graph.tocoo()
     else:
         m = graph
@@ -463,14 +466,14 @@ def _laplacian_sparse(graph, normed, axis, copy, form, dtype, symmetrized):
     w = np.asarray(m.sum(axis=axis)).ravel() - m.diagonal()
     if normed:
         m = m.tocoo(copy=needs_copy)
-        isolated_node_mask = w == 0
+        isolated_node_mask = (w == 0)
         w = np.where(isolated_node_mask, 1, np.sqrt(w))
         m.data /= w[m.row]
         m.data /= w[m.col]
         m.data *= -1
         m.setdiag(1 - isolated_node_mask)
     else:
-        if m.format == "dia":
+        if m.format == 'dia':
             m = m.copy()
         else:
             m = m.tocoo(copy=needs_copy)
@@ -481,6 +484,7 @@ def _laplacian_sparse(graph, normed, axis, copy, form, dtype, symmetrized):
 
 
 def _laplacian_dense_flo(graph, normed, axis, copy, form, dtype, symmetrized):
+
     if copy:
         m = np.array(graph)
     else:
@@ -525,6 +529,7 @@ def _laplacian_dense_flo(graph, normed, axis, copy, form, dtype, symmetrized):
 
 
 def _laplacian_dense(graph, normed, axis, copy, form, dtype, symmetrized):
+
     if form != "array":
         raise ValueError(f'{form!r} must be "array"')
 
@@ -544,7 +549,7 @@ def _laplacian_dense(graph, normed, axis, copy, form, dtype, symmetrized):
     np.fill_diagonal(m, 0)
     w = m.sum(axis=axis)
     if normed:
-        isolated_node_mask = w == 0
+        isolated_node_mask = (w == 0)
         w = np.where(isolated_node_mask, 1, np.sqrt(w))
         m /= w
         m /= w[:, np.newaxis]

@@ -1,1919 +1,3399 @@
 #
-# Author: Pearu Peterson, March 2002
+# Author:  Travis Oliphant, 2002
 #
-# w/ additions by Travis Oliphant, March 2002
-#              and Jake Vanderplas, August 2012
 
-from warnings import warn
-from itertools import product
+import operator
 import numpy as np
-from numpy import atleast_1d, atleast_2d
-from .lapack import get_lapack_funcs, _compute_lwork
-from ._misc import LinAlgError, _datacopied, LinAlgWarning
-from ._decomp import _asarray_validated
-from . import _decomp, _decomp_svd
-from ._solve_toeplitz import levinson
-from ._cythonized_array_utils import find_det_from_lu
+import math
+import warnings
+from collections import defaultdict
+from heapq import heapify, heappop
+from numpy import (pi, asarray, floor, isscalar, iscomplex, sqrt, where, mgrid,
+                   sin, place, issubdtype, extract, inexact, nan, zeros, sinc)
+from . import _ufuncs
+from ._ufuncs import (mathieu_a, mathieu_b, iv, jv, gamma,
+                      psi, hankel1, hankel2, yv, kv, poch, binom,
+                      _stirling2_inexact)
+from . import _specfun
+from ._comb import _comb_int
 from scipy._lib.deprecation import _NoValue, _deprecate_positional_args
 
-__all__ = ['solve', 'solve_triangular', 'solveh_banded', 'solve_banded',
-           'solve_toeplitz', 'solve_circulant', 'inv', 'det', 'lstsq',
-           'pinv', 'pinvh', 'matrix_balance', 'matmul_toeplitz']
+
+__all__ = [
+    'ai_zeros',
+    'assoc_laguerre',
+    'bei_zeros',
+    'beip_zeros',
+    'ber_zeros',
+    'bernoulli',
+    'berp_zeros',
+    'bi_zeros',
+    'clpmn',
+    'comb',
+    'digamma',
+    'diric',
+    'erf_zeros',
+    'euler',
+    'factorial',
+    'factorial2',
+    'factorialk',
+    'fresnel_zeros',
+    'fresnelc_zeros',
+    'fresnels_zeros',
+    'h1vp',
+    'h2vp',
+    'ivp',
+    'jn_zeros',
+    'jnjnp_zeros',
+    'jnp_zeros',
+    'jnyn_zeros',
+    'jvp',
+    'kei_zeros',
+    'keip_zeros',
+    'kelvin_zeros',
+    'ker_zeros',
+    'kerp_zeros',
+    'kvp',
+    'lmbda',
+    'lpmn',
+    'lpn',
+    'lqmn',
+    'lqn',
+    'mathieu_even_coef',
+    'mathieu_odd_coef',
+    'obl_cv_seq',
+    'pbdn_seq',
+    'pbdv_seq',
+    'pbvv_seq',
+    'perm',
+    'polygamma',
+    'pro_cv_seq',
+    'riccati_jn',
+    'riccati_yn',
+    'sinc',
+    'stirling2',
+    'y0_zeros',
+    'y1_zeros',
+    'y1p_zeros',
+    'yn_zeros',
+    'ynp_zeros',
+    'yvp',
+    'zeta'
+]
 
 
-# The numpy facilities for type-casting checks are too slow for small sized
-# arrays and eat away the time budget for the checkups. Here we set a
-# precomputed dict container of the numpy.can_cast() table.
-
-# It can be used to determine quickly what a dtype can be cast to LAPACK
-# compatible types, i.e., 'float32, float64, complex64, complex128'.
-# Then it can be checked via "casting_dict[arr.dtype.char]"
-lapack_cast_dict = {x: ''.join([y for y in 'fdFD' if np.can_cast(x, y)])
-                    for x in np.typecodes['All']}
+# mapping k to last n such that factorialk(n, k) < np.iinfo(np.int64).max
+_FACTORIALK_LIMITS_64BITS = {1: 20, 2: 33, 3: 44, 4: 54, 5: 65,
+                             6: 74, 7: 84, 8: 93, 9: 101}
+# mapping k to last n such that factorialk(n, k) < np.iinfo(np.int32).max
+_FACTORIALK_LIMITS_32BITS = {1: 12, 2: 19, 3: 25, 4: 31, 5: 37,
+                             6: 43, 7: 47, 8: 51, 9: 56}
 
 
-# Linear equations
-def _solve_check(n, info, lamch=None, rcond=None):
-    """ Check arguments during the different steps of the solution phase """
-    if info < 0:
-        raise ValueError(f'LAPACK reported an illegal value in {-info}-th argument.')
-    elif 0 < info:
-        raise LinAlgError('Matrix is singular.')
+def _nonneg_int_or_fail(n, var_name, strict=True):
+    try:
+        if strict:
+            # Raises an exception if float
+            n = operator.index(n)
+        elif n == floor(n):
+            n = int(n)
+        else:
+            raise ValueError()
+        if n < 0:
+            raise ValueError()
+    except (ValueError, TypeError) as err:
+        raise err.__class__(f"{var_name} must be a non-negative integer") from err
+    return n
 
-    if lamch is None:
-        return
-    E = lamch('E')
-    if rcond < E:
-        warn(f'Ill-conditioned matrix (rcond={rcond:.6g}): '
-             'result may not be accurate.',
-             LinAlgWarning, stacklevel=3)
 
+def diric(x, n):
+    """Periodic sinc function, also called the Dirichlet function.
 
-def solve(a, b, lower=False, overwrite_a=False,
-          overwrite_b=False, check_finite=True, assume_a='gen',
-          transposed=False):
-    """
-    Solves the linear equation set ``a @ x == b`` for the unknown ``x``
-    for square `a` matrix.
+    The Dirichlet function is defined as::
 
-    If the data matrix is known to be a particular type then supplying the
-    corresponding string to ``assume_a`` key chooses the dedicated solver.
-    The available options are
+        diric(x, n) = sin(x * n/2) / (n * sin(x / 2)),
 
-    ===================  ========
-     generic matrix       'gen'
-     symmetric            'sym'
-     hermitian            'her'
-     positive definite    'pos'
-    ===================  ========
-
-    If omitted, ``'gen'`` is the default structure.
-
-    The datatype of the arrays define which solver is called regardless
-    of the values. In other words, even when the complex array entries have
-    precisely zero imaginary parts, the complex solver will be called based
-    on the data type of the array.
+    where `n` is a positive integer.
 
     Parameters
     ----------
-    a : (N, N) array_like
-        Square input data
-    b : (N, NRHS) array_like
-        Input data for the right hand side.
-    lower : bool, default: False
-        Ignored if ``assume_a == 'gen'`` (the default). If True, the
-        calculation uses only the data in the lower triangle of `a`;
-        entries above the diagonal are ignored. If False (default), the
-        calculation uses only the data in the upper triangle of `a`; entries
-        below the diagonal are ignored.
-    overwrite_a : bool, default: False
-        Allow overwriting data in `a` (may enhance performance).
-    overwrite_b : bool, default: False
-        Allow overwriting data in `b` (may enhance performance).
-    check_finite : bool, default: True
-        Whether to check that the input matrices contain only finite numbers.
-        Disabling may give a performance gain, but may result in problems
-        (crashes, non-termination) if the inputs do contain infinities or NaNs.
-    assume_a : str, {'gen', 'sym', 'her', 'pos'}
-        Valid entries are explained above.
-    transposed : bool, default: False
-        If True, solve ``a.T @ x == b``. Raises `NotImplementedError`
-        for complex `a`.
+    x : array_like
+        Input data
+    n : int
+        Integer defining the periodicity.
 
     Returns
     -------
-    x : (N, NRHS) ndarray
-        The solution array.
-
-    Raises
-    ------
-    ValueError
-        If size mismatches detected or input a is not square.
-    LinAlgError
-        If the matrix is singular.
-    LinAlgWarning
-        If an ill-conditioned input a is detected.
-    NotImplementedError
-        If transposed is True and input a is a complex matrix.
-
-    Notes
-    -----
-    If the input b matrix is a 1-D array with N elements, when supplied
-    together with an NxN input a, it is assumed as a valid column vector
-    despite the apparent size mismatch. This is compatible with the
-    numpy.dot() behavior and the returned result is still 1-D array.
-
-    The generic, symmetric, Hermitian and positive definite solutions are
-    obtained via calling ?GESV, ?SYSV, ?HESV, and ?POSV routines of
-    LAPACK respectively.
+    diric : ndarray
 
     Examples
     --------
-    Given `a` and `b`, solve for `x`:
+    >>> import numpy as np
+    >>> from scipy import special
+    >>> import matplotlib.pyplot as plt
+
+    >>> x = np.linspace(-8*np.pi, 8*np.pi, num=201)
+    >>> plt.figure(figsize=(8, 8));
+    >>> for idx, n in enumerate([2, 3, 4, 9]):
+    ...     plt.subplot(2, 2, idx+1)
+    ...     plt.plot(x, special.diric(x, n))
+    ...     plt.title('diric, n={}'.format(n))
+    >>> plt.show()
+
+    The following example demonstrates that `diric` gives the magnitudes
+    (modulo the sign and scaling) of the Fourier coefficients of a
+    rectangular pulse.
+
+    Suppress output of values that are effectively 0:
+
+    >>> np.set_printoptions(suppress=True)
+
+    Create a signal `x` of length `m` with `k` ones:
+
+    >>> m = 8
+    >>> k = 3
+    >>> x = np.zeros(m)
+    >>> x[:k] = 1
+
+    Use the FFT to compute the Fourier transform of `x`, and
+    inspect the magnitudes of the coefficients:
+
+    >>> np.abs(np.fft.fft(x))
+    array([ 3.        ,  2.41421356,  1.        ,  0.41421356,  1.        ,
+            0.41421356,  1.        ,  2.41421356])
+
+    Now find the same values (up to sign) using `diric`. We multiply
+    by `k` to account for the different scaling conventions of
+    `numpy.fft.fft` and `diric`:
+
+    >>> theta = np.linspace(0, 2*np.pi, m, endpoint=False)
+    >>> k * special.diric(theta, k)
+    array([ 3.        ,  2.41421356,  1.        , -0.41421356, -1.        ,
+           -0.41421356,  1.        ,  2.41421356])
+    """
+    x, n = asarray(x), asarray(n)
+    n = asarray(n + (x-x))
+    x = asarray(x + (n-n))
+    if issubdtype(x.dtype, inexact):
+        ytype = x.dtype
+    else:
+        ytype = float
+    y = zeros(x.shape, ytype)
+
+    # empirical minval for 32, 64 or 128 bit float computations
+    # where sin(x/2) < minval, result is fixed at +1 or -1
+    if np.finfo(ytype).eps < 1e-18:
+        minval = 1e-11
+    elif np.finfo(ytype).eps < 1e-15:
+        minval = 1e-7
+    else:
+        minval = 1e-3
+
+    mask1 = (n <= 0) | (n != floor(n))
+    place(y, mask1, nan)
+
+    x = x / 2
+    denom = sin(x)
+    mask2 = (1-mask1) & (abs(denom) < minval)
+    xsub = extract(mask2, x)
+    nsub = extract(mask2, n)
+    zsub = xsub / pi
+    place(y, mask2, pow(-1, np.round(zsub)*(nsub-1)))
+
+    mask = (1-mask1) & (1-mask2)
+    xsub = extract(mask, x)
+    nsub = extract(mask, n)
+    dsub = extract(mask, denom)
+    place(y, mask, sin(nsub*xsub)/(nsub*dsub))
+    return y
+
+
+def jnjnp_zeros(nt):
+    """Compute zeros of integer-order Bessel functions Jn and Jn'.
+
+    Results are arranged in order of the magnitudes of the zeros.
+
+    Parameters
+    ----------
+    nt : int
+        Number (<=1200) of zeros to compute
+
+    Returns
+    -------
+    zo[l-1] : ndarray
+        Value of the lth zero of Jn(x) and Jn'(x). Of length `nt`.
+    n[l-1] : ndarray
+        Order of the Jn(x) or Jn'(x) associated with lth zero. Of length `nt`.
+    m[l-1] : ndarray
+        Serial number of the zeros of Jn(x) or Jn'(x) associated
+        with lth zero. Of length `nt`.
+    t[l-1] : ndarray
+        0 if lth zero in zo is zero of Jn(x), 1 if it is a zero of Jn'(x). Of
+        length `nt`.
+
+    See Also
+    --------
+    jn_zeros, jnp_zeros : to get separated arrays of zeros.
+
+    References
+    ----------
+    .. [1] Zhang, Shanjie and Jin, Jianming. "Computation of Special
+           Functions", John Wiley and Sons, 1996, chapter 5.
+           https://people.sc.fsu.edu/~jburkardt/f77_src/special_functions/special_functions.html
+
+    """
+    if not isscalar(nt) or (floor(nt) != nt) or (nt > 1200):
+        raise ValueError("Number must be integer <= 1200.")
+    nt = int(nt)
+    n, m, t, zo = _specfun.jdzo(nt)
+    return zo[1:nt+1], n[:nt], m[:nt], t[:nt]
+
+
+def jnyn_zeros(n, nt):
+    """Compute nt zeros of Bessel functions Jn(x), Jn'(x), Yn(x), and Yn'(x).
+
+    Returns 4 arrays of length `nt`, corresponding to the first `nt`
+    zeros of Jn(x), Jn'(x), Yn(x), and Yn'(x), respectively. The zeros
+    are returned in ascending order.
+
+    Parameters
+    ----------
+    n : int
+        Order of the Bessel functions
+    nt : int
+        Number (<=1200) of zeros to compute
+
+    Returns
+    -------
+    Jn : ndarray
+        First `nt` zeros of Jn
+    Jnp : ndarray
+        First `nt` zeros of Jn'
+    Yn : ndarray
+        First `nt` zeros of Yn
+    Ynp : ndarray
+        First `nt` zeros of Yn'
+
+    See Also
+    --------
+    jn_zeros, jnp_zeros, yn_zeros, ynp_zeros
+
+    References
+    ----------
+    .. [1] Zhang, Shanjie and Jin, Jianming. "Computation of Special
+           Functions", John Wiley and Sons, 1996, chapter 5.
+           https://people.sc.fsu.edu/~jburkardt/f77_src/special_functions/special_functions.html
+
+    Examples
+    --------
+    Compute the first three roots of :math:`J_1`, :math:`J_1'`,
+    :math:`Y_1` and :math:`Y_1'`.
+
+    >>> from scipy.special import jnyn_zeros
+    >>> jn_roots, jnp_roots, yn_roots, ynp_roots = jnyn_zeros(1, 3)
+    >>> jn_roots, yn_roots
+    (array([ 3.83170597,  7.01558667, 10.17346814]),
+     array([2.19714133, 5.42968104, 8.59600587]))
+
+    Plot :math:`J_1`, :math:`J_1'`, :math:`Y_1`, :math:`Y_1'` and their roots.
 
     >>> import numpy as np
-    >>> a = np.array([[3, 2, 0], [1, -1, 0], [0, 5, 1]])
-    >>> b = np.array([2, 4, -1])
-    >>> from scipy import linalg
-    >>> x = linalg.solve(a, b)
-    >>> x
-    array([ 2., -2.,  9.])
-    >>> np.dot(a, x) == b
+    >>> import matplotlib.pyplot as plt
+    >>> from scipy.special import jnyn_zeros, jvp, jn, yvp, yn
+    >>> jn_roots, jnp_roots, yn_roots, ynp_roots = jnyn_zeros(1, 3)
+    >>> fig, ax = plt.subplots()
+    >>> xmax= 11
+    >>> x = np.linspace(0, xmax)
+    >>> x[0] += 1e-15
+    >>> ax.plot(x, jn(1, x), label=r"$J_1$", c='r')
+    >>> ax.plot(x, jvp(1, x, 1), label=r"$J_1'$", c='b')
+    >>> ax.plot(x, yn(1, x), label=r"$Y_1$", c='y')
+    >>> ax.plot(x, yvp(1, x, 1), label=r"$Y_1'$", c='c')
+    >>> zeros = np.zeros((3, ))
+    >>> ax.scatter(jn_roots, zeros, s=30, c='r', zorder=5,
+    ...            label=r"$J_1$ roots")
+    >>> ax.scatter(jnp_roots, zeros, s=30, c='b', zorder=5,
+    ...            label=r"$J_1'$ roots")
+    >>> ax.scatter(yn_roots, zeros, s=30, c='y', zorder=5,
+    ...            label=r"$Y_1$ roots")
+    >>> ax.scatter(ynp_roots, zeros, s=30, c='c', zorder=5,
+    ...            label=r"$Y_1'$ roots")
+    >>> ax.hlines(0, 0, xmax, color='k')
+    >>> ax.set_ylim(-0.6, 0.6)
+    >>> ax.set_xlim(0, xmax)
+    >>> ax.legend(ncol=2, bbox_to_anchor=(1., 0.75))
+    >>> plt.tight_layout()
+    >>> plt.show()
+    """
+    if not (isscalar(nt) and isscalar(n)):
+        raise ValueError("Arguments must be scalars.")
+    if (floor(n) != n) or (floor(nt) != nt):
+        raise ValueError("Arguments must be integers.")
+    if (nt <= 0):
+        raise ValueError("nt > 0")
+    return _specfun.jyzo(abs(n), nt)
+
+
+def jn_zeros(n, nt):
+    r"""Compute zeros of integer-order Bessel functions Jn.
+
+    Compute `nt` zeros of the Bessel functions :math:`J_n(x)` on the
+    interval :math:`(0, \infty)`. The zeros are returned in ascending
+    order. Note that this interval excludes the zero at :math:`x = 0`
+    that exists for :math:`n > 0`.
+
+    Parameters
+    ----------
+    n : int
+        Order of Bessel function
+    nt : int
+        Number of zeros to return
+
+    Returns
+    -------
+    ndarray
+        First `nt` zeros of the Bessel function.
+
+    See Also
+    --------
+    jv: Real-order Bessel functions of the first kind
+    jnp_zeros: Zeros of :math:`Jn'`
+
+    References
+    ----------
+    .. [1] Zhang, Shanjie and Jin, Jianming. "Computation of Special
+           Functions", John Wiley and Sons, 1996, chapter 5.
+           https://people.sc.fsu.edu/~jburkardt/f77_src/special_functions/special_functions.html
+
+    Examples
+    --------
+    Compute the first four positive roots of :math:`J_3`.
+
+    >>> from scipy.special import jn_zeros
+    >>> jn_zeros(3, 4)
+    array([ 6.3801619 ,  9.76102313, 13.01520072, 16.22346616])
+
+    Plot :math:`J_3` and its first four positive roots. Note
+    that the root located at 0 is not returned by `jn_zeros`.
+
+    >>> import numpy as np
+    >>> import matplotlib.pyplot as plt
+    >>> from scipy.special import jn, jn_zeros
+    >>> j3_roots = jn_zeros(3, 4)
+    >>> xmax = 18
+    >>> xmin = -1
+    >>> x = np.linspace(xmin, xmax, 500)
+    >>> fig, ax = plt.subplots()
+    >>> ax.plot(x, jn(3, x), label=r'$J_3$')
+    >>> ax.scatter(j3_roots, np.zeros((4, )), s=30, c='r',
+    ...            label=r"$J_3$_Zeros", zorder=5)
+    >>> ax.scatter(0, 0, s=30, c='k',
+    ...            label=r"Root at 0", zorder=5)
+    >>> ax.hlines(0, 0, xmax, color='k')
+    >>> ax.set_xlim(xmin, xmax)
+    >>> plt.legend()
+    >>> plt.show()
+    """
+    return jnyn_zeros(n, nt)[0]
+
+
+def jnp_zeros(n, nt):
+    r"""Compute zeros of integer-order Bessel function derivatives Jn'.
+
+    Compute `nt` zeros of the functions :math:`J_n'(x)` on the
+    interval :math:`(0, \infty)`. The zeros are returned in ascending
+    order. Note that this interval excludes the zero at :math:`x = 0`
+    that exists for :math:`n > 1`.
+
+    Parameters
+    ----------
+    n : int
+        Order of Bessel function
+    nt : int
+        Number of zeros to return
+
+    Returns
+    -------
+    ndarray
+        First `nt` zeros of the Bessel function.
+
+    See Also
+    --------
+    jvp: Derivatives of integer-order Bessel functions of the first kind
+    jv: Float-order Bessel functions of the first kind
+
+    References
+    ----------
+    .. [1] Zhang, Shanjie and Jin, Jianming. "Computation of Special
+           Functions", John Wiley and Sons, 1996, chapter 5.
+           https://people.sc.fsu.edu/~jburkardt/f77_src/special_functions/special_functions.html
+
+    Examples
+    --------
+    Compute the first four roots of :math:`J_2'`.
+
+    >>> from scipy.special import jnp_zeros
+    >>> jnp_zeros(2, 4)
+    array([ 3.05423693,  6.70613319,  9.96946782, 13.17037086])
+
+    As `jnp_zeros` yields the roots of :math:`J_n'`, it can be used to
+    compute the locations of the peaks of :math:`J_n`. Plot
+    :math:`J_2`, :math:`J_2'` and the locations of the roots of :math:`J_2'`.
+
+    >>> import numpy as np
+    >>> import matplotlib.pyplot as plt
+    >>> from scipy.special import jn, jnp_zeros, jvp
+    >>> j2_roots = jnp_zeros(2, 4)
+    >>> xmax = 15
+    >>> x = np.linspace(0, xmax, 500)
+    >>> fig, ax = plt.subplots()
+    >>> ax.plot(x, jn(2, x), label=r'$J_2$')
+    >>> ax.plot(x, jvp(2, x, 1), label=r"$J_2'$")
+    >>> ax.hlines(0, 0, xmax, color='k')
+    >>> ax.scatter(j2_roots, np.zeros((4, )), s=30, c='r',
+    ...            label=r"Roots of $J_2'$", zorder=5)
+    >>> ax.set_ylim(-0.4, 0.8)
+    >>> ax.set_xlim(0, xmax)
+    >>> plt.legend()
+    >>> plt.show()
+    """
+    return jnyn_zeros(n, nt)[1]
+
+
+def yn_zeros(n, nt):
+    r"""Compute zeros of integer-order Bessel function Yn(x).
+
+    Compute `nt` zeros of the functions :math:`Y_n(x)` on the interval
+    :math:`(0, \infty)`. The zeros are returned in ascending order.
+
+    Parameters
+    ----------
+    n : int
+        Order of Bessel function
+    nt : int
+        Number of zeros to return
+
+    Returns
+    -------
+    ndarray
+        First `nt` zeros of the Bessel function.
+
+    See Also
+    --------
+    yn: Bessel function of the second kind for integer order
+    yv: Bessel function of the second kind for real order
+
+    References
+    ----------
+    .. [1] Zhang, Shanjie and Jin, Jianming. "Computation of Special
+           Functions", John Wiley and Sons, 1996, chapter 5.
+           https://people.sc.fsu.edu/~jburkardt/f77_src/special_functions/special_functions.html
+
+    Examples
+    --------
+    Compute the first four roots of :math:`Y_2`.
+
+    >>> from scipy.special import yn_zeros
+    >>> yn_zeros(2, 4)
+    array([ 3.38424177,  6.79380751, 10.02347798, 13.20998671])
+
+    Plot :math:`Y_2` and its first four roots.
+
+    >>> import numpy as np
+    >>> import matplotlib.pyplot as plt
+    >>> from scipy.special import yn, yn_zeros
+    >>> xmin = 2
+    >>> xmax = 15
+    >>> x = np.linspace(xmin, xmax, 500)
+    >>> fig, ax = plt.subplots()
+    >>> ax.hlines(0, xmin, xmax, color='k')
+    >>> ax.plot(x, yn(2, x), label=r'$Y_2$')
+    >>> ax.scatter(yn_zeros(2, 4), np.zeros((4, )), s=30, c='r',
+    ...            label='Roots', zorder=5)
+    >>> ax.set_ylim(-0.4, 0.4)
+    >>> ax.set_xlim(xmin, xmax)
+    >>> plt.legend()
+    >>> plt.show()
+    """
+    return jnyn_zeros(n, nt)[2]
+
+
+def ynp_zeros(n, nt):
+    r"""Compute zeros of integer-order Bessel function derivatives Yn'(x).
+
+    Compute `nt` zeros of the functions :math:`Y_n'(x)` on the
+    interval :math:`(0, \infty)`. The zeros are returned in ascending
+    order.
+
+    Parameters
+    ----------
+    n : int
+        Order of Bessel function
+    nt : int
+        Number of zeros to return
+
+    Returns
+    -------
+    ndarray
+        First `nt` zeros of the Bessel derivative function.
+
+
+    See Also
+    --------
+    yvp
+
+    References
+    ----------
+    .. [1] Zhang, Shanjie and Jin, Jianming. "Computation of Special
+           Functions", John Wiley and Sons, 1996, chapter 5.
+           https://people.sc.fsu.edu/~jburkardt/f77_src/special_functions/special_functions.html
+
+    Examples
+    --------
+    Compute the first four roots of the first derivative of the
+    Bessel function of second kind for order 0 :math:`Y_0'`.
+
+    >>> from scipy.special import ynp_zeros
+    >>> ynp_zeros(0, 4)
+    array([ 2.19714133,  5.42968104,  8.59600587, 11.74915483])
+
+    Plot :math:`Y_0`, :math:`Y_0'` and confirm visually that the roots of
+    :math:`Y_0'` are located at local extrema of :math:`Y_0`.
+
+    >>> import numpy as np
+    >>> import matplotlib.pyplot as plt
+    >>> from scipy.special import yn, ynp_zeros, yvp
+    >>> zeros = ynp_zeros(0, 4)
+    >>> xmax = 13
+    >>> x = np.linspace(0, xmax, 500)
+    >>> fig, ax = plt.subplots()
+    >>> ax.plot(x, yn(0, x), label=r'$Y_0$')
+    >>> ax.plot(x, yvp(0, x, 1), label=r"$Y_0'$")
+    >>> ax.scatter(zeros, np.zeros((4, )), s=30, c='r',
+    ...            label=r"Roots of $Y_0'$", zorder=5)
+    >>> for root in zeros:
+    ...     y0_extremum =  yn(0, root)
+    ...     lower = min(0, y0_extremum)
+    ...     upper = max(0, y0_extremum)
+    ...     ax.vlines(root, lower, upper, color='r')
+    >>> ax.hlines(0, 0, xmax, color='k')
+    >>> ax.set_ylim(-0.6, 0.6)
+    >>> ax.set_xlim(0, xmax)
+    >>> plt.legend()
+    >>> plt.show()
+    """
+    return jnyn_zeros(n, nt)[3]
+
+
+def y0_zeros(nt, complex=False):
+    """Compute nt zeros of Bessel function Y0(z), and derivative at each zero.
+
+    The derivatives are given by Y0'(z0) = -Y1(z0) at each zero z0.
+
+    Parameters
+    ----------
+    nt : int
+        Number of zeros to return
+    complex : bool, default False
+        Set to False to return only the real zeros; set to True to return only
+        the complex zeros with negative real part and positive imaginary part.
+        Note that the complex conjugates of the latter are also zeros of the
+        function, but are not returned by this routine.
+
+    Returns
+    -------
+    z0n : ndarray
+        Location of nth zero of Y0(z)
+    y0pz0n : ndarray
+        Value of derivative Y0'(z0) for nth zero
+
+    References
+    ----------
+    .. [1] Zhang, Shanjie and Jin, Jianming. "Computation of Special
+           Functions", John Wiley and Sons, 1996, chapter 5.
+           https://people.sc.fsu.edu/~jburkardt/f77_src/special_functions/special_functions.html
+
+    Examples
+    --------
+    Compute the first 4 real roots and the derivatives at the roots of
+    :math:`Y_0`:
+
+    >>> import numpy as np
+    >>> from scipy.special import y0_zeros
+    >>> zeros, grads = y0_zeros(4)
+    >>> with np.printoptions(precision=5):
+    ...     print(f"Roots: {zeros}")
+    ...     print(f"Gradients: {grads}")
+    Roots: [ 0.89358+0.j  3.95768+0.j  7.08605+0.j 10.22235+0.j]
+    Gradients: [-0.87942+0.j  0.40254+0.j -0.3001 +0.j  0.2497 +0.j]
+
+    Plot the real part of :math:`Y_0` and the first four computed roots.
+
+    >>> import matplotlib.pyplot as plt
+    >>> from scipy.special import y0
+    >>> xmin = 0
+    >>> xmax = 11
+    >>> x = np.linspace(xmin, xmax, 500)
+    >>> fig, ax = plt.subplots()
+    >>> ax.hlines(0, xmin, xmax, color='k')
+    >>> ax.plot(x, y0(x), label=r'$Y_0$')
+    >>> zeros, grads = y0_zeros(4)
+    >>> ax.scatter(zeros.real, np.zeros((4, )), s=30, c='r',
+    ...            label=r'$Y_0$_zeros', zorder=5)
+    >>> ax.set_ylim(-0.5, 0.6)
+    >>> ax.set_xlim(xmin, xmax)
+    >>> plt.legend(ncol=2)
+    >>> plt.show()
+
+    Compute the first 4 complex roots and the derivatives at the roots of
+    :math:`Y_0` by setting ``complex=True``:
+
+    >>> y0_zeros(4, True)
+    (array([ -2.40301663+0.53988231j,  -5.5198767 +0.54718001j,
+             -8.6536724 +0.54841207j, -11.79151203+0.54881912j]),
+     array([ 0.10074769-0.88196771j, -0.02924642+0.5871695j ,
+             0.01490806-0.46945875j, -0.00937368+0.40230454j]))
+    """
+    if not isscalar(nt) or (floor(nt) != nt) or (nt <= 0):
+        raise ValueError("Arguments must be scalar positive integer.")
+    kf = 0
+    kc = not complex
+    return _specfun.cyzo(nt, kf, kc)
+
+
+def y1_zeros(nt, complex=False):
+    """Compute nt zeros of Bessel function Y1(z), and derivative at each zero.
+
+    The derivatives are given by Y1'(z1) = Y0(z1) at each zero z1.
+
+    Parameters
+    ----------
+    nt : int
+        Number of zeros to return
+    complex : bool, default False
+        Set to False to return only the real zeros; set to True to return only
+        the complex zeros with negative real part and positive imaginary part.
+        Note that the complex conjugates of the latter are also zeros of the
+        function, but are not returned by this routine.
+
+    Returns
+    -------
+    z1n : ndarray
+        Location of nth zero of Y1(z)
+    y1pz1n : ndarray
+        Value of derivative Y1'(z1) for nth zero
+
+    References
+    ----------
+    .. [1] Zhang, Shanjie and Jin, Jianming. "Computation of Special
+           Functions", John Wiley and Sons, 1996, chapter 5.
+           https://people.sc.fsu.edu/~jburkardt/f77_src/special_functions/special_functions.html
+
+    Examples
+    --------
+    Compute the first 4 real roots and the derivatives at the roots of
+    :math:`Y_1`:
+
+    >>> import numpy as np
+    >>> from scipy.special import y1_zeros
+    >>> zeros, grads = y1_zeros(4)
+    >>> with np.printoptions(precision=5):
+    ...     print(f"Roots: {zeros}")
+    ...     print(f"Gradients: {grads}")
+    Roots: [ 2.19714+0.j  5.42968+0.j  8.59601+0.j 11.74915+0.j]
+    Gradients: [ 0.52079+0.j -0.34032+0.j  0.27146+0.j -0.23246+0.j]
+
+    Extract the real parts:
+
+    >>> realzeros = zeros.real
+    >>> realzeros
+    array([ 2.19714133,  5.42968104,  8.59600587, 11.74915483])
+
+    Plot :math:`Y_1` and the first four computed roots.
+
+    >>> import matplotlib.pyplot as plt
+    >>> from scipy.special import y1
+    >>> xmin = 0
+    >>> xmax = 13
+    >>> x = np.linspace(xmin, xmax, 500)
+    >>> zeros, grads = y1_zeros(4)
+    >>> fig, ax = plt.subplots()
+    >>> ax.hlines(0, xmin, xmax, color='k')
+    >>> ax.plot(x, y1(x), label=r'$Y_1$')
+    >>> ax.scatter(zeros.real, np.zeros((4, )), s=30, c='r',
+    ...            label=r'$Y_1$_zeros', zorder=5)
+    >>> ax.set_ylim(-0.5, 0.5)
+    >>> ax.set_xlim(xmin, xmax)
+    >>> plt.legend()
+    >>> plt.show()
+
+    Compute the first 4 complex roots and the derivatives at the roots of
+    :math:`Y_1` by setting ``complex=True``:
+
+    >>> y1_zeros(4, True)
+    (array([ -0.50274327+0.78624371j,  -3.83353519+0.56235654j,
+             -7.01590368+0.55339305j, -10.17357383+0.55127339j]),
+     array([-0.45952768+1.31710194j,  0.04830191-0.69251288j,
+            -0.02012695+0.51864253j,  0.011614  -0.43203296j]))
+    """
+    if not isscalar(nt) or (floor(nt) != nt) or (nt <= 0):
+        raise ValueError("Arguments must be scalar positive integer.")
+    kf = 1
+    kc = not complex
+    return _specfun.cyzo(nt, kf, kc)
+
+
+def y1p_zeros(nt, complex=False):
+    """Compute nt zeros of Bessel derivative Y1'(z), and value at each zero.
+
+    The values are given by Y1(z1) at each z1 where Y1'(z1)=0.
+
+    Parameters
+    ----------
+    nt : int
+        Number of zeros to return
+    complex : bool, default False
+        Set to False to return only the real zeros; set to True to return only
+        the complex zeros with negative real part and positive imaginary part.
+        Note that the complex conjugates of the latter are also zeros of the
+        function, but are not returned by this routine.
+
+    Returns
+    -------
+    z1pn : ndarray
+        Location of nth zero of Y1'(z)
+    y1z1pn : ndarray
+        Value of derivative Y1(z1) for nth zero
+
+    References
+    ----------
+    .. [1] Zhang, Shanjie and Jin, Jianming. "Computation of Special
+           Functions", John Wiley and Sons, 1996, chapter 5.
+           https://people.sc.fsu.edu/~jburkardt/f77_src/special_functions/special_functions.html
+
+    Examples
+    --------
+    Compute the first four roots of :math:`Y_1'` and the values of
+    :math:`Y_1` at these roots.
+
+    >>> import numpy as np
+    >>> from scipy.special import y1p_zeros
+    >>> y1grad_roots, y1_values = y1p_zeros(4)
+    >>> with np.printoptions(precision=5):
+    ...     print(f"Y1' Roots: {y1grad_roots.real}")
+    ...     print(f"Y1 values: {y1_values.real}")
+    Y1' Roots: [ 3.68302  6.9415  10.1234  13.28576]
+    Y1 values: [ 0.41673 -0.30317  0.25091 -0.21897]
+
+    `y1p_zeros` can be used to calculate the extremal points of :math:`Y_1`
+    directly. Here we plot :math:`Y_1` and the first four extrema.
+
+    >>> import matplotlib.pyplot as plt
+    >>> from scipy.special import y1, yvp
+    >>> y1_roots, y1_values_at_roots = y1p_zeros(4)
+    >>> real_roots = y1_roots.real
+    >>> xmax = 15
+    >>> x = np.linspace(0, xmax, 500)
+    >>> x[0] += 1e-15
+    >>> fig, ax = plt.subplots()
+    >>> ax.plot(x, y1(x), label=r'$Y_1$')
+    >>> ax.plot(x, yvp(1, x, 1), label=r"$Y_1'$")
+    >>> ax.scatter(real_roots, np.zeros((4, )), s=30, c='r',
+    ...            label=r"Roots of $Y_1'$", zorder=5)
+    >>> ax.scatter(real_roots, y1_values_at_roots.real, s=30, c='k',
+    ...            label=r"Extrema of $Y_1$", zorder=5)
+    >>> ax.hlines(0, 0, xmax, color='k')
+    >>> ax.set_ylim(-0.5, 0.5)
+    >>> ax.set_xlim(0, xmax)
+    >>> ax.legend(ncol=2, bbox_to_anchor=(1., 0.75))
+    >>> plt.tight_layout()
+    >>> plt.show()
+    """
+    if not isscalar(nt) or (floor(nt) != nt) or (nt <= 0):
+        raise ValueError("Arguments must be scalar positive integer.")
+    kf = 2
+    kc = not complex
+    return _specfun.cyzo(nt, kf, kc)
+
+
+def _bessel_diff_formula(v, z, n, L, phase):
+    # from AMS55.
+    # L(v, z) = J(v, z), Y(v, z), H1(v, z), H2(v, z), phase = -1
+    # L(v, z) = I(v, z) or exp(v*pi*i)K(v, z), phase = 1
+    # For K, you can pull out the exp((v-k)*pi*i) into the caller
+    v = asarray(v)
+    p = 1.0
+    s = L(v-n, z)
+    for i in range(1, n+1):
+        p = phase * (p * (n-i+1)) / i   # = choose(k, i)
+        s += p*L(v-n + i*2, z)
+    return s / (2.**n)
+
+
+def jvp(v, z, n=1):
+    """Compute derivatives of Bessel functions of the first kind.
+
+    Compute the nth derivative of the Bessel function `Jv` with
+    respect to `z`.
+
+    Parameters
+    ----------
+    v : array_like or float
+        Order of Bessel function
+    z : complex
+        Argument at which to evaluate the derivative; can be real or
+        complex.
+    n : int, default 1
+        Order of derivative. For 0 returns the Bessel function `jv` itself.
+
+    Returns
+    -------
+    scalar or ndarray
+        Values of the derivative of the Bessel function.
+
+    Notes
+    -----
+    The derivative is computed using the relation DLFM 10.6.7 [2]_.
+
+    References
+    ----------
+    .. [1] Zhang, Shanjie and Jin, Jianming. "Computation of Special
+           Functions", John Wiley and Sons, 1996, chapter 5.
+           https://people.sc.fsu.edu/~jburkardt/f77_src/special_functions/special_functions.html
+
+    .. [2] NIST Digital Library of Mathematical Functions.
+           https://dlmf.nist.gov/10.6.E7
+
+    Examples
+    --------
+
+    Compute the Bessel function of the first kind of order 0 and
+    its first two derivatives at 1.
+
+    >>> from scipy.special import jvp
+    >>> jvp(0, 1, 0), jvp(0, 1, 1), jvp(0, 1, 2)
+    (0.7651976865579666, -0.44005058574493355, -0.3251471008130331)
+
+    Compute the first derivative of the Bessel function of the first
+    kind for several orders at 1 by providing an array for `v`.
+
+    >>> jvp([0, 1, 2], 1, 1)
+    array([-0.44005059,  0.3251471 ,  0.21024362])
+
+    Compute the first derivative of the Bessel function of the first
+    kind of order 0 at several points by providing an array for `z`.
+
+    >>> import numpy as np
+    >>> points = np.array([0., 1.5, 3.])
+    >>> jvp(0, points, 1)
+    array([-0.        , -0.55793651, -0.33905896])
+
+    Plot the Bessel function of the first kind of order 1 and its
+    first three derivatives.
+
+    >>> import matplotlib.pyplot as plt
+    >>> x = np.linspace(-10, 10, 1000)
+    >>> fig, ax = plt.subplots()
+    >>> ax.plot(x, jvp(1, x, 0), label=r"$J_1$")
+    >>> ax.plot(x, jvp(1, x, 1), label=r"$J_1'$")
+    >>> ax.plot(x, jvp(1, x, 2), label=r"$J_1''$")
+    >>> ax.plot(x, jvp(1, x, 3), label=r"$J_1'''$")
+    >>> plt.legend()
+    >>> plt.show()
+    """
+    n = _nonneg_int_or_fail(n, 'n')
+    if n == 0:
+        return jv(v, z)
+    else:
+        return _bessel_diff_formula(v, z, n, jv, -1)
+
+
+def yvp(v, z, n=1):
+    """Compute derivatives of Bessel functions of the second kind.
+
+    Compute the nth derivative of the Bessel function `Yv` with
+    respect to `z`.
+
+    Parameters
+    ----------
+    v : array_like of float
+        Order of Bessel function
+    z : complex
+        Argument at which to evaluate the derivative
+    n : int, default 1
+        Order of derivative. For 0 returns the BEssel function `yv`
+
+    Returns
+    -------
+    scalar or ndarray
+        nth derivative of the Bessel function.
+
+    See Also
+    --------
+    yv : Bessel functions of the second kind
+
+    Notes
+    -----
+    The derivative is computed using the relation DLFM 10.6.7 [2]_.
+
+    References
+    ----------
+    .. [1] Zhang, Shanjie and Jin, Jianming. "Computation of Special
+           Functions", John Wiley and Sons, 1996, chapter 5.
+           https://people.sc.fsu.edu/~jburkardt/f77_src/special_functions/special_functions.html
+
+    .. [2] NIST Digital Library of Mathematical Functions.
+           https://dlmf.nist.gov/10.6.E7
+
+    Examples
+    --------
+    Compute the Bessel function of the second kind of order 0 and
+    its first two derivatives at 1.
+
+    >>> from scipy.special import yvp
+    >>> yvp(0, 1, 0), yvp(0, 1, 1), yvp(0, 1, 2)
+    (0.088256964215677, 0.7812128213002889, -0.8694697855159659)
+
+    Compute the first derivative of the Bessel function of the second
+    kind for several orders at 1 by providing an array for `v`.
+
+    >>> yvp([0, 1, 2], 1, 1)
+    array([0.78121282, 0.86946979, 2.52015239])
+
+    Compute the first derivative of the Bessel function of the
+    second kind of order 0 at several points by providing an array for `z`.
+
+    >>> import numpy as np
+    >>> points = np.array([0.5, 1.5, 3.])
+    >>> yvp(0, points, 1)
+    array([ 1.47147239,  0.41230863, -0.32467442])
+
+    Plot the Bessel function of the second kind of order 1 and its
+    first three derivatives.
+
+    >>> import matplotlib.pyplot as plt
+    >>> x = np.linspace(0, 5, 1000)
+    >>> x[0] += 1e-15
+    >>> fig, ax = plt.subplots()
+    >>> ax.plot(x, yvp(1, x, 0), label=r"$Y_1$")
+    >>> ax.plot(x, yvp(1, x, 1), label=r"$Y_1'$")
+    >>> ax.plot(x, yvp(1, x, 2), label=r"$Y_1''$")
+    >>> ax.plot(x, yvp(1, x, 3), label=r"$Y_1'''$")
+    >>> ax.set_ylim(-10, 10)
+    >>> plt.legend()
+    >>> plt.show()
+    """
+    n = _nonneg_int_or_fail(n, 'n')
+    if n == 0:
+        return yv(v, z)
+    else:
+        return _bessel_diff_formula(v, z, n, yv, -1)
+
+
+def kvp(v, z, n=1):
+    """Compute derivatives of real-order modified Bessel function Kv(z)
+
+    Kv(z) is the modified Bessel function of the second kind.
+    Derivative is calculated with respect to `z`.
+
+    Parameters
+    ----------
+    v : array_like of float
+        Order of Bessel function
+    z : array_like of complex
+        Argument at which to evaluate the derivative
+    n : int, default 1
+        Order of derivative. For 0 returns the Bessel function `kv` itself.
+
+    Returns
+    -------
+    out : ndarray
+        The results
+
+    See Also
+    --------
+    kv
+
+    Notes
+    -----
+    The derivative is computed using the relation DLFM 10.29.5 [2]_.
+
+    References
+    ----------
+    .. [1] Zhang, Shanjie and Jin, Jianming. "Computation of Special
+           Functions", John Wiley and Sons, 1996, chapter 6.
+           https://people.sc.fsu.edu/~jburkardt/f77_src/special_functions/special_functions.html
+
+    .. [2] NIST Digital Library of Mathematical Functions.
+           https://dlmf.nist.gov/10.29.E5
+
+    Examples
+    --------
+    Compute the modified bessel function of the second kind of order 0 and
+    its first two derivatives at 1.
+
+    >>> from scipy.special import kvp
+    >>> kvp(0, 1, 0), kvp(0, 1, 1), kvp(0, 1, 2)
+    (0.42102443824070834, -0.6019072301972346, 1.0229316684379428)
+
+    Compute the first derivative of the modified Bessel function of the second
+    kind for several orders at 1 by providing an array for `v`.
+
+    >>> kvp([0, 1, 2], 1, 1)
+    array([-0.60190723, -1.02293167, -3.85158503])
+
+    Compute the first derivative of the modified Bessel function of the
+    second kind of order 0 at several points by providing an array for `z`.
+
+    >>> import numpy as np
+    >>> points = np.array([0.5, 1.5, 3.])
+    >>> kvp(0, points, 1)
+    array([-1.65644112, -0.2773878 , -0.04015643])
+
+    Plot the modified bessel function of the second kind and its
+    first three derivatives.
+
+    >>> import matplotlib.pyplot as plt
+    >>> x = np.linspace(0, 5, 1000)
+    >>> fig, ax = plt.subplots()
+    >>> ax.plot(x, kvp(1, x, 0), label=r"$K_1$")
+    >>> ax.plot(x, kvp(1, x, 1), label=r"$K_1'$")
+    >>> ax.plot(x, kvp(1, x, 2), label=r"$K_1''$")
+    >>> ax.plot(x, kvp(1, x, 3), label=r"$K_1'''$")
+    >>> ax.set_ylim(-2.5, 2.5)
+    >>> plt.legend()
+    >>> plt.show()
+    """
+    n = _nonneg_int_or_fail(n, 'n')
+    if n == 0:
+        return kv(v, z)
+    else:
+        return (-1)**n * _bessel_diff_formula(v, z, n, kv, 1)
+
+
+def ivp(v, z, n=1):
+    """Compute derivatives of modified Bessel functions of the first kind.
+
+    Compute the nth derivative of the modified Bessel function `Iv`
+    with respect to `z`.
+
+    Parameters
+    ----------
+    v : array_like or float
+        Order of Bessel function
+    z : array_like
+        Argument at which to evaluate the derivative; can be real or
+        complex.
+    n : int, default 1
+        Order of derivative. For 0, returns the Bessel function `iv` itself.
+
+    Returns
+    -------
+    scalar or ndarray
+        nth derivative of the modified Bessel function.
+
+    See Also
+    --------
+    iv
+
+    Notes
+    -----
+    The derivative is computed using the relation DLFM 10.29.5 [2]_.
+
+    References
+    ----------
+    .. [1] Zhang, Shanjie and Jin, Jianming. "Computation of Special
+           Functions", John Wiley and Sons, 1996, chapter 6.
+           https://people.sc.fsu.edu/~jburkardt/f77_src/special_functions/special_functions.html
+
+    .. [2] NIST Digital Library of Mathematical Functions.
+           https://dlmf.nist.gov/10.29.E5
+
+    Examples
+    --------
+    Compute the modified Bessel function of the first kind of order 0 and
+    its first two derivatives at 1.
+
+    >>> from scipy.special import ivp
+    >>> ivp(0, 1, 0), ivp(0, 1, 1), ivp(0, 1, 2)
+    (1.2660658777520084, 0.565159103992485, 0.7009067737595233)
+
+    Compute the first derivative of the modified Bessel function of the first
+    kind for several orders at 1 by providing an array for `v`.
+
+    >>> ivp([0, 1, 2], 1, 1)
+    array([0.5651591 , 0.70090677, 0.29366376])
+
+    Compute the first derivative of the modified Bessel function of the
+    first kind of order 0 at several points by providing an array for `z`.
+
+    >>> import numpy as np
+    >>> points = np.array([0., 1.5, 3.])
+    >>> ivp(0, points, 1)
+    array([0.        , 0.98166643, 3.95337022])
+
+    Plot the modified Bessel function of the first kind of order 1 and its
+    first three derivatives.
+
+    >>> import matplotlib.pyplot as plt
+    >>> x = np.linspace(-5, 5, 1000)
+    >>> fig, ax = plt.subplots()
+    >>> ax.plot(x, ivp(1, x, 0), label=r"$I_1$")
+    >>> ax.plot(x, ivp(1, x, 1), label=r"$I_1'$")
+    >>> ax.plot(x, ivp(1, x, 2), label=r"$I_1''$")
+    >>> ax.plot(x, ivp(1, x, 3), label=r"$I_1'''$")
+    >>> plt.legend()
+    >>> plt.show()
+    """
+    n = _nonneg_int_or_fail(n, 'n')
+    if n == 0:
+        return iv(v, z)
+    else:
+        return _bessel_diff_formula(v, z, n, iv, 1)
+
+
+def h1vp(v, z, n=1):
+    """Compute derivatives of Hankel function H1v(z) with respect to `z`.
+
+    Parameters
+    ----------
+    v : array_like
+        Order of Hankel function
+    z : array_like
+        Argument at which to evaluate the derivative. Can be real or
+        complex.
+    n : int, default 1
+        Order of derivative. For 0 returns the Hankel function `h1v` itself.
+
+    Returns
+    -------
+    scalar or ndarray
+        Values of the derivative of the Hankel function.
+
+    See Also
+    --------
+    hankel1
+
+    Notes
+    -----
+    The derivative is computed using the relation DLFM 10.6.7 [2]_.
+
+    References
+    ----------
+    .. [1] Zhang, Shanjie and Jin, Jianming. "Computation of Special
+           Functions", John Wiley and Sons, 1996, chapter 5.
+           https://people.sc.fsu.edu/~jburkardt/f77_src/special_functions/special_functions.html
+
+    .. [2] NIST Digital Library of Mathematical Functions.
+           https://dlmf.nist.gov/10.6.E7
+
+    Examples
+    --------
+    Compute the Hankel function of the first kind of order 0 and
+    its first two derivatives at 1.
+
+    >>> from scipy.special import h1vp
+    >>> h1vp(0, 1, 0), h1vp(0, 1, 1), h1vp(0, 1, 2)
+    ((0.7651976865579664+0.088256964215677j),
+     (-0.44005058574493355+0.7812128213002889j),
+     (-0.3251471008130329-0.8694697855159659j))
+
+    Compute the first derivative of the Hankel function of the first kind
+    for several orders at 1 by providing an array for `v`.
+
+    >>> h1vp([0, 1, 2], 1, 1)
+    array([-0.44005059+0.78121282j,  0.3251471 +0.86946979j,
+           0.21024362+2.52015239j])
+
+    Compute the first derivative of the Hankel function of the first kind
+    of order 0 at several points by providing an array for `z`.
+
+    >>> import numpy as np
+    >>> points = np.array([0.5, 1.5, 3.])
+    >>> h1vp(0, points, 1)
+    array([-0.24226846+1.47147239j, -0.55793651+0.41230863j,
+           -0.33905896-0.32467442j])
+    """
+    n = _nonneg_int_or_fail(n, 'n')
+    if n == 0:
+        return hankel1(v, z)
+    else:
+        return _bessel_diff_formula(v, z, n, hankel1, -1)
+
+
+def h2vp(v, z, n=1):
+    """Compute derivatives of Hankel function H2v(z) with respect to `z`.
+
+    Parameters
+    ----------
+    v : array_like
+        Order of Hankel function
+    z : array_like
+        Argument at which to evaluate the derivative. Can be real or
+        complex.
+    n : int, default 1
+        Order of derivative. For 0 returns the Hankel function `h2v` itself.
+
+    Returns
+    -------
+    scalar or ndarray
+        Values of the derivative of the Hankel function.
+
+    See Also
+    --------
+    hankel2
+
+    Notes
+    -----
+    The derivative is computed using the relation DLFM 10.6.7 [2]_.
+
+    References
+    ----------
+    .. [1] Zhang, Shanjie and Jin, Jianming. "Computation of Special
+           Functions", John Wiley and Sons, 1996, chapter 5.
+           https://people.sc.fsu.edu/~jburkardt/f77_src/special_functions/special_functions.html
+
+    .. [2] NIST Digital Library of Mathematical Functions.
+           https://dlmf.nist.gov/10.6.E7
+
+    Examples
+    --------
+    Compute the Hankel function of the second kind of order 0 and
+    its first two derivatives at 1.
+
+    >>> from scipy.special import h2vp
+    >>> h2vp(0, 1, 0), h2vp(0, 1, 1), h2vp(0, 1, 2)
+    ((0.7651976865579664-0.088256964215677j),
+     (-0.44005058574493355-0.7812128213002889j),
+     (-0.3251471008130329+0.8694697855159659j))
+
+    Compute the first derivative of the Hankel function of the second kind
+    for several orders at 1 by providing an array for `v`.
+
+    >>> h2vp([0, 1, 2], 1, 1)
+    array([-0.44005059-0.78121282j,  0.3251471 -0.86946979j,
+           0.21024362-2.52015239j])
+
+    Compute the first derivative of the Hankel function of the second kind
+    of order 0 at several points by providing an array for `z`.
+
+    >>> import numpy as np
+    >>> points = np.array([0.5, 1.5, 3.])
+    >>> h2vp(0, points, 1)
+    array([-0.24226846-1.47147239j, -0.55793651-0.41230863j,
+           -0.33905896+0.32467442j])
+    """
+    n = _nonneg_int_or_fail(n, 'n')
+    if n == 0:
+        return hankel2(v, z)
+    else:
+        return _bessel_diff_formula(v, z, n, hankel2, -1)
+
+
+def riccati_jn(n, x):
+    r"""Compute Ricatti-Bessel function of the first kind and its derivative.
+
+    The Ricatti-Bessel function of the first kind is defined as :math:`x
+    j_n(x)`, where :math:`j_n` is the spherical Bessel function of the first
+    kind of order :math:`n`.
+
+    This function computes the value and first derivative of the
+    Ricatti-Bessel function for all orders up to and including `n`.
+
+    Parameters
+    ----------
+    n : int
+        Maximum order of function to compute
+    x : float
+        Argument at which to evaluate
+
+    Returns
+    -------
+    jn : ndarray
+        Value of j0(x), ..., jn(x)
+    jnp : ndarray
+        First derivative j0'(x), ..., jn'(x)
+
+    Notes
+    -----
+    The computation is carried out via backward recurrence, using the
+    relation DLMF 10.51.1 [2]_.
+
+    Wrapper for a Fortran routine created by Shanjie Zhang and Jianming
+    Jin [1]_.
+
+    References
+    ----------
+    .. [1] Zhang, Shanjie and Jin, Jianming. "Computation of Special
+           Functions", John Wiley and Sons, 1996.
+           https://people.sc.fsu.edu/~jburkardt/f77_src/special_functions/special_functions.html
+    .. [2] NIST Digital Library of Mathematical Functions.
+           https://dlmf.nist.gov/10.51.E1
+
+    """
+    if not (isscalar(n) and isscalar(x)):
+        raise ValueError("arguments must be scalars.")
+    n = _nonneg_int_or_fail(n, 'n', strict=False)
+    if (n == 0):
+        n1 = 1
+    else:
+        n1 = n
+    nm, jn, jnp = _specfun.rctj(n1, x)
+    return jn[:(n+1)], jnp[:(n+1)]
+
+
+def riccati_yn(n, x):
+    """Compute Ricatti-Bessel function of the second kind and its derivative.
+
+    The Ricatti-Bessel function of the second kind is defined as :math:`x
+    y_n(x)`, where :math:`y_n` is the spherical Bessel function of the second
+    kind of order :math:`n`.
+
+    This function computes the value and first derivative of the function for
+    all orders up to and including `n`.
+
+    Parameters
+    ----------
+    n : int
+        Maximum order of function to compute
+    x : float
+        Argument at which to evaluate
+
+    Returns
+    -------
+    yn : ndarray
+        Value of y0(x), ..., yn(x)
+    ynp : ndarray
+        First derivative y0'(x), ..., yn'(x)
+
+    Notes
+    -----
+    The computation is carried out via ascending recurrence, using the
+    relation DLMF 10.51.1 [2]_.
+
+    Wrapper for a Fortran routine created by Shanjie Zhang and Jianming
+    Jin [1]_.
+
+    References
+    ----------
+    .. [1] Zhang, Shanjie and Jin, Jianming. "Computation of Special
+           Functions", John Wiley and Sons, 1996.
+           https://people.sc.fsu.edu/~jburkardt/f77_src/special_functions/special_functions.html
+    .. [2] NIST Digital Library of Mathematical Functions.
+           https://dlmf.nist.gov/10.51.E1
+
+    """
+    if not (isscalar(n) and isscalar(x)):
+        raise ValueError("arguments must be scalars.")
+    n = _nonneg_int_or_fail(n, 'n', strict=False)
+    if (n == 0):
+        n1 = 1
+    else:
+        n1 = n
+    nm, jn, jnp = _specfun.rcty(n1, x)
+    return jn[:(n+1)], jnp[:(n+1)]
+
+
+def erf_zeros(nt):
+    """Compute the first nt zero in the first quadrant, ordered by absolute value.
+
+    Zeros in the other quadrants can be obtained by using the symmetries
+    erf(-z) = erf(z) and erf(conj(z)) = conj(erf(z)).
+
+
+    Parameters
+    ----------
+    nt : int
+        The number of zeros to compute
+
+    Returns
+    -------
+    The locations of the zeros of erf : ndarray (complex)
+        Complex values at which zeros of erf(z)
+
+    References
+    ----------
+    .. [1] Zhang, Shanjie and Jin, Jianming. "Computation of Special
+           Functions", John Wiley and Sons, 1996.
+           https://people.sc.fsu.edu/~jburkardt/f77_src/special_functions/special_functions.html
+
+    Examples
+    --------
+    >>> from scipy import special
+    >>> special.erf_zeros(1)
+    array([1.45061616+1.880943j])
+
+    Check that erf is (close to) zero for the value returned by erf_zeros
+
+    >>> special.erf(special.erf_zeros(1))
+    array([4.95159469e-14-1.16407394e-16j])
+
+    """
+    if (floor(nt) != nt) or (nt <= 0) or not isscalar(nt):
+        raise ValueError("Argument must be positive scalar integer.")
+    return _specfun.cerzo(nt)
+
+
+def fresnelc_zeros(nt):
+    """Compute nt complex zeros of cosine Fresnel integral C(z).
+
+    Parameters
+    ----------
+    nt : int
+        Number of zeros to compute
+
+    Returns
+    -------
+    fresnelc_zeros: ndarray
+        Zeros of the cosine Fresnel integral
+
+    References
+    ----------
+    .. [1] Zhang, Shanjie and Jin, Jianming. "Computation of Special
+           Functions", John Wiley and Sons, 1996.
+           https://people.sc.fsu.edu/~jburkardt/f77_src/special_functions/special_functions.html
+
+    """
+    if (floor(nt) != nt) or (nt <= 0) or not isscalar(nt):
+        raise ValueError("Argument must be positive scalar integer.")
+    return _specfun.fcszo(1, nt)
+
+
+def fresnels_zeros(nt):
+    """Compute nt complex zeros of sine Fresnel integral S(z).
+
+    Parameters
+    ----------
+    nt : int
+        Number of zeros to compute
+
+    Returns
+    -------
+    fresnels_zeros: ndarray
+        Zeros of the sine Fresnel integral
+
+    References
+    ----------
+    .. [1] Zhang, Shanjie and Jin, Jianming. "Computation of Special
+           Functions", John Wiley and Sons, 1996.
+           https://people.sc.fsu.edu/~jburkardt/f77_src/special_functions/special_functions.html
+
+    """
+    if (floor(nt) != nt) or (nt <= 0) or not isscalar(nt):
+        raise ValueError("Argument must be positive scalar integer.")
+    return _specfun.fcszo(2, nt)
+
+
+def fresnel_zeros(nt):
+    """Compute nt complex zeros of sine and cosine Fresnel integrals S(z) and C(z).
+
+    Parameters
+    ----------
+    nt : int
+        Number of zeros to compute
+
+    Returns
+    -------
+    zeros_sine: ndarray
+        Zeros of the sine Fresnel integral
+    zeros_cosine : ndarray
+        Zeros of the cosine Fresnel integral
+
+    References
+    ----------
+    .. [1] Zhang, Shanjie and Jin, Jianming. "Computation of Special
+           Functions", John Wiley and Sons, 1996.
+           https://people.sc.fsu.edu/~jburkardt/f77_src/special_functions/special_functions.html
+
+    """
+    if (floor(nt) != nt) or (nt <= 0) or not isscalar(nt):
+        raise ValueError("Argument must be positive scalar integer.")
+    return _specfun.fcszo(2, nt), _specfun.fcszo(1, nt)
+
+
+def assoc_laguerre(x, n, k=0.0):
+    """Compute the generalized (associated) Laguerre polynomial of degree n and order k.
+
+    The polynomial :math:`L^{(k)}_n(x)` is orthogonal over ``[0, inf)``,
+    with weighting function ``exp(-x) * x**k`` with ``k > -1``.
+
+    Parameters
+    ----------
+    x : float or ndarray
+        Points where to evaluate the Laguerre polynomial
+    n : int
+        Degree of the Laguerre polynomial
+    k : int
+        Order of the Laguerre polynomial
+
+    Returns
+    -------
+    assoc_laguerre: float or ndarray
+        Associated laguerre polynomial values
+
+    Notes
+    -----
+    `assoc_laguerre` is a simple wrapper around `eval_genlaguerre`, with
+    reversed argument order ``(x, n, k=0.0) --> (n, k, x)``.
+
+    """
+    return _ufuncs.eval_genlaguerre(n, k, x)
+
+
+digamma = psi
+
+
+def polygamma(n, x):
+    r"""Polygamma functions.
+
+    Defined as :math:`\psi^{(n)}(x)` where :math:`\psi` is the
+    `digamma` function. See [dlmf]_ for details.
+
+    Parameters
+    ----------
+    n : array_like
+        The order of the derivative of the digamma function; must be
+        integral
+    x : array_like
+        Real valued input
+
+    Returns
+    -------
+    ndarray
+        Function results
+
+    See Also
+    --------
+    digamma
+
+    References
+    ----------
+    .. [dlmf] NIST, Digital Library of Mathematical Functions,
+        https://dlmf.nist.gov/5.15
+
+    Examples
+    --------
+    >>> from scipy import special
+    >>> x = [2, 3, 25.5]
+    >>> special.polygamma(1, x)
+    array([ 0.64493407,  0.39493407,  0.03999467])
+    >>> special.polygamma(0, x) == special.psi(x)
     array([ True,  True,  True], dtype=bool)
 
     """
-    # Flags for 1-D or N-D right-hand side
-    b_is_1D = False
-
-    a1 = atleast_2d(_asarray_validated(a, check_finite=check_finite))
-    b1 = atleast_1d(_asarray_validated(b, check_finite=check_finite))
-    n = a1.shape[0]
-
-    overwrite_a = overwrite_a or _datacopied(a1, a)
-    overwrite_b = overwrite_b or _datacopied(b1, b)
-
-    if a1.shape[0] != a1.shape[1]:
-        raise ValueError('Input a needs to be a square matrix.')
-
-    if n != b1.shape[0]:
-        # Last chance to catch 1x1 scalar a and 1-D b arrays
-        if not (n == 1 and b1.size != 0):
-            raise ValueError('Input b has to have same number of rows as '
-                             'input a')
-
-    # accommodate empty arrays
-    if b1.size == 0:
-        return np.asfortranarray(b1.copy())
-
-    # regularize 1-D b arrays to 2D
-    if b1.ndim == 1:
-        if n == 1:
-            b1 = b1[None, :]
-        else:
-            b1 = b1[:, None]
-        b_is_1D = True
-
-    if assume_a not in ('gen', 'sym', 'her', 'pos'):
-        raise ValueError(f'{assume_a} is not a recognized matrix structure')
-
-    # for a real matrix, describe it as "symmetric", not "hermitian"
-    # (lapack doesn't know what to do with real hermitian matrices)
-    if assume_a == 'her' and not np.iscomplexobj(a1):
-        assume_a = 'sym'
-
-    # Get the correct lamch function.
-    # The LAMCH functions only exists for S and D
-    # So for complex values we have to convert to real/double.
-    if a1.dtype.char in 'fF':  # single precision
-        lamch = get_lapack_funcs('lamch', dtype='f')
-    else:
-        lamch = get_lapack_funcs('lamch', dtype='d')
-
-    # Currently we do not have the other forms of the norm calculators
-    #   lansy, lanpo, lanhe.
-    # However, in any case they only reduce computations slightly...
-    lange = get_lapack_funcs('lange', (a1,))
-
-    # Since the I-norm and 1-norm are the same for symmetric matrices
-    # we can collect them all in this one call
-    # Note however, that when issuing 'gen' and form!='none', then
-    # the I-norm should be used
-    if transposed:
-        trans = 1
-        norm = 'I'
-        if np.iscomplexobj(a1):
-            raise NotImplementedError('scipy.linalg.solve can currently '
-                                      'not solve a^T x = b or a^H x = b '
-                                      'for complex matrices.')
-    else:
-        trans = 0
-        norm = '1'
-
-    anorm = lange(norm, a1)
-
-    # Generalized case 'gesv'
-    if assume_a == 'gen':
-        gecon, getrf, getrs = get_lapack_funcs(('gecon', 'getrf', 'getrs'),
-                                               (a1, b1))
-        lu, ipvt, info = getrf(a1, overwrite_a=overwrite_a)
-        _solve_check(n, info)
-        x, info = getrs(lu, ipvt, b1,
-                        trans=trans, overwrite_b=overwrite_b)
-        _solve_check(n, info)
-        rcond, info = gecon(lu, anorm, norm=norm)
-    # Hermitian case 'hesv'
-    elif assume_a == 'her':
-        hecon, hesv, hesv_lw = get_lapack_funcs(('hecon', 'hesv',
-                                                 'hesv_lwork'), (a1, b1))
-        lwork = _compute_lwork(hesv_lw, n, lower)
-        lu, ipvt, x, info = hesv(a1, b1, lwork=lwork,
-                                 lower=lower,
-                                 overwrite_a=overwrite_a,
-                                 overwrite_b=overwrite_b)
-        _solve_check(n, info)
-        rcond, info = hecon(lu, ipvt, anorm)
-    # Symmetric case 'sysv'
-    elif assume_a == 'sym':
-        sycon, sysv, sysv_lw = get_lapack_funcs(('sycon', 'sysv',
-                                                 'sysv_lwork'), (a1, b1))
-        lwork = _compute_lwork(sysv_lw, n, lower)
-        lu, ipvt, x, info = sysv(a1, b1, lwork=lwork,
-                                 lower=lower,
-                                 overwrite_a=overwrite_a,
-                                 overwrite_b=overwrite_b)
-        _solve_check(n, info)
-        rcond, info = sycon(lu, ipvt, anorm)
-    # Positive definite case 'posv'
-    else:
-        pocon, posv = get_lapack_funcs(('pocon', 'posv'),
-                                       (a1, b1))
-        lu, x, info = posv(a1, b1, lower=lower,
-                           overwrite_a=overwrite_a,
-                           overwrite_b=overwrite_b)
-        _solve_check(n, info)
-        rcond, info = pocon(lu, anorm)
-
-    _solve_check(n, info, lamch, rcond)
-
-    if b_is_1D:
-        x = x.ravel()
-
-    return x
+    n, x = asarray(n), asarray(x)
+    fac2 = (-1.0)**(n+1) * gamma(n+1.0) * zeta(n+1, x)
+    return where(n == 0, psi(x), fac2)
 
 
-def solve_triangular(a, b, trans=0, lower=False, unit_diagonal=False,
-                     overwrite_b=False, check_finite=True):
-    """
-    Solve the equation `a x = b` for `x`, assuming a is a triangular matrix.
+def mathieu_even_coef(m, q):
+    r"""Fourier coefficients for even Mathieu and modified Mathieu functions.
+
+    The Fourier series of the even solutions of the Mathieu differential
+    equation are of the form
+
+    .. math:: \mathrm{ce}_{2n}(z, q) = \sum_{k=0}^{\infty} A_{(2n)}^{(2k)} \cos 2kz
+
+    .. math:: \mathrm{ce}_{2n+1}(z, q) =
+              \sum_{k=0}^{\infty} A_{(2n+1)}^{(2k+1)} \cos (2k+1)z
+
+    This function returns the coefficients :math:`A_{(2n)}^{(2k)}` for even
+    input m=2n, and the coefficients :math:`A_{(2n+1)}^{(2k+1)}` for odd input
+    m=2n+1.
 
     Parameters
     ----------
-    a : (M, M) array_like
-        A triangular matrix
-    b : (M,) or (M, N) array_like
-        Right-hand side matrix in `a x = b`
-    lower : bool, optional
-        Use only data contained in the lower triangle of `a`.
-        Default is to use upper triangle.
-    trans : {0, 1, 2, 'N', 'T', 'C'}, optional
-        Type of system to solve:
-
-        ========  =========
-        trans     system
-        ========  =========
-        0 or 'N'  a x  = b
-        1 or 'T'  a^T x = b
-        2 or 'C'  a^H x = b
-        ========  =========
-    unit_diagonal : bool, optional
-        If True, diagonal elements of `a` are assumed to be 1 and
-        will not be referenced.
-    overwrite_b : bool, optional
-        Allow overwriting data in `b` (may enhance performance)
-    check_finite : bool, optional
-        Whether to check that the input matrices contain only finite numbers.
-        Disabling may give a performance gain, but may result in problems
-        (crashes, non-termination) if the inputs do contain infinities or NaNs.
+    m : int
+        Order of Mathieu functions.  Must be non-negative.
+    q : float (>=0)
+        Parameter of Mathieu functions.  Must be non-negative.
 
     Returns
     -------
-    x : (M,) or (M, N) ndarray
-        Solution to the system `a x = b`.  Shape of return matches `b`.
+    Ak : ndarray
+        Even or odd Fourier coefficients, corresponding to even or odd m.
 
-    Raises
-    ------
-    LinAlgError
-        If `a` is singular
-
-    Notes
-    -----
-    .. versionadded:: 0.9.0
-
-    Examples
-    --------
-    Solve the lower triangular system a x = b, where::
-
-             [3  0  0  0]       [4]
-        a =  [2  1  0  0]   b = [2]
-             [1  0  1  0]       [4]
-             [1  1  1  1]       [2]
-
-    >>> import numpy as np
-    >>> from scipy.linalg import solve_triangular
-    >>> a = np.array([[3, 0, 0, 0], [2, 1, 0, 0], [1, 0, 1, 0], [1, 1, 1, 1]])
-    >>> b = np.array([4, 2, 4, 2])
-    >>> x = solve_triangular(a, b, lower=True)
-    >>> x
-    array([ 1.33333333, -0.66666667,  2.66666667, -1.33333333])
-    >>> a.dot(x)  # Check the result
-    array([ 4.,  2.,  4.,  2.])
+    References
+    ----------
+    .. [1] Zhang, Shanjie and Jin, Jianming. "Computation of Special
+           Functions", John Wiley and Sons, 1996.
+           https://people.sc.fsu.edu/~jburkardt/f77_src/special_functions/special_functions.html
+    .. [2] NIST Digital Library of Mathematical Functions
+           https://dlmf.nist.gov/28.4#i
 
     """
+    if not (isscalar(m) and isscalar(q)):
+        raise ValueError("m and q must be scalars.")
+    if (q < 0):
+        raise ValueError("q >=0")
+    if (m != floor(m)) or (m < 0):
+        raise ValueError("m must be an integer >=0.")
 
-    a1 = _asarray_validated(a, check_finite=check_finite)
-    b1 = _asarray_validated(b, check_finite=check_finite)
-    if len(a1.shape) != 2 or a1.shape[0] != a1.shape[1]:
-        raise ValueError('expected square matrix')
-    if a1.shape[0] != b1.shape[0]:
-        raise ValueError(f'shapes of a {a1.shape} and b {b1.shape} are incompatible')
-    overwrite_b = overwrite_b or _datacopied(b1, b)
-
-    trans = {'N': 0, 'T': 1, 'C': 2}.get(trans, trans)
-    trtrs, = get_lapack_funcs(('trtrs',), (a1, b1))
-    if a1.flags.f_contiguous or trans == 2:
-        x, info = trtrs(a1, b1, overwrite_b=overwrite_b, lower=lower,
-                        trans=trans, unitdiag=unit_diagonal)
+    if (q <= 1):
+        qm = 7.5 + 56.1*sqrt(q) - 134.7*q + 90.7*sqrt(q)*q
     else:
-        # transposed system is solved since trtrs expects Fortran ordering
-        x, info = trtrs(a1.T, b1, overwrite_b=overwrite_b, lower=not lower,
-                        trans=not trans, unitdiag=unit_diagonal)
+        qm = 17.0 + 3.1*sqrt(q) - .126*q + .0037*sqrt(q)*q
+    km = int(qm + 0.5*m)
+    if km > 251:
+        warnings.warn("Too many predicted coefficients.", RuntimeWarning, stacklevel=2)
+    kd = 1
+    m = int(floor(m))
+    if m % 2:
+        kd = 2
 
-    if info == 0:
-        return x
-    if info > 0:
-        raise LinAlgError("singular matrix: resolution failed at diagonal %d" %
-                          (info-1))
-    raise ValueError('illegal value in %dth argument of internal trtrs' %
-                     (-info))
+    a = mathieu_a(m, q)
+    fc = _specfun.fcoef(kd, m, q, a)
+    return fc[:km]
 
 
-def solve_banded(l_and_u, ab, b, overwrite_ab=False, overwrite_b=False,
-                 check_finite=True):
-    """
-    Solve the equation a x = b for x, assuming a is banded matrix.
+def mathieu_odd_coef(m, q):
+    r"""Fourier coefficients for even Mathieu and modified Mathieu functions.
 
-    The matrix a is stored in `ab` using the matrix diagonal ordered form::
+    The Fourier series of the odd solutions of the Mathieu differential
+    equation are of the form
 
-        ab[u + i - j, j] == a[i,j]
+    .. math:: \mathrm{se}_{2n+1}(z, q) =
+              \sum_{k=0}^{\infty} B_{(2n+1)}^{(2k+1)} \sin (2k+1)z
 
-    Example of `ab` (shape of a is (6,6), `u` =1, `l` =2)::
+    .. math:: \mathrm{se}_{2n+2}(z, q) =
+              \sum_{k=0}^{\infty} B_{(2n+2)}^{(2k+2)} \sin (2k+2)z
 
-        *    a01  a12  a23  a34  a45
-        a00  a11  a22  a33  a44  a55
-        a10  a21  a32  a43  a54   *
-        a20  a31  a42  a53   *    *
+    This function returns the coefficients :math:`B_{(2n+2)}^{(2k+2)}` for even
+    input m=2n+2, and the coefficients :math:`B_{(2n+1)}^{(2k+1)}` for odd
+    input m=2n+1.
 
     Parameters
     ----------
-    (l, u) : (integer, integer)
-        Number of non-zero lower and upper diagonals
-    ab : (`l` + `u` + 1, M) array_like
-        Banded matrix
-    b : (M,) or (M, K) array_like
-        Right-hand side
-    overwrite_ab : bool, optional
-        Discard data in `ab` (may enhance performance)
-    overwrite_b : bool, optional
-        Discard data in `b` (may enhance performance)
-    check_finite : bool, optional
-        Whether to check that the input matrices contain only finite numbers.
-        Disabling may give a performance gain, but may result in problems
-        (crashes, non-termination) if the inputs do contain infinities or NaNs.
+    m : int
+        Order of Mathieu functions.  Must be non-negative.
+    q : float (>=0)
+        Parameter of Mathieu functions.  Must be non-negative.
 
     Returns
     -------
-    x : (M,) or (M, K) ndarray
-        The solution to the system a x = b. Returned shape depends on the
-        shape of `b`.
+    Bk : ndarray
+        Even or odd Fourier coefficients, corresponding to even or odd m.
 
-    Examples
-    --------
-    Solve the banded system a x = b, where::
-
-            [5  2 -1  0  0]       [0]
-            [1  4  2 -1  0]       [1]
-        a = [0  1  3  2 -1]   b = [2]
-            [0  0  1  2  2]       [2]
-            [0  0  0  1  1]       [3]
-
-    There is one nonzero diagonal below the main diagonal (l = 1), and
-    two above (u = 2). The diagonal banded form of the matrix is::
-
-             [*  * -1 -1 -1]
-        ab = [*  2  2  2  2]
-             [5  4  3  2  1]
-             [1  1  1  1  *]
-
-    >>> import numpy as np
-    >>> from scipy.linalg import solve_banded
-    >>> ab = np.array([[0,  0, -1, -1, -1],
-    ...                [0,  2,  2,  2,  2],
-    ...                [5,  4,  3,  2,  1],
-    ...                [1,  1,  1,  1,  0]])
-    >>> b = np.array([0, 1, 2, 2, 3])
-    >>> x = solve_banded((1, 2), ab, b)
-    >>> x
-    array([-2.37288136,  3.93220339, -4.        ,  4.3559322 , -1.3559322 ])
+    References
+    ----------
+    .. [1] Zhang, Shanjie and Jin, Jianming. "Computation of Special
+           Functions", John Wiley and Sons, 1996.
+           https://people.sc.fsu.edu/~jburkardt/f77_src/special_functions/special_functions.html
 
     """
+    if not (isscalar(m) and isscalar(q)):
+        raise ValueError("m and q must be scalars.")
+    if (q < 0):
+        raise ValueError("q >=0")
+    if (m != floor(m)) or (m <= 0):
+        raise ValueError("m must be an integer > 0")
 
-    a1 = _asarray_validated(ab, check_finite=check_finite, as_inexact=True)
-    b1 = _asarray_validated(b, check_finite=check_finite, as_inexact=True)
-    # Validate shapes.
-    if a1.shape[-1] != b1.shape[0]:
-        raise ValueError("shapes of ab and b are not compatible.")
-    (nlower, nupper) = l_and_u
-    if nlower + nupper + 1 != a1.shape[0]:
-        raise ValueError("invalid values for the number of lower and upper "
-                         "diagonals: l+u+1 (%d) does not equal ab.shape[0] "
-                         "(%d)" % (nlower + nupper + 1, ab.shape[0]))
-
-    overwrite_b = overwrite_b or _datacopied(b1, b)
-    if a1.shape[-1] == 1:
-        b2 = np.array(b1, copy=(not overwrite_b))
-        b2 /= a1[1, 0]
-        return b2
-    if nlower == nupper == 1:
-        overwrite_ab = overwrite_ab or _datacopied(a1, ab)
-        gtsv, = get_lapack_funcs(('gtsv',), (a1, b1))
-        du = a1[0, 1:]
-        d = a1[1, :]
-        dl = a1[2, :-1]
-        du2, d, du, x, info = gtsv(dl, d, du, b1, overwrite_ab, overwrite_ab,
-                                   overwrite_ab, overwrite_b)
+    if (q <= 1):
+        qm = 7.5 + 56.1*sqrt(q) - 134.7*q + 90.7*sqrt(q)*q
     else:
-        gbsv, = get_lapack_funcs(('gbsv',), (a1, b1))
-        a2 = np.zeros((2*nlower + nupper + 1, a1.shape[1]), dtype=gbsv.dtype)
-        a2[nlower:, :] = a1
-        lu, piv, x, info = gbsv(nlower, nupper, a2, b1, overwrite_ab=True,
-                                overwrite_b=overwrite_b)
-    if info == 0:
-        return x
-    if info > 0:
-        raise LinAlgError("singular matrix")
-    raise ValueError('illegal value in %d-th argument of internal '
-                     'gbsv/gtsv' % -info)
+        qm = 17.0 + 3.1*sqrt(q) - .126*q + .0037*sqrt(q)*q
+    km = int(qm + 0.5*m)
+    if km > 251:
+        warnings.warn("Too many predicted coefficients.", RuntimeWarning, stacklevel=2)
+    kd = 4
+    m = int(floor(m))
+    if m % 2:
+        kd = 3
+
+    b = mathieu_b(m, q)
+    fc = _specfun.fcoef(kd, m, q, b)
+    return fc[:km]
 
 
-def solveh_banded(ab, b, overwrite_ab=False, overwrite_b=False, lower=False,
-                  check_finite=True):
-    """
-    Solve equation a x = b. a is Hermitian positive-definite banded matrix.
+def lpmn(m, n, z):
+    """Sequence of associated Legendre functions of the first kind.
 
-    Uses Thomas' Algorithm, which is more efficient than standard LU
-    factorization, but should only be used for Hermitian positive-definite
-    matrices.
+    Computes the associated Legendre function of the first kind of order m and
+    degree n, ``Pmn(z)`` = :math:`P_n^m(z)`, and its derivative, ``Pmn'(z)``.
+    Returns two arrays of size ``(m+1, n+1)`` containing ``Pmn(z)`` and
+    ``Pmn'(z)`` for all orders from ``0..m`` and degrees from ``0..n``.
 
-    The matrix ``a`` is stored in `ab` either in lower diagonal or upper
-    diagonal ordered form:
-
-        ab[u + i - j, j] == a[i,j]        (if upper form; i <= j)
-        ab[    i - j, j] == a[i,j]        (if lower form; i >= j)
-
-    Example of `ab` (shape of ``a`` is (6, 6), number of upper diagonals,
-    ``u`` =2)::
-
-        upper form:
-        *   *   a02 a13 a24 a35
-        *   a01 a12 a23 a34 a45
-        a00 a11 a22 a33 a44 a55
-
-        lower form:
-        a00 a11 a22 a33 a44 a55
-        a10 a21 a32 a43 a54 *
-        a20 a31 a42 a53 *   *
-
-    Cells marked with * are not used.
+    This function takes a real argument ``z``. For complex arguments ``z``
+    use clpmn instead.
 
     Parameters
     ----------
-    ab : (``u`` + 1, M) array_like
-        Banded matrix
-    b : (M,) or (M, K) array_like
-        Right-hand side
-    overwrite_ab : bool, optional
-        Discard data in `ab` (may enhance performance)
-    overwrite_b : bool, optional
-        Discard data in `b` (may enhance performance)
-    lower : bool, optional
-        Is the matrix in the lower form. (Default is upper form)
-    check_finite : bool, optional
-        Whether to check that the input matrices contain only finite numbers.
-        Disabling may give a performance gain, but may result in problems
-        (crashes, non-termination) if the inputs do contain infinities or NaNs.
+    m : int
+       ``|m| <= n``; the order of the Legendre function.
+    n : int
+       where ``n >= 0``; the degree of the Legendre function.  Often
+       called ``l`` (lower case L) in descriptions of the associated
+       Legendre function
+    z : float
+        Input value.
 
     Returns
     -------
-    x : (M,) or (M, K) ndarray
-        The solution to the system ``a x = b``. Shape of return matches shape
-        of `b`.
-
-    Notes
-    -----
-    In the case of a non-positive definite matrix ``a``, the solver
-    `solve_banded` may be used.
-
-    Examples
-    --------
-    Solve the banded system ``A x = b``, where::
-
-            [ 4  2 -1  0  0  0]       [1]
-            [ 2  5  2 -1  0  0]       [2]
-        A = [-1  2  6  2 -1  0]   b = [2]
-            [ 0 -1  2  7  2 -1]       [3]
-            [ 0  0 -1  2  8  2]       [3]
-            [ 0  0  0 -1  2  9]       [3]
-
-    >>> import numpy as np
-    >>> from scipy.linalg import solveh_banded
-
-    ``ab`` contains the main diagonal and the nonzero diagonals below the
-    main diagonal. That is, we use the lower form:
-
-    >>> ab = np.array([[ 4,  5,  6,  7, 8, 9],
-    ...                [ 2,  2,  2,  2, 2, 0],
-    ...                [-1, -1, -1, -1, 0, 0]])
-    >>> b = np.array([1, 2, 2, 3, 3, 3])
-    >>> x = solveh_banded(ab, b, lower=True)
-    >>> x
-    array([ 0.03431373,  0.45938375,  0.05602241,  0.47759104,  0.17577031,
-            0.34733894])
-
-
-    Solve the Hermitian banded system ``H x = b``, where::
-
-            [ 8   2-1j   0     0  ]        [ 1  ]
-        H = [2+1j  5     1j    0  ]    b = [1+1j]
-            [ 0   -1j    9   -2-1j]        [1-2j]
-            [ 0    0   -2+1j   6  ]        [ 0  ]
-
-    In this example, we put the upper diagonals in the array ``hb``:
-
-    >>> hb = np.array([[0, 2-1j, 1j, -2-1j],
-    ...                [8,  5,    9,   6  ]])
-    >>> b = np.array([1, 1+1j, 1-2j, 0])
-    >>> x = solveh_banded(hb, b)
-    >>> x
-    array([ 0.07318536-0.02939412j,  0.11877624+0.17696461j,
-            0.10077984-0.23035393j, -0.00479904-0.09358128j])
-
-    """
-    a1 = _asarray_validated(ab, check_finite=check_finite)
-    b1 = _asarray_validated(b, check_finite=check_finite)
-    # Validate shapes.
-    if a1.shape[-1] != b1.shape[0]:
-        raise ValueError("shapes of ab and b are not compatible.")
-
-    overwrite_b = overwrite_b or _datacopied(b1, b)
-    overwrite_ab = overwrite_ab or _datacopied(a1, ab)
-
-    if a1.shape[0] == 2:
-        ptsv, = get_lapack_funcs(('ptsv',), (a1, b1))
-        if lower:
-            d = a1[0, :].real
-            e = a1[1, :-1]
-        else:
-            d = a1[1, :].real
-            e = a1[0, 1:].conj()
-        d, du, x, info = ptsv(d, e, b1, overwrite_ab, overwrite_ab,
-                              overwrite_b)
-    else:
-        pbsv, = get_lapack_funcs(('pbsv',), (a1, b1))
-        c, x, info = pbsv(a1, b1, lower=lower, overwrite_ab=overwrite_ab,
-                          overwrite_b=overwrite_b)
-    if info > 0:
-        raise LinAlgError("%dth leading minor not positive definite" % info)
-    if info < 0:
-        raise ValueError('illegal value in %dth argument of internal '
-                         'pbsv' % -info)
-    return x
-
-
-def solve_toeplitz(c_or_cr, b, check_finite=True):
-    """Solve a Toeplitz system using Levinson Recursion
-
-    The Toeplitz matrix has constant diagonals, with c as its first column
-    and r as its first row. If r is not given, ``r == conjugate(c)`` is
-    assumed.
-
-    Parameters
-    ----------
-    c_or_cr : array_like or tuple of (array_like, array_like)
-        The vector ``c``, or a tuple of arrays (``c``, ``r``). Whatever the
-        actual shape of ``c``, it will be converted to a 1-D array. If not
-        supplied, ``r = conjugate(c)`` is assumed; in this case, if c[0] is
-        real, the Toeplitz matrix is Hermitian. r[0] is ignored; the first row
-        of the Toeplitz matrix is ``[c[0], r[1:]]``. Whatever the actual shape
-        of ``r``, it will be converted to a 1-D array.
-    b : (M,) or (M, K) array_like
-        Right-hand side in ``T x = b``.
-    check_finite : bool, optional
-        Whether to check that the input matrices contain only finite numbers.
-        Disabling may give a performance gain, but may result in problems
-        (result entirely NaNs) if the inputs do contain infinities or NaNs.
-
-    Returns
-    -------
-    x : (M,) or (M, K) ndarray
-        The solution to the system ``T x = b``. Shape of return matches shape
-        of `b`.
+    Pmn_z : (m+1, n+1) array
+       Values for all orders 0..m and degrees 0..n
+    Pmn_d_z : (m+1, n+1) array
+       Derivatives for all orders 0..m and degrees 0..n
 
     See Also
     --------
-    toeplitz : Toeplitz matrix
+    clpmn: associated Legendre functions of the first kind for complex z
 
     Notes
     -----
-    The solution is computed using Levinson-Durbin recursion, which is faster
-    than generic least-squares methods, but can be less numerically stable.
+    In the interval (-1, 1), Ferrer's function of the first kind is
+    returned. The phase convention used for the intervals (1, inf)
+    and (-inf, -1) is such that the result is always real.
 
-    Examples
-    --------
-    Solve the Toeplitz system T x = b, where::
-
-            [ 1 -1 -2 -3]       [1]
-        T = [ 3  1 -1 -2]   b = [2]
-            [ 6  3  1 -1]       [2]
-            [10  6  3  1]       [5]
-
-    To specify the Toeplitz matrix, only the first column and the first
-    row are needed.
-
-    >>> import numpy as np
-    >>> c = np.array([1, 3, 6, 10])    # First column of T
-    >>> r = np.array([1, -1, -2, -3])  # First row of T
-    >>> b = np.array([1, 2, 2, 5])
-
-    >>> from scipy.linalg import solve_toeplitz, toeplitz
-    >>> x = solve_toeplitz((c, r), b)
-    >>> x
-    array([ 1.66666667, -1.        , -2.66666667,  2.33333333])
-
-    Check the result by creating the full Toeplitz matrix and
-    multiplying it by `x`.  We should get `b`.
-
-    >>> T = toeplitz(c, r)
-    >>> T.dot(x)
-    array([ 1.,  2.,  2.,  5.])
-
-    """
-    # If numerical stability of this algorithm is a problem, a future
-    # developer might consider implementing other O(N^2) Toeplitz solvers,
-    # such as GKO (https://www.jstor.org/stable/2153371) or Bareiss.
-
-    r, c, b, dtype, b_shape = _validate_args_for_toeplitz_ops(
-        c_or_cr, b, check_finite, keep_b_shape=True)
-
-    # Form a 1-D array of values to be used in the matrix, containing a
-    # reversed copy of r[1:], followed by c.
-    vals = np.concatenate((r[-1:0:-1], c))
-    if b is None:
-        raise ValueError('illegal value, `b` is a required argument')
-
-    if b.ndim == 1:
-        x, _ = levinson(vals, np.ascontiguousarray(b))
-    else:
-        x = np.column_stack([levinson(vals, np.ascontiguousarray(b[:, i]))[0]
-                             for i in range(b.shape[1])])
-        x = x.reshape(*b_shape)
-
-    return x
-
-
-def _get_axis_len(aname, a, axis):
-    ax = axis
-    if ax < 0:
-        ax += a.ndim
-    if 0 <= ax < a.ndim:
-        return a.shape[ax]
-    raise ValueError(f"'{aname}axis' entry is out of bounds")
-
-
-def solve_circulant(c, b, singular='raise', tol=None,
-                    caxis=-1, baxis=0, outaxis=0):
-    """Solve C x = b for x, where C is a circulant matrix.
-
-    `C` is the circulant matrix associated with the vector `c`.
-
-    The system is solved by doing division in Fourier space. The
-    calculation is::
-
-        x = ifft(fft(b) / fft(c))
-
-    where `fft` and `ifft` are the fast Fourier transform and its inverse,
-    respectively. For a large vector `c`, this is *much* faster than
-    solving the system with the full circulant matrix.
-
-    Parameters
+    References
     ----------
-    c : array_like
-        The coefficients of the circulant matrix.
-    b : array_like
-        Right-hand side matrix in ``a x = b``.
-    singular : str, optional
-        This argument controls how a near singular circulant matrix is
-        handled.  If `singular` is "raise" and the circulant matrix is
-        near singular, a `LinAlgError` is raised. If `singular` is
-        "lstsq", the least squares solution is returned. Default is "raise".
-    tol : float, optional
-        If any eigenvalue of the circulant matrix has an absolute value
-        that is less than or equal to `tol`, the matrix is considered to be
-        near singular. If not given, `tol` is set to::
-
-            tol = abs_eigs.max() * abs_eigs.size * np.finfo(np.float64).eps
-
-        where `abs_eigs` is the array of absolute values of the eigenvalues
-        of the circulant matrix.
-    caxis : int
-        When `c` has dimension greater than 1, it is viewed as a collection
-        of circulant vectors. In this case, `caxis` is the axis of `c` that
-        holds the vectors of circulant coefficients.
-    baxis : int
-        When `b` has dimension greater than 1, it is viewed as a collection
-        of vectors. In this case, `baxis` is the axis of `b` that holds the
-        right-hand side vectors.
-    outaxis : int
-        When `c` or `b` are multidimensional, the value returned by
-        `solve_circulant` is multidimensional. In this case, `outaxis` is
-        the axis of the result that holds the solution vectors.
-
-    Returns
-    -------
-    x : ndarray
-        Solution to the system ``C x = b``.
-
-    Raises
-    ------
-    LinAlgError
-        If the circulant matrix associated with `c` is near singular.
-
-    See Also
-    --------
-    circulant : circulant matrix
-
-    Notes
-    -----
-    For a 1-D vector `c` with length `m`, and an array `b`
-    with shape ``(m, ...)``,
-
-        solve_circulant(c, b)
-
-    returns the same result as
-
-        solve(circulant(c), b)
-
-    where `solve` and `circulant` are from `scipy.linalg`.
-
-    .. versionadded:: 0.16.0
-
-    Examples
-    --------
-    >>> import numpy as np
-    >>> from scipy.linalg import solve_circulant, solve, circulant, lstsq
-
-    >>> c = np.array([2, 2, 4])
-    >>> b = np.array([1, 2, 3])
-    >>> solve_circulant(c, b)
-    array([ 0.75, -0.25,  0.25])
-
-    Compare that result to solving the system with `scipy.linalg.solve`:
-
-    >>> solve(circulant(c), b)
-    array([ 0.75, -0.25,  0.25])
-
-    A singular example:
-
-    >>> c = np.array([1, 1, 0, 0])
-    >>> b = np.array([1, 2, 3, 4])
-
-    Calling ``solve_circulant(c, b)`` will raise a `LinAlgError`.  For the
-    least square solution, use the option ``singular='lstsq'``:
-
-    >>> solve_circulant(c, b, singular='lstsq')
-    array([ 0.25,  1.25,  2.25,  1.25])
-
-    Compare to `scipy.linalg.lstsq`:
-
-    >>> x, resid, rnk, s = lstsq(circulant(c), b)
-    >>> x
-    array([ 0.25,  1.25,  2.25,  1.25])
-
-    A broadcasting example:
-
-    Suppose we have the vectors of two circulant matrices stored in an array
-    with shape (2, 5), and three `b` vectors stored in an array with shape
-    (3, 5).  For example,
-
-    >>> c = np.array([[1.5, 2, 3, 0, 0], [1, 1, 4, 3, 2]])
-    >>> b = np.arange(15).reshape(-1, 5)
-
-    We want to solve all combinations of circulant matrices and `b` vectors,
-    with the result stored in an array with shape (2, 3, 5). When we
-    disregard the axes of `c` and `b` that hold the vectors of coefficients,
-    the shapes of the collections are (2,) and (3,), respectively, which are
-    not compatible for broadcasting. To have a broadcast result with shape
-    (2, 3), we add a trivial dimension to `c`: ``c[:, np.newaxis, :]`` has
-    shape (2, 1, 5). The last dimension holds the coefficients of the
-    circulant matrices, so when we call `solve_circulant`, we can use the
-    default ``caxis=-1``. The coefficients of the `b` vectors are in the last
-    dimension of the array `b`, so we use ``baxis=-1``. If we use the
-    default `outaxis`, the result will have shape (5, 2, 3), so we'll use
-    ``outaxis=-1`` to put the solution vectors in the last dimension.
-
-    >>> x = solve_circulant(c[:, np.newaxis, :], b, baxis=-1, outaxis=-1)
-    >>> x.shape
-    (2, 3, 5)
-    >>> np.set_printoptions(precision=3)  # For compact output of numbers.
-    >>> x
-    array([[[-0.118,  0.22 ,  1.277, -0.142,  0.302],
-            [ 0.651,  0.989,  2.046,  0.627,  1.072],
-            [ 1.42 ,  1.758,  2.816,  1.396,  1.841]],
-           [[ 0.401,  0.304,  0.694, -0.867,  0.377],
-            [ 0.856,  0.758,  1.149, -0.412,  0.831],
-            [ 1.31 ,  1.213,  1.603,  0.042,  1.286]]])
-
-    Check by solving one pair of `c` and `b` vectors (cf. ``x[1, 1, :]``):
-
-    >>> solve_circulant(c[1], b[1, :])
-    array([ 0.856,  0.758,  1.149, -0.412,  0.831])
+    .. [1] Zhang, Shanjie and Jin, Jianming. "Computation of Special
+           Functions", John Wiley and Sons, 1996.
+           https://people.sc.fsu.edu/~jburkardt/f77_src/special_functions/special_functions.html
+    .. [2] NIST Digital Library of Mathematical Functions
+           https://dlmf.nist.gov/14.3
 
     """
-    c = np.atleast_1d(c)
-    nc = _get_axis_len("c", c, caxis)
-    b = np.atleast_1d(b)
-    nb = _get_axis_len("b", b, baxis)
-    if nc != nb:
-        raise ValueError(f'Shapes of c {c.shape} and b {b.shape} are incompatible')
-
-    fc = np.fft.fft(np.moveaxis(c, caxis, -1), axis=-1)
-    abs_fc = np.abs(fc)
-    if tol is None:
-        # This is the same tolerance as used in np.linalg.matrix_rank.
-        tol = abs_fc.max(axis=-1) * nc * np.finfo(np.float64).eps
-        if tol.shape != ():
-            tol.shape = tol.shape + (1,)
-        else:
-            tol = np.atleast_1d(tol)
-
-    near_zeros = abs_fc <= tol
-    is_near_singular = np.any(near_zeros)
-    if is_near_singular:
-        if singular == 'raise':
-            raise LinAlgError("near singular circulant matrix.")
-        else:
-            # Replace the small values with 1 to avoid errors in the
-            # division fb/fc below.
-            fc[near_zeros] = 1
-
-    fb = np.fft.fft(np.moveaxis(b, baxis, -1), axis=-1)
-
-    q = fb / fc
-
-    if is_near_singular:
-        # `near_zeros` is a boolean array, same shape as `c`, that is
-        # True where `fc` is (near) zero. `q` is the broadcasted result
-        # of fb / fc, so to set the values of `q` to 0 where `fc` is near
-        # zero, we use a mask that is the broadcast result of an array
-        # of True values shaped like `b` with `near_zeros`.
-        mask = np.ones_like(b, dtype=bool) & near_zeros
-        q[mask] = 0
-
-    x = np.fft.ifft(q, axis=-1)
-    if not (np.iscomplexobj(c) or np.iscomplexobj(b)):
-        x = x.real
-    if outaxis != -1:
-        x = np.moveaxis(x, -1, outaxis)
-    return x
-
-
-# matrix inversion
-def inv(a, overwrite_a=False, check_finite=True):
-    """
-    Compute the inverse of a matrix.
-
-    Parameters
-    ----------
-    a : array_like
-        Square matrix to be inverted.
-    overwrite_a : bool, optional
-        Discard data in `a` (may improve performance). Default is False.
-    check_finite : bool, optional
-        Whether to check that the input matrix contains only finite numbers.
-        Disabling may give a performance gain, but may result in problems
-        (crashes, non-termination) if the inputs do contain infinities or NaNs.
-
-    Returns
-    -------
-    ainv : ndarray
-        Inverse of the matrix `a`.
-
-    Raises
-    ------
-    LinAlgError
-        If `a` is singular.
-    ValueError
-        If `a` is not square, or not 2D.
-
-    Examples
-    --------
-    >>> import numpy as np
-    >>> from scipy import linalg
-    >>> a = np.array([[1., 2.], [3., 4.]])
-    >>> linalg.inv(a)
-    array([[-2. ,  1. ],
-           [ 1.5, -0.5]])
-    >>> np.dot(a, linalg.inv(a))
-    array([[ 1.,  0.],
-           [ 0.,  1.]])
-
-    """
-    a1 = _asarray_validated(a, check_finite=check_finite)
-    if len(a1.shape) != 2 or a1.shape[0] != a1.shape[1]:
-        raise ValueError('expected square matrix')
-    overwrite_a = overwrite_a or _datacopied(a1, a)
-    getrf, getri, getri_lwork = get_lapack_funcs(('getrf', 'getri',
-                                                  'getri_lwork'),
-                                                 (a1,))
-    lu, piv, info = getrf(a1, overwrite_a=overwrite_a)
-    if info == 0:
-        lwork = _compute_lwork(getri_lwork, a1.shape[0])
-
-        # XXX: the following line fixes curious SEGFAULT when
-        # benchmarking 500x500 matrix inverse. This seems to
-        # be a bug in LAPACK ?getri routine because if lwork is
-        # minimal (when using lwork[0] instead of lwork[1]) then
-        # all tests pass. Further investigation is required if
-        # more such SEGFAULTs occur.
-        lwork = int(1.01 * lwork)
-        inv_a, info = getri(lu, piv, lwork=lwork, overwrite_lu=1)
-    if info > 0:
-        raise LinAlgError("singular matrix")
-    if info < 0:
-        raise ValueError('illegal value in %d-th argument of internal '
-                         'getrf|getri' % -info)
-    return inv_a
-
-
-# Determinant
-
-def det(a, overwrite_a=False, check_finite=True):
-    """
-    Compute the determinant of a matrix
-
-    The determinant is a scalar that is a function of the associated square
-    matrix coefficients. The determinant value is zero for singular matrices.
-
-    Parameters
-    ----------
-    a : (..., M, M) array_like
-        Input array to compute determinants for.
-    overwrite_a : bool, optional
-        Allow overwriting data in a (may enhance performance).
-    check_finite : bool, optional
-        Whether to check that the input matrix contains only finite numbers.
-        Disabling may give a performance gain, but may result in problems
-        (crashes, non-termination) if the inputs do contain infinities or NaNs.
-
-    Returns
-    -------
-    det : (...) float or complex
-        Determinant of `a`. For stacked arrays, a scalar is returned for each
-        (m, m) slice in the last two dimensions of the input. For example, an
-        input of shape (p, q, m, m) will produce a result of shape (p, q). If
-        all dimensions are 1 a scalar is returned regardless of ndim.
-
-    Notes
-    -----
-    The determinant is computed by performing an LU factorization of the
-    input with LAPACK routine 'getrf', and then calculating the product of
-    diagonal entries of the U factor.
-
-    Even the input array is single precision (float32 or complex64), the result
-    will be returned in double precision (float64 or complex128) to prevent
-    overflows.
-
-    Examples
-    --------
-    >>> import numpy as np
-    >>> from scipy import linalg
-    >>> a = np.array([[1,2,3], [4,5,6], [7,8,9]])  # A singular matrix
-    >>> linalg.det(a)
-    0.0
-    >>> b = np.array([[0,2,3], [4,5,6], [7,8,9]])
-    >>> linalg.det(b)
-    3.0
-    >>> # An array with the shape (3, 2, 2, 2)
-    >>> c = np.array([[[[1., 2.], [3., 4.]],
-    ...                [[5., 6.], [7., 8.]]],
-    ...               [[[9., 10.], [11., 12.]],
-    ...                [[13., 14.], [15., 16.]]],
-    ...               [[[17., 18.], [19., 20.]],
-    ...                [[21., 22.], [23., 24.]]]])
-    >>> linalg.det(c)  # The resulting shape is (3, 2)
-    array([[-2., -2.],
-           [-2., -2.],
-           [-2., -2.]])
-    >>> linalg.det(c[0, 0])  # Confirm the (0, 0) slice, [[1, 2], [3, 4]]
-    -2.0
-    """
-    # The goal is to end up with a writable contiguous array to pass to Cython
-
-    # First we check and make arrays.
-    a1 = np.asarray_chkfinite(a) if check_finite else np.asarray(a)
-    if a1.ndim < 2:
-        raise ValueError('The input array must be at least two-dimensional.')
-    if a1.shape[-1] != a1.shape[-2]:
-        raise ValueError('Last 2 dimensions of the array must be square'
-                         f' but received shape {a1.shape}.')
-
-    # Also check if dtype is LAPACK compatible
-    if a1.dtype.char not in 'fdFD':
-        dtype_char = lapack_cast_dict[a1.dtype.char]
-        if not dtype_char:  # No casting possible
-            raise TypeError(f'The dtype "{a1.dtype.name}" cannot be cast '
-                            'to float(32, 64) or complex(64, 128).')
-
-        a1 = a1.astype(dtype_char[0])  # makes a copy, free to scratch
-        overwrite_a = True
-
-    # Empty array has determinant 1 because math.
-    if min(*a1.shape) == 0:
-        if a1.ndim == 2:
-            return np.float64(1.)
-        else:
-            return np.ones(shape=a1.shape[:-2], dtype=np.float64)
-
-    # Scalar case
-    if a1.shape[-2:] == (1, 1):
-        # Either ndarray with spurious singletons or a single element
-        if max(*a1.shape) > 1:
-            temp = np.squeeze(a1)
-            if a1.dtype.char in 'dD':
-                return temp
+    if not isscalar(m) or (abs(m) > n):
+        raise ValueError("m must be <= n.")
+    if not isscalar(n) or (n < 0):
+        raise ValueError("n must be a non-negative integer.")
+    if not isscalar(z):
+        raise ValueError("z must be scalar.")
+    if iscomplex(z):
+        raise ValueError("Argument must be real. Use clpmn instead.")
+    if (m < 0):
+        mp = -m
+        mf, nf = mgrid[0:mp+1, 0:n+1]
+        with _ufuncs.errstate(all='ignore'):
+            if abs(z) < 1:
+                # Ferrer function; DLMF 14.9.3
+                fixarr = where(mf > nf, 0.0,
+                               (-1)**mf * gamma(nf-mf+1) / gamma(nf+mf+1))
             else:
-                return (temp.astype('d') if a1.dtype.char == 'f' else
-                        temp.astype('D'))
-        else:
-            return (np.float64(a1.item()) if a1.dtype.char in 'fd' else
-                    np.complex128(a1.item()))
-
-    # Then check overwrite permission
-    if not _datacopied(a1, a):  # "a"  still alive through "a1"
-        if not overwrite_a:
-            # Data belongs to "a" so make a copy
-            a1 = a1.copy(order='C')
-        #  else: Do nothing we'll use "a" if possible
-    # else:  a1 has its own data thus free to scratch
-
-    # Then layout checks, might happen that overwrite is allowed but original
-    # array was read-only or non-C-contiguous.
-    if not (a1.flags['C_CONTIGUOUS'] and a1.flags['WRITEABLE']):
-        a1 = a1.copy(order='C')
-
-    if a1.ndim == 2:
-        det = find_det_from_lu(a1)
-        # Convert float, complex to to NumPy scalars
-        return (np.float64(det) if np.isrealobj(det) else np.complex128(det))
-
-    # loop over the stacked array, and avoid overflows for single precision
-    # Cf. np.linalg.det(np.diag([1e+38, 1e+38]).astype(np.float32))
-    dtype_char = a1.dtype.char
-    if dtype_char in 'fF':
-        dtype_char = 'd' if dtype_char.islower() else 'D'
-
-    det = np.empty(a1.shape[:-2], dtype=dtype_char)
-    for ind in product(*[range(x) for x in a1.shape[:-2]]):
-        det[ind] = find_det_from_lu(a1[ind])
-    return det
+                # Match to clpmn; DLMF 14.9.13
+                fixarr = where(mf > nf, 0.0, gamma(nf-mf+1) / gamma(nf+mf+1))
+    else:
+        mp = m
+    p, pd = _specfun.lpmn(mp, n, z)
+    if (m < 0):
+        p = p * fixarr
+        pd = pd * fixarr
+    return p, pd
 
 
-# Linear Least Squares
-def lstsq(a, b, cond=None, overwrite_a=False, overwrite_b=False,
-          check_finite=True, lapack_driver=None):
-    """
-    Compute least-squares solution to equation Ax = b.
+def clpmn(m, n, z, type=3):
+    """Associated Legendre function of the first kind for complex arguments.
 
-    Compute a vector x such that the 2-norm ``|b - A x|`` is minimized.
+    Computes the associated Legendre function of the first kind of order m and
+    degree n, ``Pmn(z)`` = :math:`P_n^m(z)`, and its derivative, ``Pmn'(z)``.
+    Returns two arrays of size ``(m+1, n+1)`` containing ``Pmn(z)`` and
+    ``Pmn'(z)`` for all orders from ``0..m`` and degrees from ``0..n``.
 
     Parameters
     ----------
-    a : (M, N) array_like
-        Left-hand side array
-    b : (M,) or (M, K) array_like
-        Right hand side array
-    cond : float, optional
-        Cutoff for 'small' singular values; used to determine effective
-        rank of a. Singular values smaller than
-        ``cond * largest_singular_value`` are considered zero.
-    overwrite_a : bool, optional
-        Discard data in `a` (may enhance performance). Default is False.
-    overwrite_b : bool, optional
-        Discard data in `b` (may enhance performance). Default is False.
-    check_finite : bool, optional
-        Whether to check that the input matrices contain only finite numbers.
-        Disabling may give a performance gain, but may result in problems
-        (crashes, non-termination) if the inputs do contain infinities or NaNs.
-    lapack_driver : str, optional
-        Which LAPACK driver is used to solve the least-squares problem.
-        Options are ``'gelsd'``, ``'gelsy'``, ``'gelss'``. Default
-        (``'gelsd'``) is a good choice.  However, ``'gelsy'`` can be slightly
-        faster on many problems.  ``'gelss'`` was used historically.  It is
-        generally slow but uses less memory.
-
-        .. versionadded:: 0.17.0
+    m : int
+       ``|m| <= n``; the order of the Legendre function.
+    n : int
+       where ``n >= 0``; the degree of the Legendre function.  Often
+       called ``l`` (lower case L) in descriptions of the associated
+       Legendre function
+    z : float or complex
+        Input value.
+    type : int, optional
+       takes values 2 or 3
+       2: cut on the real axis ``|x| > 1``
+       3: cut on the real axis ``-1 < x < 1`` (default)
 
     Returns
     -------
-    x : (N,) or (N, K) ndarray
-        Least-squares solution.
-    residues : (K,) ndarray or float
-        Square of the 2-norm for each column in ``b - a x``, if ``M > N`` and
-        ``rank(A) == n`` (returns a scalar if ``b`` is 1-D). Otherwise a
-        (0,)-shaped array is returned.
-    rank : int
-        Effective rank of `a`.
-    s : (min(M, N),) ndarray or None
-        Singular values of `a`. The condition number of ``a`` is
-        ``s[0] / s[-1]``.
-
-    Raises
-    ------
-    LinAlgError
-        If computation does not converge.
-
-    ValueError
-        When parameters are not compatible.
+    Pmn_z : (m+1, n+1) array
+       Values for all orders ``0..m`` and degrees ``0..n``
+    Pmn_d_z : (m+1, n+1) array
+       Derivatives for all orders ``0..m`` and degrees ``0..n``
 
     See Also
     --------
-    scipy.optimize.nnls : linear least squares with non-negativity constraint
+    lpmn: associated Legendre functions of the first kind for real z
 
     Notes
     -----
-    When ``'gelsy'`` is used as a driver, `residues` is set to a (0,)-shaped
-    array and `s` is always ``None``.
+    By default, i.e. for ``type=3``, phase conventions are chosen according
+    to [1]_ such that the function is analytic. The cut lies on the interval
+    (-1, 1). Approaching the cut from above or below in general yields a phase
+    factor with respect to Ferrer's function of the first kind
+    (cf. `lpmn`).
+
+    For ``type=2`` a cut at ``|x| > 1`` is chosen. Approaching the real values
+    on the interval (-1, 1) in the complex plane yields Ferrer's function
+    of the first kind.
+
+    References
+    ----------
+    .. [1] Zhang, Shanjie and Jin, Jianming. "Computation of Special
+           Functions", John Wiley and Sons, 1996.
+           https://people.sc.fsu.edu/~jburkardt/f77_src/special_functions/special_functions.html
+    .. [2] NIST Digital Library of Mathematical Functions
+           https://dlmf.nist.gov/14.21
+
+    """
+    if not isscalar(m) or (abs(m) > n):
+        raise ValueError("m must be <= n.")
+    if not isscalar(n) or (n < 0):
+        raise ValueError("n must be a non-negative integer.")
+    if not isscalar(z):
+        raise ValueError("z must be scalar.")
+    if not (type == 2 or type == 3):
+        raise ValueError("type must be either 2 or 3.")
+    if (m < 0):
+        mp = -m
+        mf, nf = mgrid[0:mp+1, 0:n+1]
+        with _ufuncs.errstate(all='ignore'):
+            if type == 2:
+                fixarr = where(mf > nf, 0.0,
+                               (-1)**mf * gamma(nf-mf+1) / gamma(nf+mf+1))
+            else:
+                fixarr = where(mf > nf, 0.0, gamma(nf-mf+1) / gamma(nf+mf+1))
+    else:
+        mp = m
+    p, pd = _specfun.clpmn(mp, n, z, type)
+    if (m < 0):
+        p = p * fixarr
+        pd = pd * fixarr
+    return p, pd
+
+
+def lqmn(m, n, z):
+    """Sequence of associated Legendre functions of the second kind.
+
+    Computes the associated Legendre function of the second kind of order m and
+    degree n, ``Qmn(z)`` = :math:`Q_n^m(z)`, and its derivative, ``Qmn'(z)``.
+    Returns two arrays of size ``(m+1, n+1)`` containing ``Qmn(z)`` and
+    ``Qmn'(z)`` for all orders from ``0..m`` and degrees from ``0..n``.
+
+    Parameters
+    ----------
+    m : int
+       ``|m| <= n``; the order of the Legendre function.
+    n : int
+       where ``n >= 0``; the degree of the Legendre function.  Often
+       called ``l`` (lower case L) in descriptions of the associated
+       Legendre function
+    z : complex
+        Input value.
+
+    Returns
+    -------
+    Qmn_z : (m+1, n+1) array
+       Values for all orders 0..m and degrees 0..n
+    Qmn_d_z : (m+1, n+1) array
+       Derivatives for all orders 0..m and degrees 0..n
+
+    References
+    ----------
+    .. [1] Zhang, Shanjie and Jin, Jianming. "Computation of Special
+           Functions", John Wiley and Sons, 1996.
+           https://people.sc.fsu.edu/~jburkardt/f77_src/special_functions/special_functions.html
+
+    """
+    if not isscalar(m) or (m < 0):
+        raise ValueError("m must be a non-negative integer.")
+    if not isscalar(n) or (n < 0):
+        raise ValueError("n must be a non-negative integer.")
+    if not isscalar(z):
+        raise ValueError("z must be scalar.")
+    m = int(m)
+    n = int(n)
+
+    # Ensure neither m nor n == 0
+    mm = max(1, m)
+    nn = max(1, n)
+
+    if iscomplex(z):
+        q, qd = _specfun.clqmn(mm, nn, z)
+    else:
+        q, qd = _specfun.lqmn(mm, nn, z)
+    return q[:(m+1), :(n+1)], qd[:(m+1), :(n+1)]
+
+
+def bernoulli(n):
+    """Bernoulli numbers B0..Bn (inclusive).
+
+    Parameters
+    ----------
+    n : int
+        Indicated the number of terms in the Bernoulli series to generate.
+
+    Returns
+    -------
+    ndarray
+        The Bernoulli numbers ``[B(0), B(1), ..., B(n)]``.
+
+    References
+    ----------
+    .. [1] Zhang, Shanjie and Jin, Jianming. "Computation of Special
+           Functions", John Wiley and Sons, 1996.
+           https://people.sc.fsu.edu/~jburkardt/f77_src/special_functions/special_functions.html
+    .. [2] "Bernoulli number", Wikipedia, https://en.wikipedia.org/wiki/Bernoulli_number
 
     Examples
     --------
     >>> import numpy as np
-    >>> from scipy.linalg import lstsq
-    >>> import matplotlib.pyplot as plt
+    >>> from scipy.special import bernoulli, zeta
+    >>> bernoulli(4)
+    array([ 1.        , -0.5       ,  0.16666667,  0.        , -0.03333333])
 
-    Suppose we have the following data:
+    The Wikipedia article ([2]_) points out the relationship between the
+    Bernoulli numbers and the zeta function, ``B_n^+ = -n * zeta(1 - n)``
+    for ``n > 0``:
 
-    >>> x = np.array([1, 2.5, 3.5, 4, 5, 7, 8.5])
-    >>> y = np.array([0.3, 1.1, 1.5, 2.0, 3.2, 6.6, 8.6])
+    >>> n = np.arange(1, 5)
+    >>> -n * zeta(1 - n)
+    array([ 0.5       ,  0.16666667, -0.        , -0.03333333])
 
-    We want to fit a quadratic polynomial of the form ``y = a + b*x**2``
-    to this data.  We first form the "design matrix" M, with a constant
-    column of 1s and a column containing ``x**2``:
-
-    >>> M = x[:, np.newaxis]**[0, 2]
-    >>> M
-    array([[  1.  ,   1.  ],
-           [  1.  ,   6.25],
-           [  1.  ,  12.25],
-           [  1.  ,  16.  ],
-           [  1.  ,  25.  ],
-           [  1.  ,  49.  ],
-           [  1.  ,  72.25]])
-
-    We want to find the least-squares solution to ``M.dot(p) = y``,
-    where ``p`` is a vector with length 2 that holds the parameters
-    ``a`` and ``b``.
-
-    >>> p, res, rnk, s = lstsq(M, y)
-    >>> p
-    array([ 0.20925829,  0.12013861])
-
-    Plot the data and the fitted curve.
-
-    >>> plt.plot(x, y, 'o', label='data')
-    >>> xx = np.linspace(0, 9, 101)
-    >>> yy = p[0] + p[1]*xx**2
-    >>> plt.plot(xx, yy, label='least squares fit, $y = a + bx^2$')
-    >>> plt.xlabel('x')
-    >>> plt.ylabel('y')
-    >>> plt.legend(framealpha=1, shadow=True)
-    >>> plt.grid(alpha=0.25)
-    >>> plt.show()
+    Note that, in the notation used in the wikipedia article,
+    `bernoulli` computes ``B_n^-`` (i.e. it used the convention that
+    ``B_1`` is -1/2).  The relation given above is for ``B_n^+``, so the
+    sign of 0.5 does not match the output of ``bernoulli(4)``.
 
     """
-    a1 = _asarray_validated(a, check_finite=check_finite)
-    b1 = _asarray_validated(b, check_finite=check_finite)
-    if len(a1.shape) != 2:
-        raise ValueError('Input array a should be 2D')
-    m, n = a1.shape
-    if len(b1.shape) == 2:
-        nrhs = b1.shape[1]
+    if not isscalar(n) or (n < 0):
+        raise ValueError("n must be a non-negative integer.")
+    n = int(n)
+    if (n < 2):
+        n1 = 2
     else:
-        nrhs = 1
-    if m != b1.shape[0]:
-        raise ValueError('Shape mismatch: a and b should have the same number'
-                         f' of rows ({m} != {b1.shape[0]}).')
-    if m == 0 or n == 0:  # Zero-sized problem, confuses LAPACK
-        x = np.zeros((n,) + b1.shape[1:], dtype=np.common_type(a1, b1))
-        if n == 0:
-            residues = np.linalg.norm(b1, axis=0)**2
-        else:
-            residues = np.empty((0,))
-        return x, residues, 0, np.empty((0,))
-
-    driver = lapack_driver
-    if driver is None:
-        driver = lstsq.default_lapack_driver
-    if driver not in ('gelsd', 'gelsy', 'gelss'):
-        raise ValueError('LAPACK driver "%s" is not found' % driver)
-
-    lapack_func, lapack_lwork = get_lapack_funcs((driver,
-                                                 '%s_lwork' % driver),
-                                                 (a1, b1))
-    real_data = True if (lapack_func.dtype.kind == 'f') else False
-
-    if m < n:
-        # need to extend b matrix as it will be filled with
-        # a larger solution matrix
-        if len(b1.shape) == 2:
-            b2 = np.zeros((n, nrhs), dtype=lapack_func.dtype)
-            b2[:m, :] = b1
-        else:
-            b2 = np.zeros(n, dtype=lapack_func.dtype)
-            b2[:m] = b1
-        b1 = b2
-
-    overwrite_a = overwrite_a or _datacopied(a1, a)
-    overwrite_b = overwrite_b or _datacopied(b1, b)
-
-    if cond is None:
-        cond = np.finfo(lapack_func.dtype).eps
-
-    if driver in ('gelss', 'gelsd'):
-        if driver == 'gelss':
-            lwork = _compute_lwork(lapack_lwork, m, n, nrhs, cond)
-            v, x, s, rank, work, info = lapack_func(a1, b1, cond, lwork,
-                                                    overwrite_a=overwrite_a,
-                                                    overwrite_b=overwrite_b)
-
-        elif driver == 'gelsd':
-            if real_data:
-                lwork, iwork = _compute_lwork(lapack_lwork, m, n, nrhs, cond)
-                x, s, rank, info = lapack_func(a1, b1, lwork,
-                                               iwork, cond, False, False)
-            else:  # complex data
-                lwork, rwork, iwork = _compute_lwork(lapack_lwork, m, n,
-                                                     nrhs, cond)
-                x, s, rank, info = lapack_func(a1, b1, lwork, rwork, iwork,
-                                               cond, False, False)
-        if info > 0:
-            raise LinAlgError("SVD did not converge in Linear Least Squares")
-        if info < 0:
-            raise ValueError('illegal value in %d-th argument of internal %s'
-                             % (-info, lapack_driver))
-        resids = np.asarray([], dtype=x.dtype)
-        if m > n:
-            x1 = x[:n]
-            if rank == n:
-                resids = np.sum(np.abs(x[n:])**2, axis=0)
-            x = x1
-        return x, resids, rank, s
-
-    elif driver == 'gelsy':
-        lwork = _compute_lwork(lapack_lwork, m, n, nrhs, cond)
-        jptv = np.zeros((a1.shape[1], 1), dtype=np.int32)
-        v, x, j, rank, info = lapack_func(a1, b1, jptv, cond,
-                                          lwork, False, False)
-        if info < 0:
-            raise ValueError("illegal value in %d-th argument of internal "
-                             "gelsy" % -info)
-        if m > n:
-            x1 = x[:n]
-            x = x1
-        return x, np.array([], x.dtype), rank, None
+        n1 = n
+    return _specfun.bernob(int(n1))[:(n+1)]
 
 
-lstsq.default_lapack_driver = 'gelsd'
+def euler(n):
+    """Euler numbers E(0), E(1), ..., E(n).
+
+    The Euler numbers [1]_ are also known as the secant numbers.
+
+    Because ``euler(n)`` returns floating point values, it does not give
+    exact values for large `n`.  The first inexact value is E(22).
+
+    Parameters
+    ----------
+    n : int
+        The highest index of the Euler number to be returned.
+
+    Returns
+    -------
+    ndarray
+        The Euler numbers [E(0), E(1), ..., E(n)].
+        The odd Euler numbers, which are all zero, are included.
+
+    References
+    ----------
+    .. [1] Sequence A122045, The On-Line Encyclopedia of Integer Sequences,
+           https://oeis.org/A122045
+    .. [2] Zhang, Shanjie and Jin, Jianming. "Computation of Special
+           Functions", John Wiley and Sons, 1996.
+           https://people.sc.fsu.edu/~jburkardt/f77_src/special_functions/special_functions.html
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from scipy.special import euler
+    >>> euler(6)
+    array([  1.,   0.,  -1.,   0.,   5.,   0., -61.])
+
+    >>> euler(13).astype(np.int64)
+    array([      1,       0,      -1,       0,       5,       0,     -61,
+                 0,    1385,       0,  -50521,       0, 2702765,       0])
+
+    >>> euler(22)[-1]  # Exact value of E(22) is -69348874393137901.
+    -69348874393137976.0
+
+    """
+    if not isscalar(n) or (n < 0):
+        raise ValueError("n must be a non-negative integer.")
+    n = int(n)
+    if (n < 2):
+        n1 = 2
+    else:
+        n1 = n
+    return _specfun.eulerb(n1)[:(n+1)]
+
+
+def lpn(n, z):
+    """Legendre function of the first kind.
+
+    Compute sequence of Legendre functions of the first kind (polynomials),
+    Pn(z) and derivatives for all degrees from 0 to n (inclusive).
+
+    See also special.legendre for polynomial class.
+
+    References
+    ----------
+    .. [1] Zhang, Shanjie and Jin, Jianming. "Computation of Special
+           Functions", John Wiley and Sons, 1996.
+           https://people.sc.fsu.edu/~jburkardt/f77_src/special_functions/special_functions.html
+
+    """
+    if not (isscalar(n) and isscalar(z)):
+        raise ValueError("arguments must be scalars.")
+    n = _nonneg_int_or_fail(n, 'n', strict=False)
+    if (n < 1):
+        n1 = 1
+    else:
+        n1 = n
+    if iscomplex(z):
+        pn, pd = _specfun.clpn(n1, z)
+    else:
+        pn, pd = _specfun.lpn(n1, z)
+    return pn[:(n+1)], pd[:(n+1)]
+
+
+def lqn(n, z):
+    """Legendre function of the second kind.
+
+    Compute sequence of Legendre functions of the second kind, Qn(z) and
+    derivatives for all degrees from 0 to n (inclusive).
+
+    References
+    ----------
+    .. [1] Zhang, Shanjie and Jin, Jianming. "Computation of Special
+           Functions", John Wiley and Sons, 1996.
+           https://people.sc.fsu.edu/~jburkardt/f77_src/special_functions/special_functions.html
+
+    """
+    if not (isscalar(n) and isscalar(z)):
+        raise ValueError("arguments must be scalars.")
+    n = _nonneg_int_or_fail(n, 'n', strict=False)
+    if (n < 1):
+        n1 = 1
+    else:
+        n1 = n
+    if iscomplex(z):
+        qn, qd = _specfun.clqn(n1, z)
+    else:
+        qn, qd = _specfun.lqnb(n1, z)
+    return qn[:(n+1)], qd[:(n+1)]
+
+
+def ai_zeros(nt):
+    """
+    Compute `nt` zeros and values of the Airy function Ai and its derivative.
+
+    Computes the first `nt` zeros, `a`, of the Airy function Ai(x);
+    first `nt` zeros, `ap`, of the derivative of the Airy function Ai'(x);
+    the corresponding values Ai(a');
+    and the corresponding values Ai'(a).
+
+    Parameters
+    ----------
+    nt : int
+        Number of zeros to compute
+
+    Returns
+    -------
+    a : ndarray
+        First `nt` zeros of Ai(x)
+    ap : ndarray
+        First `nt` zeros of Ai'(x)
+    ai : ndarray
+        Values of Ai(x) evaluated at first `nt` zeros of Ai'(x)
+    aip : ndarray
+        Values of Ai'(x) evaluated at first `nt` zeros of Ai(x)
+
+    References
+    ----------
+    .. [1] Zhang, Shanjie and Jin, Jianming. "Computation of Special
+           Functions", John Wiley and Sons, 1996.
+           https://people.sc.fsu.edu/~jburkardt/f77_src/special_functions/special_functions.html
+
+    Examples
+    --------
+    >>> from scipy import special
+    >>> a, ap, ai, aip = special.ai_zeros(3)
+    >>> a
+    array([-2.33810741, -4.08794944, -5.52055983])
+    >>> ap
+    array([-1.01879297, -3.24819758, -4.82009921])
+    >>> ai
+    array([ 0.53565666, -0.41901548,  0.38040647])
+    >>> aip
+    array([ 0.70121082, -0.80311137,  0.86520403])
+
+    """
+    kf = 1
+    if not isscalar(nt) or (floor(nt) != nt) or (nt <= 0):
+        raise ValueError("nt must be a positive integer scalar.")
+    return _specfun.airyzo(nt, kf)
+
+
+def bi_zeros(nt):
+    """
+    Compute `nt` zeros and values of the Airy function Bi and its derivative.
+
+    Computes the first `nt` zeros, b, of the Airy function Bi(x);
+    first `nt` zeros, b', of the derivative of the Airy function Bi'(x);
+    the corresponding values Bi(b');
+    and the corresponding values Bi'(b).
+
+    Parameters
+    ----------
+    nt : int
+        Number of zeros to compute
+
+    Returns
+    -------
+    b : ndarray
+        First `nt` zeros of Bi(x)
+    bp : ndarray
+        First `nt` zeros of Bi'(x)
+    bi : ndarray
+        Values of Bi(x) evaluated at first `nt` zeros of Bi'(x)
+    bip : ndarray
+        Values of Bi'(x) evaluated at first `nt` zeros of Bi(x)
+
+    References
+    ----------
+    .. [1] Zhang, Shanjie and Jin, Jianming. "Computation of Special
+           Functions", John Wiley and Sons, 1996.
+           https://people.sc.fsu.edu/~jburkardt/f77_src/special_functions/special_functions.html
+
+    Examples
+    --------
+    >>> from scipy import special
+    >>> b, bp, bi, bip = special.bi_zeros(3)
+    >>> b
+    array([-1.17371322, -3.2710933 , -4.83073784])
+    >>> bp
+    array([-2.29443968, -4.07315509, -5.51239573])
+    >>> bi
+    array([-0.45494438,  0.39652284, -0.36796916])
+    >>> bip
+    array([ 0.60195789, -0.76031014,  0.83699101])
+
+    """
+    kf = 2
+    if not isscalar(nt) or (floor(nt) != nt) or (nt <= 0):
+        raise ValueError("nt must be a positive integer scalar.")
+    return _specfun.airyzo(nt, kf)
+
+
+def lmbda(v, x):
+    r"""Jahnke-Emden Lambda function, Lambdav(x).
+
+    This function is defined as [2]_,
+
+    .. math:: \Lambda_v(x) = \Gamma(v+1) \frac{J_v(x)}{(x/2)^v},
+
+    where :math:`\Gamma` is the gamma function and :math:`J_v` is the
+    Bessel function of the first kind.
+
+    Parameters
+    ----------
+    v : float
+        Order of the Lambda function
+    x : float
+        Value at which to evaluate the function and derivatives
+
+    Returns
+    -------
+    vl : ndarray
+        Values of Lambda_vi(x), for vi=v-int(v), vi=1+v-int(v), ..., vi=v.
+    dl : ndarray
+        Derivatives Lambda_vi'(x), for vi=v-int(v), vi=1+v-int(v), ..., vi=v.
+
+    References
+    ----------
+    .. [1] Zhang, Shanjie and Jin, Jianming. "Computation of Special
+           Functions", John Wiley and Sons, 1996.
+           https://people.sc.fsu.edu/~jburkardt/f77_src/special_functions/special_functions.html
+    .. [2] Jahnke, E. and Emde, F. "Tables of Functions with Formulae and
+           Curves" (4th ed.), Dover, 1945
+    """
+    if not (isscalar(v) and isscalar(x)):
+        raise ValueError("arguments must be scalars.")
+    if (v < 0):
+        raise ValueError("argument must be > 0.")
+    n = int(v)
+    v0 = v - n
+    if (n < 1):
+        n1 = 1
+    else:
+        n1 = n
+    v1 = n1 + v0
+    if (v != floor(v)):
+        vm, vl, dl = _specfun.lamv(v1, x)
+    else:
+        vm, vl, dl = _specfun.lamn(v1, x)
+    return vl[:(n+1)], dl[:(n+1)]
+
+
+def pbdv_seq(v, x):
+    """Parabolic cylinder functions Dv(x) and derivatives.
+
+    Parameters
+    ----------
+    v : float
+        Order of the parabolic cylinder function
+    x : float
+        Value at which to evaluate the function and derivatives
+
+    Returns
+    -------
+    dv : ndarray
+        Values of D_vi(x), for vi=v-int(v), vi=1+v-int(v), ..., vi=v.
+    dp : ndarray
+        Derivatives D_vi'(x), for vi=v-int(v), vi=1+v-int(v), ..., vi=v.
+
+    References
+    ----------
+    .. [1] Zhang, Shanjie and Jin, Jianming. "Computation of Special
+           Functions", John Wiley and Sons, 1996, chapter 13.
+           https://people.sc.fsu.edu/~jburkardt/f77_src/special_functions/special_functions.html
+
+    """
+    if not (isscalar(v) and isscalar(x)):
+        raise ValueError("arguments must be scalars.")
+    n = int(v)
+    v0 = v-n
+    if (n < 1):
+        n1 = 1
+    else:
+        n1 = n
+    v1 = n1 + v0
+    dv, dp, pdf, pdd = _specfun.pbdv(v1, x)
+    return dv[:n1+1], dp[:n1+1]
+
+
+def pbvv_seq(v, x):
+    """Parabolic cylinder functions Vv(x) and derivatives.
+
+    Parameters
+    ----------
+    v : float
+        Order of the parabolic cylinder function
+    x : float
+        Value at which to evaluate the function and derivatives
+
+    Returns
+    -------
+    dv : ndarray
+        Values of V_vi(x), for vi=v-int(v), vi=1+v-int(v), ..., vi=v.
+    dp : ndarray
+        Derivatives V_vi'(x), for vi=v-int(v), vi=1+v-int(v), ..., vi=v.
+
+    References
+    ----------
+    .. [1] Zhang, Shanjie and Jin, Jianming. "Computation of Special
+           Functions", John Wiley and Sons, 1996, chapter 13.
+           https://people.sc.fsu.edu/~jburkardt/f77_src/special_functions/special_functions.html
+
+    """
+    if not (isscalar(v) and isscalar(x)):
+        raise ValueError("arguments must be scalars.")
+    n = int(v)
+    v0 = v-n
+    if (n <= 1):
+        n1 = 1
+    else:
+        n1 = n
+    v1 = n1 + v0
+    dv, dp, pdf, pdd = _specfun.pbvv(v1, x)
+    return dv[:n1+1], dp[:n1+1]
+
+
+def pbdn_seq(n, z):
+    """Parabolic cylinder functions Dn(z) and derivatives.
+
+    Parameters
+    ----------
+    n : int
+        Order of the parabolic cylinder function
+    z : complex
+        Value at which to evaluate the function and derivatives
+
+    Returns
+    -------
+    dv : ndarray
+        Values of D_i(z), for i=0, ..., i=n.
+    dp : ndarray
+        Derivatives D_i'(z), for i=0, ..., i=n.
+
+    References
+    ----------
+    .. [1] Zhang, Shanjie and Jin, Jianming. "Computation of Special
+           Functions", John Wiley and Sons, 1996, chapter 13.
+           https://people.sc.fsu.edu/~jburkardt/f77_src/special_functions/special_functions.html
+
+    """
+    if not (isscalar(n) and isscalar(z)):
+        raise ValueError("arguments must be scalars.")
+    if (floor(n) != n):
+        raise ValueError("n must be an integer.")
+    if (abs(n) <= 1):
+        n1 = 1
+    else:
+        n1 = n
+    cpb, cpd = _specfun.cpbdn(n1, z)
+    return cpb[:n1+1], cpd[:n1+1]
+
+
+def ber_zeros(nt):
+    """Compute nt zeros of the Kelvin function ber.
+
+    Parameters
+    ----------
+    nt : int
+        Number of zeros to compute. Must be positive.
+
+    Returns
+    -------
+    ndarray
+        First `nt` zeros of the Kelvin function.
+
+    See Also
+    --------
+    ber
+
+    References
+    ----------
+    .. [1] Zhang, Shanjie and Jin, Jianming. "Computation of Special
+           Functions", John Wiley and Sons, 1996.
+           https://people.sc.fsu.edu/~jburkardt/f77_src/special_functions/special_functions.html
+
+    """
+    if not isscalar(nt) or (floor(nt) != nt) or (nt <= 0):
+        raise ValueError("nt must be positive integer scalar.")
+    return _specfun.klvnzo(nt, 1)
+
+
+def bei_zeros(nt):
+    """Compute nt zeros of the Kelvin function bei.
+
+    Parameters
+    ----------
+    nt : int
+        Number of zeros to compute. Must be positive.
+
+    Returns
+    -------
+    ndarray
+        First `nt` zeros of the Kelvin function.
+
+    See Also
+    --------
+    bei
+
+    References
+    ----------
+    .. [1] Zhang, Shanjie and Jin, Jianming. "Computation of Special
+           Functions", John Wiley and Sons, 1996.
+           https://people.sc.fsu.edu/~jburkardt/f77_src/special_functions/special_functions.html
+
+    """
+    if not isscalar(nt) or (floor(nt) != nt) or (nt <= 0):
+        raise ValueError("nt must be positive integer scalar.")
+    return _specfun.klvnzo(nt, 2)
+
+
+def ker_zeros(nt):
+    """Compute nt zeros of the Kelvin function ker.
+
+    Parameters
+    ----------
+    nt : int
+        Number of zeros to compute. Must be positive.
+
+    Returns
+    -------
+    ndarray
+        First `nt` zeros of the Kelvin function.
+
+    See Also
+    --------
+    ker
+
+    References
+    ----------
+    .. [1] Zhang, Shanjie and Jin, Jianming. "Computation of Special
+           Functions", John Wiley and Sons, 1996.
+           https://people.sc.fsu.edu/~jburkardt/f77_src/special_functions/special_functions.html
+
+    """
+    if not isscalar(nt) or (floor(nt) != nt) or (nt <= 0):
+        raise ValueError("nt must be positive integer scalar.")
+    return _specfun.klvnzo(nt, 3)
+
+
+def kei_zeros(nt):
+    """Compute nt zeros of the Kelvin function kei.
+
+    Parameters
+    ----------
+    nt : int
+        Number of zeros to compute. Must be positive.
+
+    Returns
+    -------
+    ndarray
+        First `nt` zeros of the Kelvin function.
+
+    See Also
+    --------
+    kei
+
+    References
+    ----------
+    .. [1] Zhang, Shanjie and Jin, Jianming. "Computation of Special
+           Functions", John Wiley and Sons, 1996.
+           https://people.sc.fsu.edu/~jburkardt/f77_src/special_functions/special_functions.html
+
+    """
+    if not isscalar(nt) or (floor(nt) != nt) or (nt <= 0):
+        raise ValueError("nt must be positive integer scalar.")
+    return _specfun.klvnzo(nt, 4)
+
+
+def berp_zeros(nt):
+    """Compute nt zeros of the derivative of the Kelvin function ber.
+
+    Parameters
+    ----------
+    nt : int
+        Number of zeros to compute. Must be positive.
+
+    Returns
+    -------
+    ndarray
+        First `nt` zeros of the derivative of the Kelvin function.
+
+    See Also
+    --------
+    ber, berp
+
+    References
+    ----------
+    .. [1] Zhang, Shanjie and Jin, Jianming. "Computation of Special
+           Functions", John Wiley and Sons, 1996.
+           https://people.sc.fsu.edu/~jburkardt/f77_src/special_functions/special_functions.html
+
+    """
+    if not isscalar(nt) or (floor(nt) != nt) or (nt <= 0):
+        raise ValueError("nt must be positive integer scalar.")
+    return _specfun.klvnzo(nt, 5)
+
+
+def beip_zeros(nt):
+    """Compute nt zeros of the derivative of the Kelvin function bei.
+
+    Parameters
+    ----------
+    nt : int
+        Number of zeros to compute. Must be positive.
+
+    Returns
+    -------
+    ndarray
+        First `nt` zeros of the derivative of the Kelvin function.
+
+    See Also
+    --------
+    bei, beip
+
+    References
+    ----------
+    .. [1] Zhang, Shanjie and Jin, Jianming. "Computation of Special
+           Functions", John Wiley and Sons, 1996.
+           https://people.sc.fsu.edu/~jburkardt/f77_src/special_functions/special_functions.html
+
+    """
+    if not isscalar(nt) or (floor(nt) != nt) or (nt <= 0):
+        raise ValueError("nt must be positive integer scalar.")
+    return _specfun.klvnzo(nt, 6)
+
+
+def kerp_zeros(nt):
+    """Compute nt zeros of the derivative of the Kelvin function ker.
+
+    Parameters
+    ----------
+    nt : int
+        Number of zeros to compute. Must be positive.
+
+    Returns
+    -------
+    ndarray
+        First `nt` zeros of the derivative of the Kelvin function.
+
+    See Also
+    --------
+    ker, kerp
+
+    References
+    ----------
+    .. [1] Zhang, Shanjie and Jin, Jianming. "Computation of Special
+           Functions", John Wiley and Sons, 1996.
+           https://people.sc.fsu.edu/~jburkardt/f77_src/special_functions/special_functions.html
+
+    """
+    if not isscalar(nt) or (floor(nt) != nt) or (nt <= 0):
+        raise ValueError("nt must be positive integer scalar.")
+    return _specfun.klvnzo(nt, 7)
+
+
+def keip_zeros(nt):
+    """Compute nt zeros of the derivative of the Kelvin function kei.
+
+    Parameters
+    ----------
+    nt : int
+        Number of zeros to compute. Must be positive.
+
+    Returns
+    -------
+    ndarray
+        First `nt` zeros of the derivative of the Kelvin function.
+
+    See Also
+    --------
+    kei, keip
+
+    References
+    ----------
+    .. [1] Zhang, Shanjie and Jin, Jianming. "Computation of Special
+           Functions", John Wiley and Sons, 1996.
+           https://people.sc.fsu.edu/~jburkardt/f77_src/special_functions/special_functions.html
+
+    """
+    if not isscalar(nt) or (floor(nt) != nt) or (nt <= 0):
+        raise ValueError("nt must be positive integer scalar.")
+    return _specfun.klvnzo(nt, 8)
+
+
+def kelvin_zeros(nt):
+    """Compute nt zeros of all Kelvin functions.
+
+    Returned in a length-8 tuple of arrays of length nt.  The tuple contains
+    the arrays of zeros of (ber, bei, ker, kei, ber', bei', ker', kei').
+
+    References
+    ----------
+    .. [1] Zhang, Shanjie and Jin, Jianming. "Computation of Special
+           Functions", John Wiley and Sons, 1996.
+           https://people.sc.fsu.edu/~jburkardt/f77_src/special_functions/special_functions.html
+
+    """
+    if not isscalar(nt) or (floor(nt) != nt) or (nt <= 0):
+        raise ValueError("nt must be positive integer scalar.")
+    return (_specfun.klvnzo(nt, 1),
+            _specfun.klvnzo(nt, 2),
+            _specfun.klvnzo(nt, 3),
+            _specfun.klvnzo(nt, 4),
+            _specfun.klvnzo(nt, 5),
+            _specfun.klvnzo(nt, 6),
+            _specfun.klvnzo(nt, 7),
+            _specfun.klvnzo(nt, 8))
+
+
+def pro_cv_seq(m, n, c):
+    """Characteristic values for prolate spheroidal wave functions.
+
+    Compute a sequence of characteristic values for the prolate
+    spheroidal wave functions for mode m and n'=m..n and spheroidal
+    parameter c.
+
+    References
+    ----------
+    .. [1] Zhang, Shanjie and Jin, Jianming. "Computation of Special
+           Functions", John Wiley and Sons, 1996.
+           https://people.sc.fsu.edu/~jburkardt/f77_src/special_functions/special_functions.html
+
+    """
+    if not (isscalar(m) and isscalar(n) and isscalar(c)):
+        raise ValueError("Arguments must be scalars.")
+    if (n != floor(n)) or (m != floor(m)):
+        raise ValueError("Modes must be integers.")
+    if (n-m > 199):
+        raise ValueError("Difference between n and m is too large.")
+    maxL = n-m+1
+    return _specfun.segv(m, n, c, 1)[1][:maxL]
+
+
+def obl_cv_seq(m, n, c):
+    """Characteristic values for oblate spheroidal wave functions.
+
+    Compute a sequence of characteristic values for the oblate
+    spheroidal wave functions for mode m and n'=m..n and spheroidal
+    parameter c.
+
+    References
+    ----------
+    .. [1] Zhang, Shanjie and Jin, Jianming. "Computation of Special
+           Functions", John Wiley and Sons, 1996.
+           https://people.sc.fsu.edu/~jburkardt/f77_src/special_functions/special_functions.html
+
+    """
+    if not (isscalar(m) and isscalar(n) and isscalar(c)):
+        raise ValueError("Arguments must be scalars.")
+    if (n != floor(n)) or (m != floor(m)):
+        raise ValueError("Modes must be integers.")
+    if (n-m > 199):
+        raise ValueError("Difference between n and m is too large.")
+    maxL = n-m+1
+    return _specfun.segv(m, n, c, -1)[1][:maxL]
 
 
 @_deprecate_positional_args(version="1.14")
-def pinv(a, *, atol=None, rtol=None, return_rank=False, check_finite=True,
-         cond=_NoValue, rcond=_NoValue):
-    """
-    Compute the (Moore-Penrose) pseudo-inverse of a matrix.
+def comb(N, k, *, exact=False, repetition=False, legacy=_NoValue):
+    """The number of combinations of N things taken k at a time.
 
-    Calculate a generalized inverse of a matrix using its
-    singular-value decomposition ``U @ S @ V`` in the economy mode and picking
-    up only the columns/rows that are associated with significant singular
-    values.
-
-    If ``s`` is the maximum singular value of ``a``, then the
-    significance cut-off value is determined by ``atol + rtol * s``. Any
-    singular value below this value is assumed insignificant.
+    This is often expressed as "N choose k".
 
     Parameters
     ----------
-    a : (M, N) array_like
-        Matrix to be pseudo-inverted.
-    atol : float, optional
-        Absolute threshold term, default value is 0.
+    N : int, ndarray
+        Number of things.
+    k : int, ndarray
+        Number of elements taken.
+    exact : bool, optional
+        For integers, if `exact` is False, then floating point precision is
+        used, otherwise the result is computed exactly. For non-integers, if
+        `exact` is True, is disregarded.
+    repetition : bool, optional
+        If `repetition` is True, then the number of combinations with
+        repetition is computed.
+    legacy : bool, optional
+        If `legacy` is True and `exact` is True, then non-integral arguments
+        are cast to ints; if `legacy` is False, the result for non-integral
+        arguments is unaffected by the value of `exact`.
 
-        .. versionadded:: 1.7.0
-
-    rtol : float, optional
-        Relative threshold term, default value is ``max(M, N) * eps`` where
-        ``eps`` is the machine precision value of the datatype of ``a``.
-
-        .. versionadded:: 1.7.0
-
-    return_rank : bool, optional
-        If True, return the effective rank of the matrix.
-    check_finite : bool, optional
-        Whether to check that the input matrix contains only finite numbers.
-        Disabling may give a performance gain, but may result in problems
-        (crashes, non-termination) if the inputs do contain infinities or NaNs.
-    cond, rcond : float, optional
-        In older versions, these values were meant to be used as ``atol`` with
-        ``rtol=0``. If both were given ``rcond`` overwrote ``cond`` and hence
-        the code was not correct. Thus using these are strongly discouraged and
-        the tolerances above are recommended instead. In fact, if provided,
-        atol, rtol takes precedence over these keywords.
-
-        .. deprecated:: 1.7.0
-            Deprecated in favor of ``rtol`` and ``atol`` parameters above and
-            will be removed in SciPy 1.14.0.
-
-        .. versionchanged:: 1.3.0
-            Previously the default cutoff value was just ``eps*f`` where ``f``
-            was ``1e3`` for single precision and ``1e6`` for double precision.
+        .. deprecated:: 1.9.0
+            Using `legacy` is deprecated and will removed by
+            Scipy 1.14.0. If you want to keep the legacy behaviour, cast
+            your inputs directly, e.g.
+            ``comb(int(your_N), int(your_k), exact=True)``.
 
     Returns
     -------
-    B : (N, M) ndarray
-        The pseudo-inverse of matrix `a`.
-    rank : int
-        The effective rank of the matrix. Returned if `return_rank` is True.
-
-    Raises
-    ------
-    LinAlgError
-        If SVD computation does not converge.
+    val : int, float, ndarray
+        The total number of combinations.
 
     See Also
     --------
-    pinvh : Moore-Penrose pseudoinverse of a hermitian matrix.
+    binom : Binomial coefficient considered as a function of two real
+            variables.
 
     Notes
     -----
-    If ``A`` is invertible then the Moore-Penrose pseudoinverse is exactly
-    the inverse of ``A`` [1]_. If ``A`` is not invertible then the
-    Moore-Penrose pseudoinverse computes the ``x`` solution to ``Ax = b`` such
-    that ``||Ax - b||`` is minimized [1]_.
-
-    References
-    ----------
-    .. [1] Penrose, R. (1956). On best approximate solutions of linear matrix
-           equations. Mathematical Proceedings of the Cambridge Philosophical
-           Society, 52(1), 17-19. doi:10.1017/S0305004100030929
+    - Array arguments accepted only for exact=False case.
+    - If N < 0, or k < 0, then 0 is returned.
+    - If k > N and repetition=False, then 0 is returned.
 
     Examples
     --------
-
-    Given an ``m x n`` matrix ``A`` and an ``n x m`` matrix ``B`` the four
-    Moore-Penrose conditions are:
-
-    1. ``ABA = A`` (``B`` is a generalized inverse of ``A``),
-    2. ``BAB = B`` (``A`` is a generalized inverse of ``B``),
-    3. ``(AB)* = AB`` (``AB`` is hermitian),
-    4. ``(BA)* = BA`` (``BA`` is hermitian) [1]_.
-
-    Here, ``A*`` denotes the conjugate transpose. The Moore-Penrose
-    pseudoinverse is a unique ``B`` that satisfies all four of these
-    conditions and exists for any ``A``. Note that, unlike the standard
-    matrix inverse, ``A`` does not have to be a square matrix or have
-    linearly independent columns/rows.
-
-    As an example, we can calculate the Moore-Penrose pseudoinverse of a
-    random non-square matrix and verify it satisfies the four conditions.
-
     >>> import numpy as np
-    >>> from scipy import linalg
-    >>> rng = np.random.default_rng()
-    >>> A = rng.standard_normal((9, 6))
-    >>> B = linalg.pinv(A)
-    >>> np.allclose(A @ B @ A, A)  # Condition 1
-    True
-    >>> np.allclose(B @ A @ B, B)  # Condition 2
-    True
-    >>> np.allclose((A @ B).conj().T, A @ B)  # Condition 3
-    True
-    >>> np.allclose((B @ A).conj().T, B @ A)  # Condition 4
-    True
+    >>> from scipy.special import comb
+    >>> k = np.array([3, 4])
+    >>> n = np.array([10, 10])
+    >>> comb(n, k, exact=False)
+    array([ 120.,  210.])
+    >>> comb(10, 3, exact=True)
+    120
+    >>> comb(10, 3, exact=True, repetition=True)
+    220
 
     """
-    a = _asarray_validated(a, check_finite=check_finite)
-    u, s, vh = _decomp_svd.svd(a, full_matrices=False, check_finite=False)
-    t = u.dtype.char.lower()
-    maxS = np.max(s)
-
-    if rcond is not _NoValue or cond is not _NoValue:
-        warn('Use of the "cond" and "rcond" keywords are deprecated and '
-             'will be removed in SciPy 1.14.0. Use "atol" and '
-             '"rtol" keywords instead', DeprecationWarning, stacklevel=2)
-
-    # backwards compatible only atol and rtol are both missing
-    if ((rcond not in (_NoValue, None) or cond not in (_NoValue, None))
-            and (atol is None) and (rtol is None)):
-        atol = rcond if rcond not in (_NoValue, None) else cond
-        rtol = 0.
-
-    atol = 0. if atol is None else atol
-    rtol = max(a.shape) * np.finfo(t).eps if (rtol is None) else rtol
-
-    if (atol < 0.) or (rtol < 0.):
-        raise ValueError("atol and rtol values must be positive.")
-
-    val = atol + maxS * rtol
-    rank = np.sum(s > val)
-
-    u = u[:, :rank]
-    u /= s[:rank]
-    B = (u @ vh[:rank]).conj().T
-
-    if return_rank:
-        return B, rank
+    if legacy is not _NoValue:
+        warnings.warn(
+            "Using 'legacy' keyword is deprecated and will be removed by "
+            "Scipy 1.14.0. If you want to keep the legacy behaviour, cast "
+            "your inputs directly, e.g. "
+            "'comb(int(your_N), int(your_k), exact=True)'.",
+            DeprecationWarning,
+            stacklevel=2
+        )
+    if repetition:
+        return comb(N + k - 1, k, exact=exact, legacy=legacy)
+    if exact:
+        if int(N) == N and int(k) == k:
+            # _comb_int casts inputs to integers, which is safe & intended here
+            return _comb_int(N, k)
+        elif legacy:
+            # here at least one number is not an integer; legacy behavior uses
+            # lossy casts to int
+            return _comb_int(N, k)
+        # otherwise, we disregard `exact=True`; it makes no sense for
+        # non-integral arguments
+        return comb(N, k)
     else:
-        return B
+        k, N = asarray(k), asarray(N)
+        cond = (k <= N) & (N >= 0) & (k >= 0)
+        vals = binom(N, k)
+        if isinstance(vals, np.ndarray):
+            vals[~cond] = 0
+        elif not cond:
+            vals = np.float64(0)
+        return vals
 
 
-def pinvh(a, atol=None, rtol=None, lower=True, return_rank=False,
-          check_finite=True):
-    """
-    Compute the (Moore-Penrose) pseudo-inverse of a Hermitian matrix.
+def perm(N, k, exact=False):
+    """Permutations of N things taken k at a time, i.e., k-permutations of N.
 
-    Calculate a generalized inverse of a complex Hermitian/real symmetric
-    matrix using its eigenvalue decomposition and including all eigenvalues
-    with 'large' absolute value.
+    It's also known as "partial permutations".
 
     Parameters
     ----------
-    a : (N, N) array_like
-        Real symmetric or complex hermetian matrix to be pseudo-inverted
-
-    atol : float, optional
-        Absolute threshold term, default value is 0.
-
-        .. versionadded:: 1.7.0
-
-    rtol : float, optional
-        Relative threshold term, default value is ``N * eps`` where
-        ``eps`` is the machine precision value of the datatype of ``a``.
-
-        .. versionadded:: 1.7.0
-
-    lower : bool, optional
-        Whether the pertinent array data is taken from the lower or upper
-        triangle of `a`. (Default: lower)
-    return_rank : bool, optional
-        If True, return the effective rank of the matrix.
-    check_finite : bool, optional
-        Whether to check that the input matrix contains only finite numbers.
-        Disabling may give a performance gain, but may result in problems
-        (crashes, non-termination) if the inputs do contain infinities or NaNs.
+    N : int, ndarray
+        Number of things.
+    k : int, ndarray
+        Number of elements taken.
+    exact : bool, optional
+        If `exact` is False, then floating point precision is used, otherwise
+        exact long integer is computed.
 
     Returns
     -------
-    B : (N, N) ndarray
-        The pseudo-inverse of matrix `a`.
-    rank : int
-        The effective rank of the matrix.  Returned if `return_rank` is True.
+    val : int, ndarray
+        The number of k-permutations of N.
 
-    Raises
-    ------
-    LinAlgError
-        If eigenvalue algorithm does not converge.
-
-    See Also
-    --------
-    pinv : Moore-Penrose pseudoinverse of a matrix.
+    Notes
+    -----
+    - Array arguments accepted only for exact=False case.
+    - If k > N, N < 0, or k < 0, then a 0 is returned.
 
     Examples
     --------
-
-    For a more detailed example see `pinv`.
-
     >>> import numpy as np
-    >>> from scipy.linalg import pinvh
-    >>> rng = np.random.default_rng()
-    >>> a = rng.standard_normal((9, 6))
-    >>> a = np.dot(a, a.T)
-    >>> B = pinvh(a)
-    >>> np.allclose(a, a @ B @ a)
-    True
-    >>> np.allclose(B, B @ a @ B)
-    True
+    >>> from scipy.special import perm
+    >>> k = np.array([3, 4])
+    >>> n = np.array([10, 10])
+    >>> perm(n, k)
+    array([  720.,  5040.])
+    >>> perm(10, 3, exact=True)
+    720
 
     """
-    a = _asarray_validated(a, check_finite=check_finite)
-    s, u = _decomp.eigh(a, lower=lower, check_finite=False)
-    t = u.dtype.char.lower()
-    maxS = np.max(np.abs(s))
-
-    atol = 0. if atol is None else atol
-    rtol = max(a.shape) * np.finfo(t).eps if (rtol is None) else rtol
-
-    if (atol < 0.) or (rtol < 0.):
-        raise ValueError("atol and rtol values must be positive.")
-
-    val = atol + maxS * rtol
-    above_cutoff = (abs(s) > val)
-
-    psigma_diag = 1.0 / s[above_cutoff]
-    u = u[:, above_cutoff]
-
-    B = (u * psigma_diag) @ u.conj().T
-
-    if return_rank:
-        return B, len(psigma_diag)
+    if exact:
+        if (k > N) or (N < 0) or (k < 0):
+            return 0
+        val = 1
+        for i in range(N - k + 1, N + 1):
+            val *= i
+        return val
     else:
-        return B
+        k, N = asarray(k), asarray(N)
+        cond = (k <= N) & (N >= 0) & (k >= 0)
+        vals = poch(N - k + 1, k)
+        if isinstance(vals, np.ndarray):
+            vals[~cond] = 0
+        elif not cond:
+            vals = np.float64(0)
+        return vals
 
 
-def matrix_balance(A, permute=True, scale=True, separate=False,
-                   overwrite_a=False):
+# https://stackoverflow.com/a/16327037
+def _range_prod(lo, hi, k=1):
     """
-    Compute a diagonal similarity transformation for row/column balancing.
+    Product of a range of numbers spaced k apart (from hi).
 
-    The balancing tries to equalize the row and column 1-norms by applying
-    a similarity transformation such that the magnitude variation of the
-    matrix entries is reflected to the scaling matrices.
+    For k=1, this returns the product of
+    lo * (lo+1) * (lo+2) * ... * (hi-2) * (hi-1) * hi
+    = hi! / (lo-1)!
 
-    Moreover, if enabled, the matrix is first permuted to isolate the upper
-    triangular parts of the matrix and, again if scaling is also enabled,
-    only the remaining subblocks are subjected to scaling.
+    For k>1, it correspond to taking only every k'th number when
+    counting down from hi - e.g. 18!!!! = _range_prod(1, 18, 4).
 
-    The balanced matrix satisfies the following equality
+    Breaks into smaller products first for speed:
+    _range_prod(2, 9) = ((2*3)*(4*5))*((6*7)*(8*9))
+    """
+    if lo + k < hi:
+        mid = (hi + lo) // 2
+        if k > 1:
+            # make sure mid is a multiple of k away from hi
+            mid = mid - ((mid - hi) % k)
+        return _range_prod(lo, mid, k) * _range_prod(mid + k, hi, k)
+    elif lo + k == hi:
+        return lo * hi
+    else:
+        return hi
+
+
+def _factorialx_array_exact(n, k=1):
+    """
+    Exact computation of factorial for an array.
+
+    The factorials are computed in incremental fashion, by taking
+    the sorted unique values of n and multiplying the intervening
+    numbers between the different unique values.
+
+    In other words, the factorial for the largest input is only
+    computed once, with each other result computed in the process.
+
+    k > 1 corresponds to the multifactorial.
+    """
+    un = np.unique(n)
+    # numpy changed nan-sorting behaviour with 1.21, see numpy/numpy#18070;
+    # to unify the behaviour, we remove the nan's here; the respective
+    # values will be set separately at the end
+    un = un[~np.isnan(un)]
+
+    # Convert to object array if np.int64 can't handle size
+    if np.isnan(n).any():
+        dt = float
+    elif k in _FACTORIALK_LIMITS_64BITS.keys():
+        if un[-1] > _FACTORIALK_LIMITS_64BITS[k]:
+            # e.g. k=1: 21! > np.iinfo(np.int64).max
+            dt = object
+        elif un[-1] > _FACTORIALK_LIMITS_32BITS[k]:
+            # e.g. k=3: 26!!! > np.iinfo(np.int32).max
+            dt = np.int64
+        else:
+            dt = np.dtype("long")
+    else:
+        # for k >= 10, we always use object
+        dt = object
+
+    out = np.empty_like(n, dtype=dt)
+
+    # Handle invalid/trivial values
+    un = un[un > 1]
+    out[n < 2] = 1
+    out[n < 0] = 0
+
+    # Calculate products of each range of numbers
+    # we can only multiply incrementally if the values are k apart;
+    # therefore we partition `un` into "lanes", i.e. its residues modulo k
+    for lane in range(0, k):
+        ul = un[(un % k) == lane] if k > 1 else un
+        if ul.size:
+            # after np.unique, un resp. ul are sorted, ul[0] is the smallest;
+            # cast to python ints to avoid overflow with np.int-types
+            val = _range_prod(1, int(ul[0]), k=k)
+            out[n == ul[0]] = val
+            for i in range(len(ul) - 1):
+                # by the filtering above, we have ensured that prev & current
+                # are a multiple of k apart
+                prev = ul[i]
+                current = ul[i + 1]
+                # we already multiplied all factors until prev; continue
+                # building the full factorial from the following (`prev + 1`);
+                # use int() for the same reason as above
+                val *= _range_prod(int(prev + 1), int(current), k=k)
+                out[n == current] = val
+
+    if np.isnan(n).any():
+        out = out.astype(np.float64)
+        out[np.isnan(n)] = np.nan
+    return out
+
+
+def _factorialx_array_approx(n, k):
+    """
+    Calculate approximation to multifactorial for array n and integer k.
+
+    Ensure we only call _factorialx_approx_core where necessary/required.
+    """
+    result = zeros(n.shape)
+    # keep nans as nans
+    place(result, np.isnan(n), np.nan)
+    # only compute where n >= 0 (excludes nans), everything else is 0
+    cond = (n >= 0)
+    n_to_compute = extract(cond, n)
+    place(result, cond, _factorialx_approx_core(n_to_compute, k=k))
+    return result
+
+
+def _factorialx_approx_core(n, k):
+    """
+    Core approximation to multifactorial for array n and integer k.
+    """
+    if k == 1:
+        # shortcut for k=1
+        result = gamma(n + 1)
+        if isinstance(n, np.ndarray):
+            # gamma does not maintain 0-dim arrays
+            result = np.array(result)
+        return result
+
+    n_mod_k = n % k
+    # scalar case separately, unified handling would be inefficient for arrays;
+    # don't use isscalar due to numpy/numpy#23574; 0-dim arrays treated below
+    if not isinstance(n, np.ndarray):
+        return (
+            np.power(k, (n - n_mod_k) / k)
+            * gamma(n / k + 1) / gamma(n_mod_k / k + 1)
+            * max(n_mod_k, 1)
+        )
+
+    # factor that's independent of the residue class (see factorialk docstring)
+    result = np.power(k, n / k) * gamma(n / k + 1)
+    # factor dependent on residue r (for `r=0` it's 1, so we skip `r=0`
+    # below and thus also avoid evaluating `max(r, 1)`)
+    def corr(k, r): return np.power(k, -r / k) / gamma(r / k + 1) * r
+    for r in np.unique(n_mod_k):
+        if r == 0:
+            continue
+        # cast to int because uint types break on `-r`
+        result[n_mod_k == r] *= corr(k, int(r))
+    return result
+
+
+def factorial(n, exact=False):
+    """
+    The factorial of a number or array of numbers.
+
+    The factorial of non-negative integer `n` is the product of all
+    positive integers less than or equal to `n`::
+
+        n! = n * (n - 1) * (n - 2) * ... * 1
+
+    Parameters
+    ----------
+    n : int or array_like of ints
+        Input values.  If ``n < 0``, the return value is 0.
+    exact : bool, optional
+        If True, calculate the answer exactly using long integer arithmetic.
+        If False, result is approximated in floating point rapidly using the
+        `gamma` function.
+        Default is False.
+
+    Returns
+    -------
+    nf : float or int or ndarray
+        Factorial of `n`, as integer or float depending on `exact`.
+
+    Notes
+    -----
+    For arrays with ``exact=True``, the factorial is computed only once, for
+    the largest input, with each other result computed in the process.
+    The output dtype is increased to ``int64`` or ``object`` if necessary.
+
+    With ``exact=False`` the factorial is approximated using the gamma
+    function:
+
+    .. math:: n! = \\Gamma(n+1)
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from scipy.special import factorial
+    >>> arr = np.array([3, 4, 5])
+    >>> factorial(arr, exact=False)
+    array([   6.,   24.,  120.])
+    >>> factorial(arr, exact=True)
+    array([  6,  24, 120])
+    >>> factorial(5, exact=True)
+    120
+
+    """
+    # don't use isscalar due to numpy/numpy#23574; 0-dim arrays treated below
+    if np.ndim(n) == 0 and not isinstance(n, np.ndarray):
+        # scalar cases
+        if n is None or np.isnan(n):
+            return np.nan
+        elif not (np.issubdtype(type(n), np.integer)
+                  or np.issubdtype(type(n), np.floating)):
+            raise ValueError(
+                f"Unsupported datatype for factorial: {type(n)}\n"
+                "Permitted data types are integers and floating point numbers"
+            )
+        elif n < 0:
+            return 0
+        elif exact and np.issubdtype(type(n), np.integer):
+            return math.factorial(n)
+        elif exact:
+            msg = ("Non-integer values of `n` together with `exact=True` are "
+                   "deprecated. Either ensure integer `n` or use `exact=False`.")
+            warnings.warn(msg, DeprecationWarning, stacklevel=2)
+        return _factorialx_approx_core(n, k=1)
+
+    # arrays & array-likes
+    n = asarray(n)
+    if n.size == 0:
+        # return empty arrays unchanged
+        return n
+    if not (np.issubdtype(n.dtype, np.integer)
+            or np.issubdtype(n.dtype, np.floating)):
+        raise ValueError(
+            f"Unsupported datatype for factorial: {n.dtype}\n"
+            "Permitted data types are integers and floating point numbers"
+        )
+    if exact and not np.issubdtype(n.dtype, np.integer):
+        msg = ("factorial with `exact=True` does not "
+               "support non-integral arrays")
+        raise ValueError(msg)
+
+    if exact:
+        return _factorialx_array_exact(n, k=1)
+    return _factorialx_array_approx(n, k=1)
+
+
+def factorial2(n, exact=False):
+    """Double factorial.
+
+    This is the factorial with every second value skipped.  E.g., ``7!! = 7 * 5
+    * 3 * 1``.  It can be approximated numerically as::
+
+      n!! = 2 ** (n / 2) * gamma(n / 2 + 1) * sqrt(2 / pi)  n odd
+          = 2 ** (n / 2) * gamma(n / 2 + 1)                 n even
+          = 2 ** (n / 2) * (n / 2)!                         n even
+
+    Parameters
+    ----------
+    n : int or array_like
+        Calculate ``n!!``.  If ``n < 0``, the return value is 0.
+    exact : bool, optional
+        The result can be approximated rapidly using the gamma-formula
+        above (default).  If `exact` is set to True, calculate the
+        answer exactly using integer arithmetic.
+
+    Returns
+    -------
+    nff : float or int
+        Double factorial of `n`, as an int or a float depending on
+        `exact`.
+
+    Examples
+    --------
+    >>> from scipy.special import factorial2
+    >>> factorial2(7, exact=False)
+    array(105.00000000000001)
+    >>> factorial2(7, exact=True)
+    105
+
+    """
+
+    # don't use isscalar due to numpy/numpy#23574; 0-dim arrays treated below
+    if np.ndim(n) == 0 and not isinstance(n, np.ndarray):
+        # scalar cases
+        if n is None or np.isnan(n):
+            return np.nan
+        elif not np.issubdtype(type(n), np.integer):
+            msg = "factorial2 does not support non-integral scalar arguments"
+            raise ValueError(msg)
+        elif n < 0:
+            return 0
+        elif n in {0, 1}:
+            return 1
+        # general integer case
+        if exact:
+            return _range_prod(1, n, k=2)
+        return _factorialx_approx_core(n, k=2)
+    # arrays & array-likes
+    n = asarray(n)
+    if n.size == 0:
+        # return empty arrays unchanged
+        return n
+    if not np.issubdtype(n.dtype, np.integer):
+        raise ValueError("factorial2 does not support non-integral arrays")
+    if exact:
+        return _factorialx_array_exact(n, k=2)
+    return _factorialx_array_approx(n, k=2)
+
+
+def factorialk(n, k, exact=None):
+    """Multifactorial of n of order k, n(!!...!).
+
+    This is the multifactorial of n skipping k values.  For example,
+
+      factorialk(17, 4) = 17!!!! = 17 * 13 * 9 * 5 * 1
+
+    In particular, for any integer ``n``, we have
+
+      factorialk(n, 1) = factorial(n)
+
+      factorialk(n, 2) = factorial2(n)
+
+    Parameters
+    ----------
+    n : int or array_like
+        Calculate multifactorial. If ``n < 0``, the return value is 0.
+    k : int
+        Order of multifactorial.
+    exact : bool, optional
+        If exact is set to True, calculate the answer exactly using
+        integer arithmetic, otherwise use an approximation (faster,
+        but yields floats instead of integers)
+
+        .. warning::
+           The default value for ``exact`` will be changed to
+           ``False`` in SciPy 1.15.0.
+
+    Returns
+    -------
+    val : int
+        Multifactorial of `n`.
+
+    Examples
+    --------
+    >>> from scipy.special import factorialk
+    >>> factorialk(5, k=1, exact=True)
+    120
+    >>> factorialk(5, k=3, exact=True)
+    10
+    >>> factorialk([5, 7, 9], k=3, exact=True)
+    array([ 10,  28, 162])
+    >>> factorialk([5, 7, 9], k=3, exact=False)
+    array([ 10.,  28., 162.])
+
+    Notes
+    -----
+    While less straight-forward than for the double-factorial, it's possible to
+    calculate a general approximation formula of n!(k) by studying ``n`` for a given
+    remainder ``r < k`` (thus ``n = m * k + r``, resp. ``r = n % k``), which can be
+    put together into something valid for all integer values ``n >= 0`` & ``k > 0``::
+
+      n!(k) = k ** ((n - r)/k) * gamma(n/k + 1) / gamma(r/k + 1) * max(r, 1)
+
+    This is the basis of the approximation when ``exact=False``. Compare also [1].
+
+    References
+    ----------
+    .. [1] Complex extension to multifactorial
+            https://en.wikipedia.org/wiki/Double_factorial#Alternative_extension_of_the_multifactorial
+    """
+    if not np.issubdtype(type(k), np.integer) or k < 1:
+        raise ValueError(f"k must be a positive integer, received: {k}")
+    if exact is None:
+        msg = (
+            "factorialk will default to `exact=False` starting from SciPy "
+            "1.15.0. To avoid behaviour changes due to this, explicitly "
+            "specify either `exact=False` (faster, returns floats), or the "
+            "past default `exact=True` (slower, lossless result as integer)."
+        )
+        warnings.warn(msg, DeprecationWarning, stacklevel=2)
+        exact = True
+
+    helpmsg = ""
+    if k in {1, 2}:
+        func = "factorial" if k == 1 else "factorial2"
+        helpmsg = f"\nYou can try to use {func} instead"
+
+    # don't use isscalar due to numpy/numpy#23574; 0-dim arrays treated below
+    if np.ndim(n) == 0 and not isinstance(n, np.ndarray):
+        # scalar cases
+        if n is None or np.isnan(n):
+            return np.nan
+        elif not np.issubdtype(type(n), np.integer):
+            msg = "factorialk does not support non-integral scalar arguments!"
+            raise ValueError(msg + helpmsg)
+        elif n < 0:
+            return 0
+        elif n in {0, 1}:
+            return 1
+        # general integer case
+        if exact:
+            return _range_prod(1, n, k=k)
+        return _factorialx_approx_core(n, k=k)
+    # arrays & array-likes
+    n = asarray(n)
+    if n.size == 0:
+        # return empty arrays unchanged
+        return n
+    if not np.issubdtype(n.dtype, np.integer):
+        msg = "factorialk does not support non-integral arrays!"
+        raise ValueError(msg + helpmsg)
+    if exact:
+        return _factorialx_array_exact(n, k=k)
+    return _factorialx_array_approx(n, k=k)
+
+
+def stirling2(N, K, *, exact=False):
+    r"""Generate Stirling number(s) of the second kind.
+
+    Stirling numbers of the second kind count the number of ways to
+    partition a set with N elements into K non-empty subsets.
+
+    The values this function returns are calculated using a dynamic
+    program which avoids redundant computation across the subproblems
+    in the solution. For array-like input, this implementation also
+    avoids redundant computation across the different Stirling number
+    calculations.
+
+    The numbers are sometimes denoted
 
     .. math::
 
-                        B = T^{-1} A T
+        {N \brace{K}}
 
-    The scaling coefficients are approximated to the nearest power of 2
-    to avoid round-off errors.
-
-    Parameters
-    ----------
-    A : (n, n) array_like
-        Square data matrix for the balancing.
-    permute : bool, optional
-        The selector to define whether permutation of A is also performed
-        prior to scaling.
-    scale : bool, optional
-        The selector to turn on and off the scaling. If False, the matrix
-        will not be scaled.
-    separate : bool, optional
-        This switches from returning a full matrix of the transformation
-        to a tuple of two separate 1-D permutation and scaling arrays.
-    overwrite_a : bool, optional
-        This is passed to xGEBAL directly. Essentially, overwrites the result
-        to the data. It might increase the space efficiency. See LAPACK manual
-        for details. This is False by default.
-
-    Returns
-    -------
-    B : (n, n) ndarray
-        Balanced matrix
-    T : (n, n) ndarray
-        A possibly permuted diagonal matrix whose nonzero entries are
-        integer powers of 2 to avoid numerical truncation errors.
-    scale, perm : (n,) ndarray
-        If ``separate`` keyword is set to True then instead of the array
-        ``T`` above, the scaling and the permutation vectors are given
-        separately as a tuple without allocating the full array ``T``.
-
-    Notes
-    -----
-    This algorithm is particularly useful for eigenvalue and matrix
-    decompositions and in many cases it is already called by various
-    LAPACK routines.
-
-    The algorithm is based on the well-known technique of [1]_ and has
-    been modified to account for special cases. See [2]_ for details
-    which have been implemented since LAPACK v3.5.0. Before this version
-    there are corner cases where balancing can actually worsen the
-    conditioning. See [3]_ for such examples.
-
-    The code is a wrapper around LAPACK's xGEBAL routine family for matrix
-    balancing.
-
-    .. versionadded:: 0.19.0
-
-    References
-    ----------
-    .. [1] B.N. Parlett and C. Reinsch, "Balancing a Matrix for
-       Calculation of Eigenvalues and Eigenvectors", Numerische Mathematik,
-       Vol.13(4), 1969, :doi:`10.1007/BF02165404`
-    .. [2] R. James, J. Langou, B.R. Lowery, "On matrix balancing and
-       eigenvector computation", 2014, :arxiv:`1401.5766`
-    .. [3] D.S. Watkins. A case where balancing is harmful.
-       Electron. Trans. Numer. Anal, Vol.23, 2006.
-
-    Examples
-    --------
-    >>> import numpy as np
-    >>> from scipy import linalg
-    >>> x = np.array([[1,2,0], [9,1,0.01], [1,2,10*np.pi]])
-
-    >>> y, permscale = linalg.matrix_balance(x)
-    >>> np.abs(x).sum(axis=0) / np.abs(x).sum(axis=1)
-    array([ 3.66666667,  0.4995005 ,  0.91312162])
-
-    >>> np.abs(y).sum(axis=0) / np.abs(y).sum(axis=1)
-    array([ 1.2       ,  1.27041742,  0.92658316])  # may vary
-
-    >>> permscale  # only powers of 2 (0.5 == 2^(-1))
-    array([[  0.5,   0. ,  0. ],  # may vary
-           [  0. ,   1. ,  0. ],
-           [  0. ,   0. ,  1. ]])
-
-    """
-
-    A = np.atleast_2d(_asarray_validated(A, check_finite=True))
-
-    if not np.equal(*A.shape):
-        raise ValueError('The data matrix for balancing should be square.')
-
-    gebal = get_lapack_funcs(('gebal'), (A,))
-    B, lo, hi, ps, info = gebal(A, scale=scale, permute=permute,
-                                overwrite_a=overwrite_a)
-
-    if info < 0:
-        raise ValueError('xGEBAL exited with the internal error '
-                         f'"illegal value in argument number {-info}.". See '
-                         'LAPACK documentation for the xGEBAL error codes.')
-
-    # Separate the permutations from the scalings and then convert to int
-    scaling = np.ones_like(ps, dtype=float)
-    scaling[lo:hi+1] = ps[lo:hi+1]
-
-    # gebal uses 1-indexing
-    ps = ps.astype(int, copy=False) - 1
-    n = A.shape[0]
-    perm = np.arange(n)
-
-    # LAPACK permutes with the ordering n --> hi, then 0--> lo
-    if hi < n:
-        for ind, x in enumerate(ps[hi+1:][::-1], 1):
-            if n-ind == x:
-                continue
-            perm[[x, n-ind]] = perm[[n-ind, x]]
-
-    if lo > 0:
-        for ind, x in enumerate(ps[:lo]):
-            if ind == x:
-                continue
-            perm[[x, ind]] = perm[[ind, x]]
-
-    if separate:
-        return B, (scaling, perm)
-
-    # get the inverse permutation
-    iperm = np.empty_like(perm)
-    iperm[perm] = np.arange(n)
-
-    return B, np.diag(scaling)[iperm, :]
-
-
-def _validate_args_for_toeplitz_ops(c_or_cr, b, check_finite, keep_b_shape,
-                                    enforce_square=True):
-    """Validate arguments and format inputs for toeplitz functions
+    see [1]_ for details. This is often expressed-verbally-as
+    "N subset K".
 
     Parameters
     ----------
-    c_or_cr : array_like or tuple of (array_like, array_like)
-        The vector ``c``, or a tuple of arrays (``c``, ``r``). Whatever the
-        actual shape of ``c``, it will be converted to a 1-D array. If not
-        supplied, ``r = conjugate(c)`` is assumed; in this case, if c[0] is
-        real, the Toeplitz matrix is Hermitian. r[0] is ignored; the first row
-        of the Toeplitz matrix is ``[c[0], r[1:]]``. Whatever the actual shape
-        of ``r``, it will be converted to a 1-D array.
-    b : (M,) or (M, K) array_like
-        Right-hand side in ``T x = b``.
-    check_finite : bool
-        Whether to check that the input matrices contain only finite numbers.
-        Disabling may give a performance gain, but may result in problems
-        (result entirely NaNs) if the inputs do contain infinities or NaNs.
-    keep_b_shape : bool
-        Whether to convert a (M,) dimensional b into a (M, 1) dimensional
-        matrix.
-    enforce_square : bool, optional
-        If True (default), this verifies that the Toeplitz matrix is square.
+    N : int, ndarray
+        Number of things.
+    K : int, ndarray
+        Number of non-empty subsets taken.
+    exact : bool, optional
+        Uses dynamic programming (DP) with floating point
+        numbers for smaller arrays and uses a second order approximation due to
+        Temme for larger entries  of `N` and `K` that allows trading speed for
+        accuracy. See [2]_ for a description. Temme approximation is used for
+        values `n>50`. The max error from the DP has max relative error
+        `4.5*10^-16` for `n<=50` and the max error from the Temme approximation
+        has max relative error `5*10^-5` for `51 <= n < 70` and
+        `9*10^-6` for `70 <= n < 101`. Note that these max relative errors will
+        decrease further as `n` increases.
 
     Returns
     -------
-    r : array
-        1d array corresponding to the first row of the Toeplitz matrix.
-    c: array
-        1d array corresponding to the first column of the Toeplitz matrix.
-    b: array
-        (M,), (M, 1) or (M, K) dimensional array, post validation,
-        corresponding to ``b``.
-    dtype: numpy datatype
-        ``dtype`` stores the datatype of ``r``, ``c`` and ``b``. If any of
-        ``r``, ``c`` or ``b`` are complex, ``dtype`` is ``np.complex128``,
-        otherwise, it is ``np.float``.
-    b_shape: tuple
-        Shape of ``b`` after passing it through ``_asarray_validated``.
-
-    """
-
-    if isinstance(c_or_cr, tuple):
-        c, r = c_or_cr
-        c = _asarray_validated(c, check_finite=check_finite).ravel()
-        r = _asarray_validated(r, check_finite=check_finite).ravel()
-    else:
-        c = _asarray_validated(c_or_cr, check_finite=check_finite).ravel()
-        r = c.conjugate()
-
-    if b is None:
-        raise ValueError('`b` must be an array, not None.')
-
-    b = _asarray_validated(b, check_finite=check_finite)
-    b_shape = b.shape
-
-    is_not_square = r.shape[0] != c.shape[0]
-    if (enforce_square and is_not_square) or b.shape[0] != r.shape[0]:
-        raise ValueError('Incompatible dimensions.')
-
-    is_cmplx = np.iscomplexobj(r) or np.iscomplexobj(c) or np.iscomplexobj(b)
-    dtype = np.complex128 if is_cmplx else np.float64
-    r, c, b = (np.asarray(i, dtype=dtype) for i in (r, c, b))
-
-    if b.ndim == 1 and not keep_b_shape:
-        b = b.reshape(-1, 1)
-    elif b.ndim != 1:
-        b = b.reshape(b.shape[0], -1)
-
-    return r, c, b, dtype, b_shape
-
-
-def matmul_toeplitz(c_or_cr, x, check_finite=False, workers=None):
-    """Efficient Toeplitz Matrix-Matrix Multiplication using FFT
-
-    This function returns the matrix multiplication between a Toeplitz
-    matrix and a dense matrix.
-
-    The Toeplitz matrix has constant diagonals, with c as its first column
-    and r as its first row. If r is not given, ``r == conjugate(c)`` is
-    assumed.
-
-    Parameters
-    ----------
-    c_or_cr : array_like or tuple of (array_like, array_like)
-        The vector ``c``, or a tuple of arrays (``c``, ``r``). Whatever the
-        actual shape of ``c``, it will be converted to a 1-D array. If not
-        supplied, ``r = conjugate(c)`` is assumed; in this case, if c[0] is
-        real, the Toeplitz matrix is Hermitian. r[0] is ignored; the first row
-        of the Toeplitz matrix is ``[c[0], r[1:]]``. Whatever the actual shape
-        of ``r``, it will be converted to a 1-D array.
-    x : (M,) or (M, K) array_like
-        Matrix with which to multiply.
-    check_finite : bool, optional
-        Whether to check that the input matrices contain only finite numbers.
-        Disabling may give a performance gain, but may result in problems
-        (result entirely NaNs) if the inputs do contain infinities or NaNs.
-    workers : int, optional
-        To pass to scipy.fft.fft and ifft. Maximum number of workers to use
-        for parallel computation. If negative, the value wraps around from
-        ``os.cpu_count()``. See scipy.fft.fft for more details.
-
-    Returns
-    -------
-    T @ x : (M,) or (M, K) ndarray
-        The result of the matrix multiplication ``T @ x``. Shape of return
-        matches shape of `x`.
+    val : int, float, ndarray
+        The number of partitions.
 
     See Also
     --------
-    toeplitz : Toeplitz matrix
-    solve_toeplitz : Solve a Toeplitz system using Levinson Recursion
+    comb : The number of combinations of N things taken k at a time.
 
     Notes
     -----
-    The Toeplitz matrix is embedded in a circulant matrix and the FFT is used
-    to efficiently calculate the matrix-matrix product.
+    - If N < 0, or K < 0, then 0 is returned.
+    - If K > N, then 0 is returned.
 
-    Because the computation is based on the FFT, integer inputs will
-    result in floating point outputs.  This is unlike NumPy's `matmul`,
-    which preserves the data type of the input.
-
-    This is partly based on the implementation that can be found in [1]_,
-    licensed under the MIT license. More information about the method can be
-    found in reference [2]_. References [3]_ and [4]_ have more reference
-    implementations in Python.
-
-    .. versionadded:: 1.6.0
+    The output type will always be `int` or ndarray of `object`.
+    The input must contain either numpy or python integers otherwise a
+    TypeError is raised.
 
     References
     ----------
-    .. [1] Jacob R Gardner, Geoff Pleiss, David Bindel, Kilian
-       Q Weinberger, Andrew Gordon Wilson, "GPyTorch: Blackbox Matrix-Matrix
-       Gaussian Process Inference with GPU Acceleration" with contributions
-       from Max Balandat and Ruihan Wu. Available online:
-       https://github.com/cornellius-gp/gpytorch
+    .. [1] R. L. Graham, D. E. Knuth and O. Patashnik, "Concrete
+        Mathematics: A Foundation for Computer Science," Addison-Wesley
+        Publishing Company, Boston, 1989. Chapter 6, page 258.
 
-    .. [2] J. Demmel, P. Koev, and X. Li, "A Brief Survey of Direct Linear
-       Solvers". In Z. Bai, J. Demmel, J. Dongarra, A. Ruhe, and H. van der
-       Vorst, editors. Templates for the Solution of Algebraic Eigenvalue
-       Problems: A Practical Guide. SIAM, Philadelphia, 2000. Available at:
-       http://www.netlib.org/utk/people/JackDongarra/etemplates/node384.html
-
-    .. [3] R. Scheibler, E. Bezzam, I. Dokmanic, Pyroomacoustics: A Python
-       package for audio room simulations and array processing algorithms,
-       Proc. IEEE ICASSP, Calgary, CA, 2018.
-       https://github.com/LCAV/pyroomacoustics/blob/pypi-release/
-       pyroomacoustics/adaptive/util.py
-
-    .. [4] Marano S, Edwards B, Ferrari G and Fah D (2017), "Fitting
-       Earthquake Spectra: Colored Noise and Incomplete Data", Bulletin of
-       the Seismological Society of America., January, 2017. Vol. 107(1),
-       pp. 276-291.
+    .. [2] Temme, Nico M. "Asymptotic estimates of Stirling numbers."
+        Studies in Applied Mathematics 89.3 (1993): 233-243.
 
     Examples
     --------
-    Multiply the Toeplitz matrix T with matrix x::
-
-            [ 1 -1 -2 -3]       [1 10]
-        T = [ 3  1 -1 -2]   x = [2 11]
-            [ 6  3  1 -1]       [2 11]
-            [10  6  3  1]       [5 19]
-
-    To specify the Toeplitz matrix, only the first column and the first
-    row are needed.
-
     >>> import numpy as np
-    >>> c = np.array([1, 3, 6, 10])    # First column of T
-    >>> r = np.array([1, -1, -2, -3])  # First row of T
-    >>> x = np.array([[1, 10], [2, 11], [2, 11], [5, 19]])
-
-    >>> from scipy.linalg import toeplitz, matmul_toeplitz
-    >>> matmul_toeplitz((c, r), x)
-    array([[-20., -80.],
-           [ -7.,  -8.],
-           [  9.,  85.],
-           [ 33., 218.]])
-
-    Check the result by creating the full Toeplitz matrix and
-    multiplying it by ``x``.
-
-    >>> toeplitz(c, r) @ x
-    array([[-20, -80],
-           [ -7,  -8],
-           [  9,  85],
-           [ 33, 218]])
-
-    The full matrix is never formed explicitly, so this routine
-    is suitable for very large Toeplitz matrices.
-
-    >>> n = 1000000
-    >>> matmul_toeplitz([1] + [0]*(n-1), np.ones(n))
-    array([1., 1., 1., ..., 1., 1., 1.])
+    >>> from scipy.special import stirling2
+    >>> k = np.array([3, -1, 3])
+    >>> n = np.array([10, 10, 9])
+    >>> stirling2(n, k)
+    array([9330, 0, 3025], dtype=object)
 
     """
+    output_is_scalar = np.isscalar(N) and np.isscalar(K)
+    # make a min-heap of unique (n,k) pairs
+    N, K = asarray(N), asarray(K)
+    if not np.issubdtype(N.dtype, np.integer):
+        raise TypeError("Argument `N` must contain only integers")
+    if not np.issubdtype(K.dtype, np.integer):
+        raise TypeError("Argument `K` must contain only integers")
+    if not exact:
+        # NOTE: here we allow np.uint via casting to double types prior to
+        # passing to private ufunc dispatcher. All dispatched functions
+        # take double type for (n,k) arguments and return double.
+        return _stirling2_inexact(N.astype(float), K.astype(float))
+    nk_pairs = list(
+        set([(n.take(0), k.take(0))
+             for n, k in np.nditer([N, K], ['refs_ok'])])
+    )
+    heapify(nk_pairs)
+    # base mapping for small values
+    snsk_vals = defaultdict(int)
+    for pair in [(0, 0), (1, 1), (2, 1), (2, 2)]:
+        snsk_vals[pair] = 1
+    # for each pair in the min-heap, calculate the value, store for later
+    n_old, n_row = 2, [0, 1, 1]
+    while nk_pairs:
+        n, k = heappop(nk_pairs)
+        if n < 2 or k > n or k <= 0:
+            continue
+        elif k == n or k == 1:
+            snsk_vals[(n, k)] = 1
+            continue
+        elif n != n_old:
+            num_iters = n - n_old
+            while num_iters > 0:
+                n_row.append(1)
+                # traverse from back to remove second row
+                for j in range(len(n_row)-2, 1, -1):
+                    n_row[j] = n_row[j]*j + n_row[j-1]
+                num_iters -= 1
+            snsk_vals[(n, k)] = n_row[k]
+        else:
+            snsk_vals[(n, k)] = n_row[k]
+        n_old, n_row = n, n_row
+    out_types = [object, object, object] if exact else [float, float, float]
+    # for each pair in the map, fetch the value, and populate the array
+    it = np.nditer(
+        [N, K, None],
+        ['buffered', 'refs_ok'],
+        [['readonly'], ['readonly'], ['writeonly', 'allocate']],
+        op_dtypes=out_types,
+    )
+    with it:
+        while not it.finished:
+            it[2] = snsk_vals[(int(it[0]), int(it[1]))]
+            it.iternext()
+        output = it.operands[2]
+        # If N and K were both scalars, convert output to scalar.
+        if output_is_scalar:
+            output = output.take(0)
+    return output
 
-    from ..fft import fft, ifft, rfft, irfft
 
-    r, c, x, dtype, x_shape = _validate_args_for_toeplitz_ops(
-        c_or_cr, x, check_finite, keep_b_shape=False, enforce_square=False)
-    n, m = x.shape
+def zeta(x, q=None, out=None):
+    r"""
+    Riemann or Hurwitz zeta function.
 
-    T_nrows = len(c)
-    T_ncols = len(r)
-    p = T_nrows + T_ncols - 1  # equivalent to len(embedded_col)
+    Parameters
+    ----------
+    x : array_like of float
+        Input data, must be real
+    q : array_like of float, optional
+        Input data, must be real.  Defaults to Riemann zeta.
+    out : ndarray, optional
+        Output array for the computed values.
 
-    embedded_col = np.concatenate((c, r[-1:0:-1]))
+    Returns
+    -------
+    out : array_like
+        Values of zeta(x).
 
-    if np.iscomplexobj(embedded_col) or np.iscomplexobj(x):
-        fft_mat = fft(embedded_col, axis=0, workers=workers).reshape(-1, 1)
-        fft_x = fft(x, n=p, axis=0, workers=workers)
+    See Also
+    --------
+    zetac
 
-        mat_times_x = ifft(fft_mat*fft_x, axis=0,
-                           workers=workers)[:T_nrows, :]
+    Notes
+    -----
+    The two-argument version is the Hurwitz zeta function
+
+    .. math::
+
+        \zeta(x, q) = \sum_{k=0}^{\infty} \frac{1}{(k + q)^x};
+
+    see [dlmf]_ for details. The Riemann zeta function corresponds to
+    the case when ``q = 1``.
+
+    References
+    ----------
+    .. [dlmf] NIST, Digital Library of Mathematical Functions,
+        https://dlmf.nist.gov/25.11#i
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from scipy.special import zeta, polygamma, factorial
+
+    Some specific values:
+
+    >>> zeta(2), np.pi**2/6
+    (1.6449340668482266, 1.6449340668482264)
+
+    >>> zeta(4), np.pi**4/90
+    (1.0823232337111381, 1.082323233711138)
+
+    Relation to the `polygamma` function:
+
+    >>> m = 3
+    >>> x = 1.25
+    >>> polygamma(m, x)
+    array(2.782144009188397)
+    >>> (-1)**(m+1) * factorial(m) * zeta(m+1, x)
+    2.7821440091883969
+
+    """
+    if q is None:
+        return _ufuncs._riemann_zeta(x, out)
     else:
-        # Real inputs; using rfft is faster
-        fft_mat = rfft(embedded_col, axis=0, workers=workers).reshape(-1, 1)
-        fft_x = rfft(x, n=p, axis=0, workers=workers)
-
-        mat_times_x = irfft(fft_mat*fft_x, axis=0,
-                            workers=workers, n=p)[:T_nrows, :]
-
-    return_shape = (T_nrows,) if len(x_shape) == 1 else (T_nrows, m)
-    return mat_times_x.reshape(*return_shape)
+        return _ufuncs._zeta(x, q, out)
