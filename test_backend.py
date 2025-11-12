@@ -1,98 +1,98 @@
-import sys
-import types
+from functools import partial
 
+import numpy as np
+import scipy.fft
+from scipy.fft import _fftlog, _pocketfft, set_backend
+from scipy.fft.tests import mock_backend
+
+from numpy.testing import assert_allclose, assert_equal
 import pytest
 
-import pandas.util._test_decorators as td
+fnames = ('fft', 'fft2', 'fftn',
+          'ifft', 'ifft2', 'ifftn',
+          'rfft', 'rfft2', 'rfftn',
+          'irfft', 'irfft2', 'irfftn',
+          'dct', 'idct', 'dctn', 'idctn',
+          'dst', 'idst', 'dstn', 'idstn',
+          'fht', 'ifht')
 
-import pandas
+np_funcs = (np.fft.fft, np.fft.fft2, np.fft.fftn,
+            np.fft.ifft, np.fft.ifft2, np.fft.ifftn,
+            np.fft.rfft, np.fft.rfft2, np.fft.rfftn,
+            np.fft.irfft, np.fft.irfft2, np.fft.irfftn,
+            np.fft.hfft, _pocketfft.hfft2, _pocketfft.hfftn,  # np has no hfftn
+            np.fft.ihfft, _pocketfft.ihfft2, _pocketfft.ihfftn,
+            _pocketfft.dct, _pocketfft.idct, _pocketfft.dctn, _pocketfft.idctn,
+            _pocketfft.dst, _pocketfft.idst, _pocketfft.dstn, _pocketfft.idstn,
+            # must provide required kwargs for fht, ifht
+            partial(_fftlog.fht, dln=2, mu=0.5),
+            partial(_fftlog.ifht, dln=2, mu=0.5))
 
+funcs = (scipy.fft.fft, scipy.fft.fft2, scipy.fft.fftn,
+         scipy.fft.ifft, scipy.fft.ifft2, scipy.fft.ifftn,
+         scipy.fft.rfft, scipy.fft.rfft2, scipy.fft.rfftn,
+         scipy.fft.irfft, scipy.fft.irfft2, scipy.fft.irfftn,
+         scipy.fft.hfft, scipy.fft.hfft2, scipy.fft.hfftn,
+         scipy.fft.ihfft, scipy.fft.ihfft2, scipy.fft.ihfftn,
+         scipy.fft.dct, scipy.fft.idct, scipy.fft.dctn, scipy.fft.idctn,
+         scipy.fft.dst, scipy.fft.idst, scipy.fft.dstn, scipy.fft.idstn,
+         # must provide required kwargs for fht, ifht
+         partial(scipy.fft.fht, dln=2, mu=0.5),
+         partial(scipy.fft.ifht, dln=2, mu=0.5))
 
-@pytest.fixture
-def dummy_backend():
-    db = types.ModuleType("pandas_dummy_backend")
-    setattr(db, "plot", lambda *args, **kwargs: "used_dummy")
-    return db
-
-
-@pytest.fixture
-def restore_backend():
-    """Restore the plotting backend to matplotlib"""
-    with pandas.option_context("plotting.backend", "matplotlib"):
-        yield
-
-
-def test_backend_is_not_module():
-    msg = "Could not find plotting backend 'not_an_existing_module'."
-    with pytest.raises(ValueError, match=msg):
-        pandas.set_option("plotting.backend", "not_an_existing_module")
-
-    assert pandas.options.plotting.backend == "matplotlib"
-
-
-def test_backend_is_correct(monkeypatch, restore_backend, dummy_backend):
-    monkeypatch.setitem(sys.modules, "pandas_dummy_backend", dummy_backend)
-
-    pandas.set_option("plotting.backend", "pandas_dummy_backend")
-    assert pandas.get_option("plotting.backend") == "pandas_dummy_backend"
-    assert (
-        pandas.plotting._core._get_plot_backend("pandas_dummy_backend") is dummy_backend
-    )
-
-
-def test_backend_can_be_set_in_plot_call(monkeypatch, restore_backend, dummy_backend):
-    monkeypatch.setitem(sys.modules, "pandas_dummy_backend", dummy_backend)
-    df = pandas.DataFrame([1, 2, 3])
-
-    assert pandas.get_option("plotting.backend") == "matplotlib"
-    assert df.plot(backend="pandas_dummy_backend") == "used_dummy"
-
-
-def test_register_entrypoint(restore_backend, tmp_path, monkeypatch, dummy_backend):
-    monkeypatch.syspath_prepend(tmp_path)
-    monkeypatch.setitem(sys.modules, "pandas_dummy_backend", dummy_backend)
-
-    dist_info = tmp_path / "my_backend-0.0.0.dist-info"
-    dist_info.mkdir()
-    # entry_point name should not match module name - otherwise pandas will
-    # fall back to backend lookup by module name
-    (dist_info / "entry_points.txt").write_bytes(
-        b"[pandas_plotting_backends]\nmy_ep_backend = pandas_dummy_backend\n"
-    )
-
-    assert pandas.plotting._core._get_plot_backend("my_ep_backend") is dummy_backend
-
-    with pandas.option_context("plotting.backend", "my_ep_backend"):
-        assert pandas.plotting._core._get_plot_backend() is dummy_backend
+mocks = (mock_backend.fft, mock_backend.fft2, mock_backend.fftn,
+         mock_backend.ifft, mock_backend.ifft2, mock_backend.ifftn,
+         mock_backend.rfft, mock_backend.rfft2, mock_backend.rfftn,
+         mock_backend.irfft, mock_backend.irfft2, mock_backend.irfftn,
+         mock_backend.hfft, mock_backend.hfft2, mock_backend.hfftn,
+         mock_backend.ihfft, mock_backend.ihfft2, mock_backend.ihfftn,
+         mock_backend.dct, mock_backend.idct,
+         mock_backend.dctn, mock_backend.idctn,
+         mock_backend.dst, mock_backend.idst,
+         mock_backend.dstn, mock_backend.idstn,
+         mock_backend.fht, mock_backend.ifht)
 
 
-def test_setting_backend_without_plot_raises(monkeypatch):
-    # GH-28163
-    module = types.ModuleType("pandas_plot_backend")
-    monkeypatch.setitem(sys.modules, "pandas_plot_backend", module)
+@pytest.mark.parametrize("func, np_func, mock", zip(funcs, np_funcs, mocks))
+def test_backend_call(func, np_func, mock):
+    x = np.arange(20).reshape((10,2))
+    answer = np_func(x.astype(np.float64))
+    assert_allclose(func(x), answer, atol=1e-10)
 
-    assert pandas.options.plotting.backend == "matplotlib"
-    with pytest.raises(
-        ValueError, match="Could not find plotting backend 'pandas_plot_backend'."
-    ):
-        pandas.set_option("plotting.backend", "pandas_plot_backend")
+    with set_backend(mock_backend, only=True):
+        mock.number_calls = 0
+        y = func(x)
+        assert_equal(y, mock.return_value)
+        assert_equal(mock.number_calls, 1)
 
-    assert pandas.options.plotting.backend == "matplotlib"
-
-
-@td.skip_if_installed("matplotlib")
-def test_no_matplotlib_ok():
-    msg = (
-        'matplotlib is required for plotting when the default backend "matplotlib" is '
-        "selected."
-    )
-    with pytest.raises(ImportError, match=msg):
-        pandas.plotting._core._get_plot_backend("matplotlib")
+    assert_allclose(func(x), answer, atol=1e-10)
 
 
-def test_extra_kinds_ok(monkeypatch, restore_backend, dummy_backend):
-    # https://github.com/pandas-dev/pandas/pull/28647
-    monkeypatch.setitem(sys.modules, "pandas_dummy_backend", dummy_backend)
-    pandas.set_option("plotting.backend", "pandas_dummy_backend")
-    df = pandas.DataFrame({"A": [1, 2, 3]})
-    df.plot(kind="not a real kind")
+plan_funcs = (scipy.fft.fft, scipy.fft.fft2, scipy.fft.fftn,
+              scipy.fft.ifft, scipy.fft.ifft2, scipy.fft.ifftn,
+              scipy.fft.rfft, scipy.fft.rfft2, scipy.fft.rfftn,
+              scipy.fft.irfft, scipy.fft.irfft2, scipy.fft.irfftn,
+              scipy.fft.hfft, scipy.fft.hfft2, scipy.fft.hfftn,
+              scipy.fft.ihfft, scipy.fft.ihfft2, scipy.fft.ihfftn)
+
+plan_mocks = (mock_backend.fft, mock_backend.fft2, mock_backend.fftn,
+              mock_backend.ifft, mock_backend.ifft2, mock_backend.ifftn,
+              mock_backend.rfft, mock_backend.rfft2, mock_backend.rfftn,
+              mock_backend.irfft, mock_backend.irfft2, mock_backend.irfftn,
+              mock_backend.hfft, mock_backend.hfft2, mock_backend.hfftn,
+              mock_backend.ihfft, mock_backend.ihfft2, mock_backend.ihfftn)
+
+
+@pytest.mark.parametrize("func, mock", zip(plan_funcs, plan_mocks))
+def test_backend_plan(func, mock):
+    x = np.arange(20).reshape((10, 2))
+
+    with pytest.raises(NotImplementedError, match='precomputed plan'):
+        func(x, plan='foo')
+
+    with set_backend(mock_backend, only=True):
+        mock.number_calls = 0
+        y = func(x, plan='foo')
+        assert_equal(y, mock.return_value)
+        assert_equal(mock.number_calls, 1)
+        assert_equal(mock.last_args[1]['plan'], 'foo')
