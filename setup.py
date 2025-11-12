@@ -1,30 +1,74 @@
-import os
 import numpy
 from numpy.distutils.misc_util import Configuration
 
 
 def configuration(parent_package="", top_path=None):
-    config = Configuration("decomposition", parent_package, top_path)
-
-    libraries = []
-    if os.name == "posix":
-        libraries.append("m")
+    config = Configuration("ensemble", parent_package, top_path)
 
     config.add_extension(
-        "_online_lda_fast",
-        sources=["_online_lda_fast.pyx"],
+        "_gradient_boosting",
+        sources=["_gradient_boosting.pyx"],
         include_dirs=[numpy.get_include()],
-        libraries=libraries,
-    )
-
-    config.add_extension(
-        "_cdnmf_fast",
-        sources=["_cdnmf_fast.pyx"],
-        include_dirs=[numpy.get_include()],
-        libraries=libraries,
     )
 
     config.add_subpackage("tests")
+
+    # Histogram-based gradient boosting files
+    config.add_extension(
+        "_hist_gradient_boosting._gradient_boosting",
+        sources=["_hist_gradient_boosting/_gradient_boosting.pyx"],
+        include_dirs=[numpy.get_include()],
+    )
+
+    config.add_extension(
+        "_hist_gradient_boosting.histogram",
+        sources=["_hist_gradient_boosting/histogram.pyx"],
+        include_dirs=[numpy.get_include()],
+    )
+
+    config.add_extension(
+        "_hist_gradient_boosting.splitting",
+        sources=["_hist_gradient_boosting/splitting.pyx"],
+        include_dirs=[numpy.get_include()],
+    )
+
+    config.add_extension(
+        "_hist_gradient_boosting._binning",
+        sources=["_hist_gradient_boosting/_binning.pyx"],
+        include_dirs=[numpy.get_include()],
+    )
+
+    config.add_extension(
+        "_hist_gradient_boosting._predictor",
+        sources=["_hist_gradient_boosting/_predictor.pyx"],
+        include_dirs=[numpy.get_include()],
+    )
+
+    config.add_extension(
+        "_hist_gradient_boosting._loss",
+        sources=["_hist_gradient_boosting/_loss.pyx"],
+        include_dirs=[numpy.get_include()],
+    )
+
+    config.add_extension(
+        "_hist_gradient_boosting._bitset",
+        sources=["_hist_gradient_boosting/_bitset.pyx"],
+        include_dirs=[numpy.get_include()],
+    )
+
+    config.add_extension(
+        "_hist_gradient_boosting.common",
+        sources=["_hist_gradient_boosting/common.pyx"],
+        include_dirs=[numpy.get_include()],
+    )
+
+    config.add_extension(
+        "_hist_gradient_boosting.utils",
+        sources=["_hist_gradient_boosting/utils.pyx"],
+        include_dirs=[numpy.get_include()],
+    )
+
+    config.add_subpackage("_hist_gradient_boosting.tests")
 
     return config
 

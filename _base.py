@@ -1,156 +1,314 @@
-"""Principal Component Analysis Base Classes"""
+"""Base class for ensemble-based estimators."""
 
-# Author: Alexandre Gramfort <alexandre.gramfort@inria.fr>
-#         Olivier Grisel <olivier.grisel@ensta.org>
-#         Mathieu Blondel <mathieu@mblondel.org>
-#         Denis A. Engemann <denis-alexander.engemann@inria.fr>
-#         Kyle Kastner <kastnerkyle@gmail.com>
-#
+# Authors: Gilles Louppe
 # License: BSD 3 clause
 
-import numpy as np
-from scipy import linalg
-
-from ..base import BaseEstimator, TransformerMixin
-from ..utils.validation import check_is_fitted
 from abc import ABCMeta, abstractmethod
+import numbers
+from typing import List
+
+import numpy as np
+
+from joblib import effective_n_jobs
+
+from ..base import clone
+from ..base import is_classifier, is_regressor
+from ..base import BaseEstimator
+from ..base import MetaEstimatorMixin
+from ..tree import DecisionTreeRegressor, ExtraTreeRegressor
+from ..utils import Bunch, _print_elapsed_time
+from ..utils import check_random_state
+from ..utils.metaestimators import _BaseComposition
 
 
-class _BasePCA(TransformerMixin, BaseEstimator, metaclass=ABCMeta):
-    """Base class for PCA methods.
+def _fit_single_estimator(
+    estimator, X, y, sample_weight=None, message_clsname=None, message=None
+):
+    """Private function used to fit an estimator within a job."""
+    if sample_weight is not None:
+        try:
+            with _print_elapsed_time(message_clsname, message):
+                estimator.fit(X, y, sample_weight=sample_weight)
+        except TypeError as exc:
+            if "unexpected keyword argument 'sample_weight'" in str(exc):
+                raise TypeError(
+                    "Underlying estimator {} does not support sample weights.".format(
+                        estimator.__class__.__name__
+                    )
+                ) from exc
+            raise
+    else:
+        with _print_elapsed_time(message_clsname, message):
+            estimator.fit(X, y)
+    return estimator
 
-    Warning: This class should not be used directly.
-    Use derived classes instead.
+
+def _set_random_states(estimator, random_state=None):
+    """Set fixed random_state parameters for an estimator.
+
+    Finds all parameters ending ``random_state`` and sets them to integers
+    derived from ``random_state``.
+
+    Parameters
+    ----------
+    estimator : estimator supporting get/set_params
+        Estimator with potential randomness managed by random_state
+        parameters.
+
+    random_state : int, RandomState instance or None, default=None
+        Pseudo-random number generator to control the generation of the random
+        integers. Pass an int for reproducible output across multiple function
+        calls.
+        See :term:`Glossary <random_state>`.
+
+    Notes
+    -----
+    This does not necessarily set *all* ``random_state`` attributes that
+    control an estimator's randomness, only those accessible through
+    ``estimator.get_params()``.  ``random_state``s not controlled include
+    those belonging to:
+
+        * cross-validation splitters
+        * ``scipy.stats`` rvs
+    """
+    random_state = check_random_state(random_state)
+    to_set = {}
+    for key in sorted(estimator.get_params(deep=True)):
+        if key == "random_state" or key.endswith("__random_state"):
+            to_set[key] = random_state.randint(np.iinfo(np.int32).max)
+
+    if to_set:
+        estimator.set_params(**to_set)
+
+
+class BaseEnsemble(MetaEstimatorMixin, BaseEstimator, metaclass=ABCMeta):
+    """Base class for all ensemble classes.
+
+    Warning: This class should not be used directly. Use derived classes
+    instead.
+
+    Parameters
+    ----------
+    base_estimator : object
+        The base estimator from which the ensemble is built.
+
+    n_estimators : int, default=10
+        The number of estimators in the ensemble.
+
+    estimator_params : list of str, default=tuple()
+        The list of attributes to use as parameters when instantiating a
+        new base estimator. If none are given, default parameters are used.
+
+    Attributes
+    ----------
+    base_estimator_ : estimator
+        The base estimator from which the ensemble is grown.
+
+    estimators_ : list of estimators
+        The collection of fitted base estimators.
     """
 
-    def get_covariance(self):
-        """Compute data covariance with the generative model.
-
-        ``cov = components_.T * S**2 * components_ + sigma2 * eye(n_features)``
-        where S**2 contains the explained variances, and sigma2 contains the
-        noise variances.
-
-        Returns
-        -------
-        cov : array of shape=(n_features, n_features)
-            Estimated covariance of data.
-        """
-        components_ = self.components_
-        exp_var = self.explained_variance_
-        if self.whiten:
-            components_ = components_ * np.sqrt(exp_var[:, np.newaxis])
-        exp_var_diff = np.maximum(exp_var - self.noise_variance_, 0.0)
-        cov = np.dot(components_.T * exp_var_diff, components_)
-        cov.flat[:: len(cov) + 1] += self.noise_variance_  # modify diag inplace
-        return cov
-
-    def get_precision(self):
-        """Compute data precision matrix with the generative model.
-
-        Equals the inverse of the covariance but computed with
-        the matrix inversion lemma for efficiency.
-
-        Returns
-        -------
-        precision : array, shape=(n_features, n_features)
-            Estimated precision of data.
-        """
-        n_features = self.components_.shape[1]
-
-        # handle corner cases first
-        if self.n_components_ == 0:
-            return np.eye(n_features) / self.noise_variance_
-        if self.n_components_ == n_features:
-            return linalg.inv(self.get_covariance())
-
-        # Get precision using matrix inversion lemma
-        components_ = self.components_
-        exp_var = self.explained_variance_
-        if self.whiten:
-            components_ = components_ * np.sqrt(exp_var[:, np.newaxis])
-        exp_var_diff = np.maximum(exp_var - self.noise_variance_, 0.0)
-        precision = np.dot(components_, components_.T) / self.noise_variance_
-        precision.flat[:: len(precision) + 1] += 1.0 / exp_var_diff
-        precision = np.dot(components_.T, np.dot(linalg.inv(precision), components_))
-        precision /= -(self.noise_variance_ ** 2)
-        precision.flat[:: len(precision) + 1] += 1.0 / self.noise_variance_
-        return precision
+    # overwrite _required_parameters from MetaEstimatorMixin
+    _required_parameters: List[str] = []
 
     @abstractmethod
-    def fit(self, X, y=None):
-        """Placeholder for fit. Subclasses should implement this method!
+    def __init__(self, base_estimator, *, n_estimators=10, estimator_params=tuple()):
+        # Set parameters
+        self.base_estimator = base_estimator
+        self.n_estimators = n_estimators
+        self.estimator_params = estimator_params
 
-        Fit the model with X.
+        # Don't instantiate estimators now! Parameters of base_estimator might
+        # still change. Eg., when grid-searching with the nested object syntax.
+        # self.estimators_ needs to be filled by the derived classes in fit.
+
+    def _validate_estimator(self, default=None):
+        """Check the estimator and the n_estimator attribute.
+
+        Sets the base_estimator_` attributes.
+        """
+        if not isinstance(self.n_estimators, numbers.Integral):
+            raise ValueError(
+                "n_estimators must be an integer, got {0}.".format(
+                    type(self.n_estimators)
+                )
+            )
+
+        if self.n_estimators <= 0:
+            raise ValueError(
+                "n_estimators must be greater than zero, got {0}.".format(
+                    self.n_estimators
+                )
+            )
+
+        if self.base_estimator is not None:
+            self.base_estimator_ = self.base_estimator
+        else:
+            self.base_estimator_ = default
+
+        if self.base_estimator_ is None:
+            raise ValueError("base_estimator cannot be None")
+
+    def _make_estimator(self, append=True, random_state=None):
+        """Make and configure a copy of the `base_estimator_` attribute.
+
+        Warning: This method should be used to properly instantiate new
+        sub-estimators.
+        """
+        estimator = clone(self.base_estimator_)
+        estimator.set_params(**{p: getattr(self, p) for p in self.estimator_params})
+
+        # TODO: Remove in v1.2
+        # criterion "mse" and "mae" would cause warnings in every call to
+        # DecisionTreeRegressor.fit(..)
+        if isinstance(estimator, (DecisionTreeRegressor, ExtraTreeRegressor)):
+            if getattr(estimator, "criterion", None) == "mse":
+                estimator.set_params(criterion="squared_error")
+            elif getattr(estimator, "criterion", None) == "mae":
+                estimator.set_params(criterion="absolute_error")
+
+        if random_state is not None:
+            _set_random_states(estimator, random_state)
+
+        if append:
+            self.estimators_.append(estimator)
+
+        return estimator
+
+    def __len__(self):
+        """Return the number of estimators in the ensemble."""
+        return len(self.estimators_)
+
+    def __getitem__(self, index):
+        """Return the index'th estimator in the ensemble."""
+        return self.estimators_[index]
+
+    def __iter__(self):
+        """Return iterator over estimators in the ensemble."""
+        return iter(self.estimators_)
+
+
+def _partition_estimators(n_estimators, n_jobs):
+    """Private function used to partition estimators between jobs."""
+    # Compute the number of jobs
+    n_jobs = min(effective_n_jobs(n_jobs), n_estimators)
+
+    # Partition estimators between jobs
+    n_estimators_per_job = np.full(n_jobs, n_estimators // n_jobs, dtype=int)
+    n_estimators_per_job[: n_estimators % n_jobs] += 1
+    starts = np.cumsum(n_estimators_per_job)
+
+    return n_jobs, n_estimators_per_job.tolist(), [0] + starts.tolist()
+
+
+class _BaseHeterogeneousEnsemble(
+    MetaEstimatorMixin, _BaseComposition, metaclass=ABCMeta
+):
+    """Base class for heterogeneous ensemble of learners.
+
+    Parameters
+    ----------
+    estimators : list of (str, estimator) tuples
+        The ensemble of estimators to use in the ensemble. Each element of the
+        list is defined as a tuple of string (i.e. name of the estimator) and
+        an estimator instance. An estimator can be set to `'drop'` using
+        `set_params`.
+
+    Attributes
+    ----------
+    estimators_ : list of estimators
+        The elements of the estimators parameter, having been fitted on the
+        training data. If an estimator has been set to `'drop'`, it will not
+        appear in `estimators_`.
+    """
+
+    _required_parameters = ["estimators"]
+
+    @property
+    def named_estimators(self):
+        """Dictionary to access any fitted sub-estimators by name.
+
+        Returns
+        -------
+        :class:`~sklearn.utils.Bunch`
+        """
+        return Bunch(**dict(self.estimators))
+
+    @abstractmethod
+    def __init__(self, estimators):
+        self.estimators = estimators
+
+    def _validate_estimators(self):
+        if self.estimators is None or len(self.estimators) == 0:
+            raise ValueError(
+                "Invalid 'estimators' attribute, 'estimators' should be a list"
+                " of (string, estimator) tuples."
+            )
+        names, estimators = zip(*self.estimators)
+        # defined by MetaEstimatorMixin
+        self._validate_names(names)
+
+        has_estimator = any(est != "drop" for est in estimators)
+        if not has_estimator:
+            raise ValueError(
+                "All estimators are dropped. At least one is required "
+                "to be an estimator."
+            )
+
+        is_estimator_type = is_classifier if is_classifier(self) else is_regressor
+
+        for est in estimators:
+            if est != "drop" and not is_estimator_type(est):
+                raise ValueError(
+                    "The estimator {} should be a {}.".format(
+                        est.__class__.__name__, is_estimator_type.__name__[3:]
+                    )
+                )
+
+        return names, estimators
+
+    def set_params(self, **params):
+        """
+        Set the parameters of an estimator from the ensemble.
+
+        Valid parameter keys can be listed with `get_params()`. Note that you
+        can directly set the parameters of the estimators contained in
+        `estimators`.
 
         Parameters
         ----------
-        X : array-like of shape (n_samples, n_features)
-            Training data, where `n_samples` is the number of samples and
-            `n_features` is the number of features.
+        **params : keyword arguments
+            Specific parameters using e.g.
+            `set_params(parameter_name=new_value)`. In addition, to setting the
+            parameters of the estimator, the individual estimator of the
+            estimators can also be set, or can be removed by setting them to
+            'drop'.
 
         Returns
         -------
         self : object
-            Returns the instance itself.
+            Estimator instance.
         """
+        super()._set_params("estimators", **params)
+        return self
 
-    def transform(self, X):
-        """Apply dimensionality reduction to X.
+    def get_params(self, deep=True):
+        """
+        Get the parameters of an estimator from the ensemble.
 
-        X is projected on the first principal components previously extracted
-        from a training set.
+        Returns the parameters given in the constructor as well as the
+        estimators contained within the `estimators` parameter.
 
         Parameters
         ----------
-        X : array-like of shape (n_samples, n_features)
-            New data, where `n_samples` is the number of samples
-            and `n_features` is the number of features.
+        deep : bool, default=True
+            Setting it to True gets the various estimators and the parameters
+            of the estimators as well.
 
         Returns
         -------
-        X_new : array-like of shape (n_samples, n_components)
-            Projection of X in the first principal components, where `n_samples`
-            is the number of samples and `n_components` is the number of the components.
+        params : dict
+            Parameter and estimator names mapped to their values or parameter
+            names mapped to their values.
         """
-        check_is_fitted(self)
-
-        X = self._validate_data(X, dtype=[np.float64, np.float32], reset=False)
-        if self.mean_ is not None:
-            X = X - self.mean_
-        X_transformed = np.dot(X, self.components_.T)
-        if self.whiten:
-            X_transformed /= np.sqrt(self.explained_variance_)
-        return X_transformed
-
-    def inverse_transform(self, X):
-        """Transform data back to its original space.
-
-        In other words, return an input `X_original` whose transform would be X.
-
-        Parameters
-        ----------
-        X : array-like of shape (n_samples, n_components)
-            New data, where `n_samples` is the number of samples
-            and `n_components` is the number of components.
-
-        Returns
-        -------
-        X_original array-like of shape (n_samples, n_features)
-            Original data, where `n_samples` is the number of samples
-            and `n_features` is the number of features.
-
-        Notes
-        -----
-        If whitening is enabled, inverse_transform will compute the
-        exact inverse operation, which includes reversing whitening.
-        """
-        if self.whiten:
-            return (
-                np.dot(
-                    X,
-                    np.sqrt(self.explained_variance_[:, np.newaxis]) * self.components_,
-                )
-                + self.mean_
-            )
-        else:
-            return np.dot(X, self.components_) + self.mean_
+        return super()._get_params("estimators", deep=deep)
