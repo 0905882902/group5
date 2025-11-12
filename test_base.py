@@ -1,75 +1,116 @@
 import numpy as np
 import pytest
+from scipy import sparse as sp
 
-from sklearn.datasets import load_iris
-from sklearn.linear_model import LogisticRegression
-from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
+from numpy.testing import assert_array_equal
 
-from sklearn.metrics._plot.base import _get_response
-
-
-@pytest.mark.parametrize(
-    "estimator, err_msg, params",
-    [
-        (
-            DecisionTreeRegressor(),
-            "Expected 'estimator' to be a binary classifier",
-            {"response_method": "auto"},
-        ),
-        (
-            DecisionTreeClassifier(),
-            "The class provided by 'pos_label' is unknown.",
-            {"response_method": "auto", "pos_label": "unknown"},
-        ),
-        (
-            DecisionTreeClassifier(),
-            "fit on multiclass",
-            {"response_method": "predict_proba"},
-        ),
-    ],
-)
-def test_get_response_error(estimator, err_msg, params):
-    """Check that we raise the proper error messages in `_get_response`."""
-    X, y = load_iris(return_X_y=True)
-
-    estimator.fit(X, y)
-    with pytest.raises(ValueError, match=err_msg):
-        _get_response(X, estimator, **params)
+from sklearn.base import BaseEstimator
+from sklearn.feature_selection._base import SelectorMixin
+from sklearn.utils import check_array
 
 
-def test_get_response_predict_proba():
-    """Check the behaviour of `_get_response` using `predict_proba`."""
-    X, y = load_iris(return_X_y=True)
-    X_binary, y_binary = X[:100], y[:100]
+class StepSelector(SelectorMixin, BaseEstimator):
+    """Retain every `step` features (beginning with 0)"""
 
-    classifier = DecisionTreeClassifier().fit(X_binary, y_binary)
-    y_proba, pos_label = _get_response(
-        X_binary, classifier, response_method="predict_proba"
-    )
-    np.testing.assert_allclose(y_proba, classifier.predict_proba(X_binary)[:, 1])
-    assert pos_label == 1
+    def __init__(self, step=2):
+        self.step = step
 
-    y_proba, pos_label = _get_response(
-        X_binary, classifier, response_method="predict_proba", pos_label=0
-    )
-    np.testing.assert_allclose(y_proba, classifier.predict_proba(X_binary)[:, 0])
-    assert pos_label == 0
+    def fit(self, X, y=None):
+        X = check_array(X, accept_sparse="csc")
+        self.n_input_feats = X.shape[1]
+        return self
+
+    def _get_support_mask(self):
+        mask = np.zeros(self.n_input_feats, dtype=bool)
+        mask[:: self.step] = True
+        return mask
 
 
-def test_get_response_decision_function():
-    """Check the behaviour of `get_response` using `decision_function`."""
-    X, y = load_iris(return_X_y=True)
-    X_binary, y_binary = X[:100], y[:100]
+support = [True, False] * 5
+support_inds = [0, 2, 4, 6, 8]
+X = np.arange(20).reshape(2, 10)
+Xt = np.arange(0, 20, 2).reshape(2, 5)
+Xinv = X.copy()
+Xinv[:, 1::2] = 0
+y = [0, 1]
+feature_names = list("ABCDEFGHIJ")
+feature_names_t = feature_names[::2]
+feature_names_inv = np.array(feature_names)
+feature_names_inv[1::2] = ""
 
-    classifier = LogisticRegression().fit(X_binary, y_binary)
-    y_score, pos_label = _get_response(
-        X_binary, classifier, response_method="decision_function"
-    )
-    np.testing.assert_allclose(y_score, classifier.decision_function(X_binary))
-    assert pos_label == 1
 
-    y_score, pos_label = _get_response(
-        X_binary, classifier, response_method="decision_function", pos_label=0
-    )
-    np.testing.assert_allclose(y_score, classifier.decision_function(X_binary) * -1)
-    assert pos_label == 0
+def test_transform_dense():
+    sel = StepSelector()
+    Xt_actual = sel.fit(X, y).transform(X)
+    Xt_actual2 = StepSelector().fit_transform(X, y)
+    assert_array_equal(Xt, Xt_actual)
+    assert_array_equal(Xt, Xt_actual2)
+
+    # Check dtype matches
+    assert np.int32 == sel.transform(X.astype(np.int32)).dtype
+    assert np.float32 == sel.transform(X.astype(np.float32)).dtype
+
+    # Check 1d list and other dtype:
+    names_t_actual = sel.transform([feature_names])
+    assert_array_equal(feature_names_t, names_t_actual.ravel())
+
+    # Check wrong shape raises error
+    with pytest.raises(ValueError):
+        sel.transform(np.array([[1], [2]]))
+
+
+def test_transform_sparse():
+    sparse = sp.csc_matrix
+    sel = StepSelector()
+    Xt_actual = sel.fit(sparse(X)).transform(sparse(X))
+    Xt_actual2 = sel.fit_transform(sparse(X))
+    assert_array_equal(Xt, Xt_actual.toarray())
+    assert_array_equal(Xt, Xt_actual2.toarray())
+
+    # Check dtype matches
+    assert np.int32 == sel.transform(sparse(X).astype(np.int32)).dtype
+    assert np.float32 == sel.transform(sparse(X).astype(np.float32)).dtype
+
+    # Check wrong shape raises error
+    with pytest.raises(ValueError):
+        sel.transform(np.array([[1], [2]]))
+
+
+def test_inverse_transform_dense():
+    sel = StepSelector()
+    Xinv_actual = sel.fit(X, y).inverse_transform(Xt)
+    assert_array_equal(Xinv, Xinv_actual)
+
+    # Check dtype matches
+    assert np.int32 == sel.inverse_transform(Xt.astype(np.int32)).dtype
+    assert np.float32 == sel.inverse_transform(Xt.astype(np.float32)).dtype
+
+    # Check 1d list and other dtype:
+    names_inv_actual = sel.inverse_transform([feature_names_t])
+    assert_array_equal(feature_names_inv, names_inv_actual.ravel())
+
+    # Check wrong shape raises error
+    with pytest.raises(ValueError):
+        sel.inverse_transform(np.array([[1], [2]]))
+
+
+def test_inverse_transform_sparse():
+    sparse = sp.csc_matrix
+    sel = StepSelector()
+    Xinv_actual = sel.fit(sparse(X)).inverse_transform(sparse(Xt))
+    assert_array_equal(Xinv, Xinv_actual.toarray())
+
+    # Check dtype matches
+    assert np.int32 == sel.inverse_transform(sparse(Xt).astype(np.int32)).dtype
+    assert np.float32 == sel.inverse_transform(sparse(Xt).astype(np.float32)).dtype
+
+    # Check wrong shape raises error
+    with pytest.raises(ValueError):
+        sel.inverse_transform(np.array([[1], [2]]))
+
+
+def test_get_support():
+    sel = StepSelector()
+    sel.fit(X, y)
+    assert_array_equal(support, sel.get_support())
+    assert_array_equal(support_inds, sel.get_support(indices=True))
