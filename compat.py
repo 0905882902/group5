@@ -1,85 +1,90 @@
-"""Stuff that differs in different Python versions and platform
-distributions."""
+"""
+requests.compat
+~~~~~~~~~~~~~~~
 
-import importlib.resources
-import logging
-import os
+This module previously handled import compatibility issues
+between Python 2 and Python 3. It remains for backwards
+compatibility until the next major version.
+"""
+
 import sys
-from typing import IO
 
-__all__ = ["get_path_uid", "stdlib_pkgs", "tomllib", "WINDOWS"]
+# -------
+# urllib3
+# -------
+from pip._vendor.urllib3 import __version__ as urllib3_version
 
+# Detect which major version of urllib3 is being used.
+try:
+    is_urllib3_1 = int(urllib3_version.split(".")[0]) == 1
+except (TypeError, AttributeError):
+    # If we can't discern a version, prefer old functionality.
+    is_urllib3_1 = True
 
-logger = logging.getLogger(__name__)
-
-
-def has_tls() -> bool:
-    try:
-        import _ssl  # noqa: F401  # ignore unused
-
-        return True
-    except ImportError:
-        pass
-
-    from pip._vendor.urllib3.util import IS_PYOPENSSL
-
-    return IS_PYOPENSSL
+# -------------------
+# Character Detection
+# -------------------
 
 
-def get_path_uid(path: str) -> int:
-    """
-    Return path's uid.
-
-    Does not follow symlinks:
-        https://github.com/pypa/pip/pull/935#discussion_r5307003
-
-    Placed this function in compat due to differences on AIX and
-    Jython, that should eventually go away.
-
-    :raises OSError: When path is a symlink or can't be read.
-    """
-    if hasattr(os, "O_NOFOLLOW"):
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-        file_uid = os.fstat(fd).st_uid
-        os.close(fd)
-    else:  # AIX and Jython
-        # WARNING: time of check vulnerability, but best we can do w/o NOFOLLOW
-        if not os.path.islink(path):
-            # older versions of Jython don't have `os.fstat`
-            file_uid = os.stat(path).st_uid
-        else:
-            # raise OSError for parity with os.O_NOFOLLOW above
-            raise OSError(f"{path} is a symlink; Will not return uid for symlinks")
-    return file_uid
+def _resolve_char_detection():
+    """Find supported character detection libraries."""
+    chardet = None
+    return chardet
 
 
-# The importlib.resources.open_text function was deprecated in 3.11 with suggested
-# replacement we use below.
-if sys.version_info < (3, 11):
-    open_text_resource = importlib.resources.open_text
-else:
+chardet = _resolve_char_detection()
 
-    def open_text_resource(
-        package: str, resource: str, encoding: str = "utf-8", errors: str = "strict"
-    ) -> IO[str]:
-        return (importlib.resources.files(package) / resource).open(
-            "r", encoding=encoding, errors=errors
-        )
+# -------
+# Pythons
+# -------
 
+# Syntax sugar.
+_ver = sys.version_info
 
-if sys.version_info >= (3, 11):
-    import tomllib
-else:
-    from pip._vendor import tomli as tomllib
+#: Python 2.x?
+is_py2 = _ver[0] == 2
 
+#: Python 3.x?
+is_py3 = _ver[0] == 3
 
-# packages in the stdlib that may have installation metadata, but should not be
-# considered 'installed'.  this theoretically could be determined based on
-# dist.location (py27:`sysconfig.get_paths()['stdlib']`,
-# py26:sysconfig.get_config_vars('LIBDEST')), but fear platform variation may
-# make this ineffective, so hard-coding
-stdlib_pkgs = {"python", "wsgiref", "argparse"}
+# Note: We've patched out simplejson support in pip because it prevents
+#       upgrading simplejson on Windows.
+import json
+from json import JSONDecodeError
 
+# Keep OrderedDict for backwards compatibility.
+from collections import OrderedDict
+from collections.abc import Callable, Mapping, MutableMapping
+from http import cookiejar as cookielib
+from http.cookies import Morsel
+from io import StringIO
 
-# windows detection, covers cpython and ironpython
-WINDOWS = sys.platform.startswith("win") or (sys.platform == "cli" and os.name == "nt")
+# --------------
+# Legacy Imports
+# --------------
+from urllib.parse import (
+    quote,
+    quote_plus,
+    unquote,
+    unquote_plus,
+    urldefrag,
+    urlencode,
+    urljoin,
+    urlparse,
+    urlsplit,
+    urlunparse,
+)
+from urllib.request import (
+    getproxies,
+    getproxies_environment,
+    parse_http_list,
+    proxy_bypass,
+    proxy_bypass_environment,
+)
+
+builtin_str = str
+str = str
+bytes = bytes
+basestring = (str, bytes)
+numeric_types = (int, float)
+integer_types = (int,)
