@@ -1,41 +1,98 @@
 import os
+from os.path import join
 
-import numpy
-from numpy.distutils.misc_util import Configuration
+from sklearn._build_utils import gen_from_templates
 
 
 def configuration(parent_package="", top_path=None):
-    config = Configuration("tree", parent_package, top_path)
+    import numpy
+    from numpy.distutils.misc_util import Configuration
+
+    config = Configuration("utils", parent_package, top_path)
+
     libraries = []
     if os.name == "posix":
         libraries.append("m")
+
     config.add_extension(
-        "_tree",
-        sources=["_tree.pyx"],
-        include_dirs=[numpy.get_include()],
-        libraries=libraries,
-        extra_compile_args=["-O3"],
+        "sparsefuncs_fast", sources=["sparsefuncs_fast.pyx"], libraries=libraries
     )
+
     config.add_extension(
-        "_splitter",
-        sources=["_splitter.pyx"],
-        include_dirs=[numpy.get_include()],
-        libraries=libraries,
-        extra_compile_args=["-O3"],
+        "_cython_blas", sources=["_cython_blas.pyx"], libraries=libraries
     )
+
     config.add_extension(
-        "_criterion",
-        sources=["_criterion.pyx"],
+        "arrayfuncs",
+        sources=["arrayfuncs.pyx"],
         include_dirs=[numpy.get_include()],
         libraries=libraries,
-        extra_compile_args=["-O3"],
     )
+
     config.add_extension(
-        "_utils",
-        sources=["_utils.pyx"],
+        "murmurhash",
+        sources=["murmurhash.pyx", join("src", "MurmurHash3.cpp")],
+        include_dirs=["src"],
+    )
+
+    config.add_extension(
+        "_fast_dict",
+        sources=["_fast_dict.pyx"],
+        language="c++",
         include_dirs=[numpy.get_include()],
         libraries=libraries,
-        extra_compile_args=["-O3"],
+    )
+
+    config.add_extension(
+        "_openmp_helpers", sources=["_openmp_helpers.pyx"], libraries=libraries
+    )
+
+    # generate files from a template
+    templates = [
+        "sklearn/utils/_seq_dataset.pyx.tp",
+        "sklearn/utils/_seq_dataset.pxd.tp",
+        "sklearn/utils/_weight_vector.pyx.tp",
+        "sklearn/utils/_weight_vector.pxd.tp",
+    ]
+
+    gen_from_templates(templates)
+
+    config.add_extension(
+        "_seq_dataset", sources=["_seq_dataset.pyx"], include_dirs=[numpy.get_include()]
+    )
+
+    config.add_extension(
+        "_weight_vector",
+        sources=["_weight_vector.pyx"],
+        include_dirs=[numpy.get_include()],
+        libraries=libraries,
+    )
+
+    config.add_extension(
+        "_random",
+        sources=["_random.pyx"],
+        include_dirs=[numpy.get_include()],
+        libraries=libraries,
+    )
+
+    config.add_extension(
+        "_logistic_sigmoid",
+        sources=["_logistic_sigmoid.pyx"],
+        include_dirs=[numpy.get_include()],
+        libraries=libraries,
+    )
+
+    config.add_extension(
+        "_readonly_array_wrapper",
+        sources=["_readonly_array_wrapper.pyx"],
+        libraries=libraries,
+    )
+
+    config.add_extension(
+        "_typedefs",
+        sources=["_typedefs.pyx"],
+        include_dirs=[numpy.get_include()],
+        libraries=libraries,
     )
 
     config.add_subpackage("tests")
@@ -46,4 +103,4 @@ def configuration(parent_package="", top_path=None):
 if __name__ == "__main__":
     from numpy.distutils.core import setup
 
-    setup(**configuration().todict())
+    setup(**configuration(top_path="").todict())
